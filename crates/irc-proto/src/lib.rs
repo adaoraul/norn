@@ -14,5 +14,5 @@ pub mod tags;
 
 pub use caps::{Cap, CapName, CapSet, LsAccumulator};
 pub use message::{Command, Message, ParseError, Source};
-pub use sasl::{External, Mechanism, Plain, SaslError};
+pub use sasl::{External, Mechanism, Plain, SaslError, ScramSha256};
 pub use tags::{TagKey, Tags};

@@ -8,6 +8,8 @@ description = "Pure, synchronous IRCv3 protocol core: codec, cap parsing, SASL m
 thiserror = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
 
 [dev-dependencies]
 proptest = "1"

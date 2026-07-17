@@ -10,11 +10,13 @@
 
 pub mod external;
 pub mod plain;
+pub mod scram;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 pub use external::External;
 pub use plain::Plain;
+pub use scram::ScramSha256;
 
 /// Maximum base64 payload bytes per `AUTHENTICATE` line (rule 8).
 pub const CHUNK_LEN: usize = 400;

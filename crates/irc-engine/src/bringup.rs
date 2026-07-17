@@ -576,6 +576,51 @@ mod tests {
     }
 
     #[test]
+    fn scram_drives_through_the_bringup_machine() {
+        // Proves the Mechanism trait carries a multi-round mechanism end to end,
+        // using the RFC 7677 vector. Server messages are base64 on the wire.
+        use irc_proto::sasl::{encode_b64, ScramSha256};
+
+        let mut cfg = config(false, true, SaslFailPolicy::Continue);
+        cfg.sasl = Some(Box::new(ScramSha256::new(
+            "user",
+            "pencil",
+            "rOprNGfwEbeRWgbNEkqO",
+        )));
+        let mut d = Driver::new(cfg);
+
+        d.feed("CAP * LS :sasl");
+        d.feed("CAP * ACK :sasl");
+        assert!(d.sent_contains("AUTHENTICATE SCRAM-SHA-256"));
+
+        d.feed("AUTHENTICATE +");
+        let client_first = encode_b64(b"n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+        assert!(d.sent_contains(&format!("AUTHENTICATE {client_first}")));
+
+        let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+        d.feed(&format!(
+            "AUTHENTICATE {}",
+            encode_b64(server_first.as_bytes())
+        ));
+        let client_final = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=";
+        assert!(d.sent_contains(&format!(
+            "AUTHENTICATE {}",
+            encode_b64(client_final.as_bytes())
+        )));
+
+        // Correct server signature: client acknowledges with empty, then 903.
+        d.feed(&format!(
+            "AUTHENTICATE {}",
+            encode_b64(b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+        ));
+        assert!(d.sent_contains("AUTHENTICATE +"));
+        assert!(!d.sent_contains("CAP END")); // not until 903
+
+        d.feed("903 user :SASL authentication successful");
+        assert!(d.sent_contains("CAP END"));
+    }
+
+    #[test]
     fn sasl_failure_abort_policy_disconnects() {
         let mut d = Driver::new(config(true, true, SaslFailPolicy::Abort));
         d.feed("CAP * LS :sasl");
