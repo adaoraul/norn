@@ -1,15 +1,23 @@
-//! Async connection driver: the only I/O in the bring-up path.
+//! Async connection driver: the only I/O in the engine.
 //!
 //! It reads bytes from a stream, frames them into lines, parses each into a
-//! [`Message`], and feeds the [`BringupMachine`], writing the machine's
-//! outgoing lines back and collecting its events. It is generic over any
-//! `AsyncRead + AsyncWrite` so it can be driven by an in-memory pipe in tests;
-//! real TLS setup (a rustls stream) plugs in as the `S` type later.
+//! [`Message`], and feeds the [`BringupMachine`] (during bring-up) or the
+//! [`Engine`] (once registered), writing outgoing lines back. It is generic
+//! over any `AsyncRead + AsyncWrite` so it can be driven by an in-memory pipe in
+//! tests; a real TLS stream plugs in as the `S` type.
+//!
+//! [`run`] is the unified driver: it hands the bring-up machine each message
+//! until `Registered`, then switches to the engine in the same read loop, so no
+//! already-framed line is dropped at the handoff. It also answers server `PING`
+//! keepalives in both phases.
+//!
+//! [`run`]: Connection::run
 
-use irc_proto::Message;
+use irc_proto::{Command, Message};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::bringup::{Action, BringupMachine};
+use crate::engine::Engine;
 use crate::event::Event;
 use crate::framing::LineFramer;
 
@@ -64,6 +72,84 @@ where
         }
 
         Ok(events)
+    }
+
+    /// Drive the whole session: bring-up, then the post-registration runtime.
+    ///
+    /// Sends the opening handshake, then reads in one loop: each message goes to
+    /// the bring-up machine until `Registered`, after which messages go to the
+    /// `Engine`. Server `PING`s are answered in both phases. Every event
+    /// (bring-up and runtime) is passed to `on_event`. Returns when the stream
+    /// ends.
+    pub async fn run<F>(
+        &mut self,
+        machine: &mut BringupMachine,
+        engine: &mut Engine,
+        mut on_event: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnMut(&Event),
+    {
+        let opening = machine.start();
+        self.dispatch(opening, &mut on_event).await?;
+
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = self.stream.read(&mut buf).await?;
+            if n == 0 {
+                break; // stream closed
+            }
+            for line in self.framer.push(&buf[..n]) {
+                let Ok(msg) = Message::parse(&line) else {
+                    continue;
+                };
+                if machine.is_registered() {
+                    self.answer_ping(&msg).await?;
+                    for event in engine.handle(msg) {
+                        on_event(&event);
+                    }
+                } else {
+                    let actions = machine.handle(&msg);
+                    self.dispatch(actions, &mut on_event).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Send a raw line (a trailing CRLF is appended) and flush.
+    pub async fn send(&mut self, line: &str) -> std::io::Result<()> {
+        self.stream.write_all(line.as_bytes()).await?;
+        self.stream.write_all(b"\r\n").await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// Reply to a server `PING` with a matching `PONG`.
+    async fn answer_ping(&mut self, msg: &Message) -> std::io::Result<()> {
+        if matches!(&msg.command, Command::Named(name) if name == "PING") {
+            let token = msg.params.first().cloned().unwrap_or_default();
+            self.send(&format!("PONG :{token}")).await?;
+        }
+        Ok(())
+    }
+
+    /// Write outgoing lines (appending CRLF) and route emitted events to a sink.
+    async fn dispatch<F>(&mut self, actions: Vec<Action>, on_event: &mut F) -> std::io::Result<()>
+    where
+        F: FnMut(&Event),
+    {
+        for action in actions {
+            match action {
+                Action::Send(line) => {
+                    self.stream.write_all(line.as_bytes()).await?;
+                    self.stream.write_all(b"\r\n").await?;
+                }
+                Action::Emit(event) => on_event(&event),
+            }
+        }
+        self.stream.flush().await?;
+        Ok(())
     }
 
     /// Write outgoing lines (appending CRLF) and collect emitted events.

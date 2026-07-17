@@ -1,14 +1,16 @@
 //! norn: a terminal IRCv3 client built on the norn engine.
 //!
-//! Step 2 opens a real connection: TCP (optionally TLS), runs the bring-up
-//! handshake, and prints the resulting events. The live event loop arrives in
-//! step 3.
+//! Connects (TCP, optionally TLS), runs the bring-up handshake, then stays
+//! connected — feeding messages into the engine and rendering the resulting
+//! events until the server closes the connection. Sending user input is a
+//! follow-up step.
 
 mod config;
+mod render;
 mod transport;
 
 use clap::Parser;
-use irc_engine::{BringupMachine, Connection};
+use irc_engine::{BringupMachine, Connection, Engine};
 
 use config::Cli;
 
@@ -25,17 +27,10 @@ async fn main() -> std::io::Result<()> {
     let stream = transport::connect(&settings.conn).await?;
     let mut conn = Connection::new(stream);
     let mut machine = BringupMachine::new(settings.bringup);
+    let mut engine = Engine::new();
 
-    let events = conn.run_bringup(&mut machine).await?;
-    for event in &events {
-        println!("{event:?}");
-    }
+    conn.run(&mut machine, &mut engine, render::render).await?;
 
-    if machine.is_registered() {
-        eprintln!("registered.");
-    } else {
-        eprintln!("connection ended before registration completed.");
-    }
-
+    eprintln!("connection closed.");
     Ok(())
 }
