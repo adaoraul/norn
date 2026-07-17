@@ -1,0 +1,12 @@
+# Cargo build output
+/target/
+debug/
+
+# rustfmt backups
+**/*.rs.bk
+
+# MSVC debug info
+*.pdb
+
+# Cargo.lock is intentionally committed: this workspace builds an application
+# (the norn client), so a locked dependency graph is desired. Do not ignore it.

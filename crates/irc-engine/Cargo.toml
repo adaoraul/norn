@@ -1,0 +1,8 @@
+[package]
+name = "irc-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Async IRCv3 engine: connection, TLS, bring-up machines, batch/label routing, CHATHISTORY, event emission."
+
+[dependencies]
+irc-proto = { path = "../irc-proto" }
