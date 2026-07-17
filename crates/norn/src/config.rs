@@ -31,7 +31,7 @@ fn random_nonce() -> String {
 }
 
 /// Parsed command-line arguments.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "norn", about = "A terminal IRCv3 client.")]
 pub struct Cli {
     /// Server hostname to connect to.

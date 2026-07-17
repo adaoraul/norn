@@ -5,12 +5,17 @@
 //! produced line is forwarded (without CRLF) to the connection's outgoing
 //! channel; the connection only sends them once registered.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Read stdin to end, translating each line and forwarding outgoing IRC lines.
-/// Returns when stdin closes (EOF) or the connection's receiver is gone.
-pub async fn run(tx: UnboundedSender<String>) {
+/// Runs for the whole program (across reconnects). On `/quit` it sets `quit` so
+/// the main loop stops reconnecting. Returns when stdin closes (EOF), the
+/// receiver is gone, or the user quits.
+pub async fn run(tx: UnboundedSender<String>, quit: Arc<AtomicBool>) {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut current: Option<String> = None;
 
@@ -19,13 +24,14 @@ pub async fn run(tx: UnboundedSender<String>) {
             Ok(Some(line)) => line,
             _ => break, // EOF or read error
         };
-        let (out, quit) = translate(&line, &mut current);
+        let (out, is_quit) = translate(&line, &mut current);
         for msg in out {
             if tx.send(msg).is_err() {
                 return; // connection gone
             }
         }
-        if quit {
+        if is_quit {
+            quit.store(true, Ordering::SeqCst);
             break;
         }
     }
