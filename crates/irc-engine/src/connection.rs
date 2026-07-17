@@ -15,6 +15,7 @@
 
 use irc_proto::{Command, Message};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::bringup::{Action, BringupMachine};
 use crate::engine::Engine;
@@ -76,15 +77,18 @@ where
 
     /// Drive the whole session: bring-up, then the post-registration runtime.
     ///
-    /// Sends the opening handshake, then reads in one loop: each message goes to
-    /// the bring-up machine until `Registered`, after which messages go to the
-    /// `Engine`. Server `PING`s are answered in both phases. Every event
-    /// (bring-up and runtime) is passed to `on_event`. Returns when the stream
-    /// ends.
+    /// Sends the opening handshake, then loops selecting between inbound bytes
+    /// and outbound user lines from `outgoing`. Inbound messages go to the
+    /// bring-up machine until `Registered`, then to the `Engine`; server `PING`s
+    /// are answered in both phases. Outbound lines are only sent once registered
+    /// (earlier ones stay queued in the channel), so user input typed during
+    /// bring-up is not sent prematurely. Every event is passed to `on_event`.
+    /// Returns when the stream ends.
     pub async fn run<F>(
         &mut self,
         machine: &mut BringupMachine,
         engine: &mut Engine,
+        outgoing: &mut mpsc::UnboundedReceiver<String>,
         mut on_event: F,
     ) -> std::io::Result<()>
     where
@@ -94,23 +98,36 @@ where
         self.dispatch(opening, &mut on_event).await?;
 
         let mut buf = [0u8; 4096];
+        let mut input_open = true;
         loop {
-            let n = self.stream.read(&mut buf).await?;
-            if n == 0 {
-                break; // stream closed
-            }
-            for line in self.framer.push(&buf[..n]) {
-                let Ok(msg) = Message::parse(&line) else {
-                    continue;
-                };
-                if machine.is_registered() {
-                    self.answer_ping(&msg).await?;
-                    for event in engine.handle(msg) {
-                        on_event(&event);
+            tokio::select! {
+                result = self.stream.read(&mut buf) => {
+                    let n = result?;
+                    if n == 0 {
+                        break; // stream closed
                     }
-                } else {
-                    let actions = machine.handle(&msg);
-                    self.dispatch(actions, &mut on_event).await?;
+                    for line in self.framer.push(&buf[..n]) {
+                        let Ok(msg) = Message::parse(&line) else {
+                            continue;
+                        };
+                        if machine.is_registered() {
+                            self.answer_ping(&msg).await?;
+                            for event in engine.handle(msg) {
+                                on_event(&event);
+                            }
+                        } else {
+                            let actions = machine.handle(&msg);
+                            self.dispatch(actions, &mut on_event).await?;
+                        }
+                    }
+                }
+                // Only accept user input once registered; before that it stays
+                // queued. Disabled entirely once the input channel closes.
+                maybe_line = outgoing.recv(), if input_open && machine.is_registered() => {
+                    match maybe_line {
+                        Some(line) => self.send(&line).await?,
+                        None => input_open = false,
+                    }
                 }
             }
         }
