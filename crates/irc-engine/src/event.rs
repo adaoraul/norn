@@ -4,10 +4,12 @@
 //! currently carries the variants produced during bring-up; more arrive in
 //! later build-order steps (message receipt, history, membership).
 
+use chrono::{DateTime, Utc};
 use irc_proto::{CapSet, SaslError, Source};
 
 use crate::batch::CompletedBatch;
 use crate::chat::ChatMessage;
+use crate::roster::Member;
 use crate::stdreply::StandardReply;
 
 /// An authenticated account name.
@@ -96,6 +98,30 @@ pub enum Event {
     },
     /// A netsplit/netjoin (or other collapsible) batch folded into one event.
     BatchCollapsed(CompletedBatch),
+    /// The full member list for a channel (emitted at end-of-NAMES, 366).
+    NamesLoaded {
+        /// The channel.
+        target: String,
+        /// Its members, with prefixes.
+        members: Vec<Member>,
+    },
+    /// A channel topic, or its metadata, changed.
+    ///
+    /// `topic` is `Some` for topic text (RPL_TOPIC 332 or a live `TOPIC`), and
+    /// `None` when there is no topic (RPL_NOTOPIC 331), the topic was cleared,
+    /// or this event carries only who/when metadata (RPL_TOPICWHOTIME 333). A
+    /// consumer must not overwrite stored topic text when `topic` is `None` but
+    /// `set_by`/`set_at` are present.
+    TopicChanged {
+        /// The channel.
+        target: String,
+        /// The topic text, if this event sets it.
+        topic: Option<String>,
+        /// Who set the topic, if known.
+        set_by: Option<String>,
+        /// When the topic was set, if known.
+        set_at: Option<DateTime<Utc>>,
+    },
     /// A member joined a channel. `account` is present with `extended-join`.
     MemberJoined {
         /// The channel joined.

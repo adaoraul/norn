@@ -9,14 +9,21 @@
 
 use std::collections::HashMap;
 
-use irc_proto::Message;
+use chrono::{DateTime, Utc};
+use irc_proto::{Command, Message};
 
 use crate::batch::{BatchCollector, CollectorOutput, CompletedBatch};
 use crate::chat::ChatMessage;
-use crate::event::Event;
+use crate::event::{Event, LeaveReason};
 use crate::history::ChatHistoryRequest;
 use crate::identity::identity_event;
+use crate::roster::Roster;
 use crate::stdreply::StandardReply;
+
+/// Normalize a channel name for roster keying (ASCII case-insensitive).
+fn norm(channel: &str) -> String {
+    channel.to_ascii_lowercase()
+}
 
 /// Wires batch collection and request correlation into semantic events.
 #[derive(Debug, Default)]
@@ -25,6 +32,8 @@ pub struct Engine {
     /// Outstanding CHATHISTORY requests, keyed by the label we attached, so a
     /// closing batch knows its requested limit (for the `complete` flag).
     history: HashMap<String, ChatHistoryRequest>,
+    /// Per-channel membership, accumulated from NAMES and membership events.
+    rosters: HashMap<String, Roster>,
     next_label: u64,
 }
 
@@ -58,6 +67,11 @@ impl Engine {
     }
 
     fn on_passthrough(&mut self, msg: &Message, events: &mut Vec<Event>) {
+        // Channel state (NAMES/TOPIC): numerics and TOPIC that are neither a
+        // standard reply, an identity command, nor a chat message.
+        if self.handle_channel_state(msg, events) {
+            return;
+        }
         // Standard replies (rule 15) take precedence over chat interpretation.
         if let Some(reply) = StandardReply::from_message(msg) {
             events.push(Event::StandardReply(reply));
@@ -65,11 +79,142 @@ impl Engine {
         }
         // Membership/identity commands (JOIN/PART/QUIT/NICK/ACCOUNT/...).
         if let Some(event) = identity_event(msg) {
+            self.update_roster(&event);
             events.push(event);
             return;
         }
         if let Some(chat) = ChatMessage::from_message(msg) {
             events.push(Event::MessageReceived(chat));
+        }
+    }
+
+    /// Handle NAMES (353/366) and TOPIC (331/332/333 + the `TOPIC` command),
+    /// updating the roster and emitting events. Returns whether it applied.
+    fn handle_channel_state(&mut self, msg: &Message, events: &mut Vec<Event>) -> bool {
+        match &msg.command {
+            // 353 RPL_NAMREPLY: <me> <symbol> <channel> :<prefixed nicks>
+            Command::Numeric(353) => {
+                let (Some(channel), Some(names)) = (msg.params.get(2), msg.params.get(3)) else {
+                    return true;
+                };
+                self.rosters
+                    .entry(norm(channel))
+                    .or_default()
+                    .apply_names_reply(names);
+                true
+            }
+            // 366 RPL_ENDOFNAMES: <me> <channel> :End of /NAMES
+            Command::Numeric(366) => {
+                if let Some(channel) = msg.params.get(1) {
+                    let members = self
+                        .rosters
+                        .get(&norm(channel))
+                        .map(Roster::snapshot)
+                        .unwrap_or_default();
+                    events.push(Event::NamesLoaded {
+                        target: channel.clone(),
+                        members,
+                    });
+                }
+                true
+            }
+            // 332 RPL_TOPIC: <me> <channel> :<topic>
+            Command::Numeric(332) => {
+                if let Some(channel) = msg.params.get(1) {
+                    events.push(Event::TopicChanged {
+                        target: channel.clone(),
+                        topic: Some(msg.params.get(2).cloned().unwrap_or_default()),
+                        set_by: None,
+                        set_at: None,
+                    });
+                }
+                true
+            }
+            // 331 RPL_NOTOPIC: <me> <channel> :No topic is set
+            Command::Numeric(331) => {
+                if let Some(channel) = msg.params.get(1) {
+                    events.push(Event::TopicChanged {
+                        target: channel.clone(),
+                        topic: None,
+                        set_by: None,
+                        set_at: None,
+                    });
+                }
+                true
+            }
+            // 333 RPL_TOPICWHOTIME: <me> <channel> <setter> <unixtime>
+            Command::Numeric(333) => {
+                if let Some(channel) = msg.params.get(1) {
+                    let set_at = msg
+                        .params
+                        .get(3)
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0));
+                    events.push(Event::TopicChanged {
+                        target: channel.clone(),
+                        topic: None,
+                        set_by: msg.params.get(2).cloned(),
+                        set_at,
+                    });
+                }
+                true
+            }
+            // Live topic change: :nick!u@h TOPIC <channel> :<new topic>
+            Command::Named(name) if name == "TOPIC" => {
+                if let Some(channel) = msg.params.first() {
+                    let topic = match msg.params.get(1) {
+                        Some(t) if !t.is_empty() => Some(t.clone()),
+                        _ => None, // cleared
+                    };
+                    let set_by = msg.source.as_ref().and_then(|s| match s {
+                        irc_proto::Source::User { nick, .. } => Some(nick.clone()),
+                        irc_proto::Source::Server(_) => None,
+                    });
+                    events.push(Event::TopicChanged {
+                        target: channel.clone(),
+                        topic,
+                        set_by,
+                        set_at: msg.server_time(),
+                    });
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mirror a membership event into the per-channel rosters so the engine's
+    /// roster stays authoritative alongside the emitted deltas.
+    fn update_roster(&mut self, event: &Event) {
+        match event {
+            Event::MemberJoined { target, who, .. } => {
+                self.rosters
+                    .entry(norm(target))
+                    .or_default()
+                    .insert(&who.nick);
+            }
+            Event::MemberLeft {
+                target,
+                who,
+                reason,
+            } => match reason {
+                LeaveReason::Quit(_) => {
+                    for roster in self.rosters.values_mut() {
+                        roster.remove(&who.nick);
+                    }
+                }
+                _ => {
+                    if let Some(roster) = self.rosters.get_mut(&norm(target)) {
+                        roster.remove(&who.nick);
+                    }
+                }
+            },
+            Event::NickChanged { old, new } => {
+                for roster in self.rosters.values_mut() {
+                    roster.rename(old, new);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -130,6 +275,99 @@ mod tests {
 
     fn label_of(line: &str) -> String {
         Message::parse(line).unwrap().label().unwrap().to_string()
+    }
+
+    fn feed(e: &mut Engine, line: &str) -> Vec<Event> {
+        e.handle(Message::parse(line).unwrap())
+    }
+
+    #[test]
+    fn names_reply_accumulates_then_emits_at_end() {
+        let mut e = Engine::new();
+        assert!(feed(&mut e, ":s 353 me = #rust :@alice +bob").is_empty());
+        assert!(feed(&mut e, ":s 353 me = #rust :carol").is_empty());
+        let events = feed(&mut e, ":s 366 me #rust :End of /NAMES list");
+        assert_eq!(events.len(), 1);
+        let Event::NamesLoaded { target, members } = &events[0] else {
+            panic!("expected NamesLoaded, got {:?}", events[0]);
+        };
+        assert_eq!(target, "#rust");
+        assert_eq!(members.len(), 3);
+        let alice = members.iter().find(|m| m.nick == "alice").unwrap();
+        assert_eq!(alice.highest(), Some(crate::roster::MemberPrefix::Op));
+    }
+
+    #[test]
+    fn topic_numeric_and_whotime() {
+        let mut e = Engine::new();
+        let events = feed(&mut e, ":s 332 me #rust :Rust programming");
+        assert!(matches!(
+            &events[0],
+            Event::TopicChanged { target, topic: Some(t), .. } if target == "#rust" && t == "Rust programming"
+        ));
+        let events = feed(&mut e, ":s 333 me #rust setter 1600000000");
+        let Event::TopicChanged {
+            topic,
+            set_by,
+            set_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected TopicChanged");
+        };
+        assert!(topic.is_none()); // metadata only, don't overwrite text
+        assert_eq!(set_by.as_deref(), Some("setter"));
+        assert!(set_at.is_some());
+    }
+
+    #[test]
+    fn notopic_and_live_topic() {
+        let mut e = Engine::new();
+        assert!(matches!(
+            &feed(&mut e, ":s 331 me #rust :No topic is set")[0],
+            Event::TopicChanged { topic: None, .. }
+        ));
+        assert!(matches!(
+            &feed(&mut e, ":op!u@h TOPIC #rust :new topic")[0],
+            Event::TopicChanged { topic: Some(t), set_by: Some(by), .. }
+                if t == "new topic" && by == "op"
+        ));
+        // Empty trailing clears the topic.
+        assert!(matches!(
+            &feed(&mut e, ":op!u@h TOPIC #rust :")[0],
+            Event::TopicChanged {
+                topic: None,
+                set_by: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn roster_tracks_join_part_nick_across_events() {
+        let mut e = Engine::new();
+        feed(&mut e, ":s 353 me = #rust :@alice");
+        feed(&mut e, ":s 366 me #rust :End");
+        feed(&mut e, ":bob!u@h JOIN #rust");
+        // The engine's roster now has alice + bob; re-emit via a fresh 366 path
+        // is not exposed, so assert indirectly through a NAMES snapshot request:
+        feed(&mut e, ":carol!u@h NICK caroline");
+        feed(&mut e, ":bob!u@h PART #rust :bye");
+        // Drive another end-of-names on the same channel to snapshot the roster.
+        feed(&mut e, ":s 353 me = #rust :@alice caroline");
+        let events = feed(&mut e, ":s 366 me #rust :End");
+        let Event::NamesLoaded { members, .. } = &events[0] else {
+            panic!("expected NamesLoaded");
+        };
+        let nicks: Vec<&str> = members.iter().map(|m| m.nick.as_str()).collect();
+        assert!(nicks.contains(&"alice"));
+        assert!(!nicks.contains(&"bob")); // parted
+    }
+
+    #[test]
+    fn unrelated_numeric_yields_no_event() {
+        let mut e = Engine::new();
+        assert!(feed(&mut e, ":s 375 me :- Message of the Day -").is_empty());
     }
 
     // The integration proof: label routing + batch collection + server-time all

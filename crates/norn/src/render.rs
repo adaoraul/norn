@@ -33,6 +33,19 @@ pub fn render(event: &Event) {
         Event::BatchCollapsed(batch) => {
             println!("-- {} batch ({} items)", batch.batch_type, batch.len());
         }
+        Event::NamesLoaded { target, members } => {
+            println!("-- {} has {} member(s)", target, members.len());
+        }
+        Event::TopicChanged {
+            target,
+            topic,
+            set_by,
+            ..
+        } => match (topic, set_by) {
+            (Some(topic), _) => println!("-- topic for {target}: {topic}"),
+            (None, Some(by)) => println!("-- topic for {target} set by {by}"),
+            (None, None) => println!("-- {target} has no topic"),
+        },
         Event::MemberJoined {
             target,
             who,

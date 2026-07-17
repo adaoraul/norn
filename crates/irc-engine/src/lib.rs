@@ -18,6 +18,7 @@ pub mod framing;
 pub mod history;
 pub mod identity;
 pub mod labels;
+pub mod roster;
 pub mod stdreply;
 
 pub use batch::{BatchCollector, BatchItem, CollectorOutput, CompletedBatch};
@@ -30,4 +31,5 @@ pub use framing::LineFramer;
 pub use history::{ChatHistoryRequest, Selector};
 pub use identity::identity_event;
 pub use labels::{LabelRouter, LabeledResponse};
+pub use roster::{Member, MemberPrefix, Roster};
 pub use stdreply::{ReplyKind, StandardReply};
