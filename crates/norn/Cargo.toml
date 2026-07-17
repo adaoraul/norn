@@ -1,0 +1,15 @@
+[package]
+name = "norn"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal IRCv3 client built on the norn engine."
+
+[[bin]]
+name = "norn"
+path = "src/main.rs"
+
+[dependencies]
+irc-proto = { path = "../irc-proto" }
+irc-engine = { path = "../irc-engine" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
