@@ -62,8 +62,6 @@ pub struct Settings {
     pub conn: ConnConfig,
     /// Engine bring-up configuration.
     pub bringup: BringupConfig,
-    /// The SASL account name, retained for display only.
-    pub sasl_account: Option<String>,
 }
 
 impl Cli {
@@ -105,7 +103,6 @@ impl Cli {
                 tls,
             },
             bringup,
-            sasl_account: self.sasl_account,
         }
     }
 }

@@ -13,3 +13,5 @@ irc-proto = { path = "../irc-proto" }
 irc-engine = { path = "../irc-engine" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "0.26"
