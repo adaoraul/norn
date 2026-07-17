@@ -1,31 +1,33 @@
-//! Async connection driver: the only I/O in the engine.
+//! Async connection: framing plus read/write over a byte stream.
 //!
-//! It reads bytes from a stream, frames them into lines, parses each into a
-//! [`Message`], and feeds the [`BringupMachine`] (during bring-up) or the
-//! [`Engine`] (once registered), writing outgoing lines back. It is generic
-//! over any `AsyncRead + AsyncWrite` so it can be driven by an in-memory pipe in
-//! tests; a real TLS stream plugs in as the `S` type.
+//! [`recv`] returns the next parsed [`Message`], buffering any extra framed
+//! lines from a single read so nothing is dropped between calls. [`run_bringup`]
+//! drives the bring-up machine to `Registered` (or `Closed`); the client then
+//! owns the runtime loop, calling [`recv`]/[`send`] and feeding the [`Engine`].
 //!
-//! [`run`] is the unified driver: it hands the bring-up machine each message
-//! until `Registered`, then switches to the engine in the same read loop, so no
-//! already-framed line is dropped at the handoff. It also answers server `PING`
-//! keepalives in both phases.
+//! Generic over any `AsyncRead + AsyncWrite`, so tests drive it over an
+//! in-memory pipe and a real TLS stream plugs in as `S`.
 //!
-//! [`run`]: Connection::run
+//! [`recv`]: Connection::recv
+//! [`send`]: Connection::send
+//! [`run_bringup`]: Connection::run_bringup
+//! [`Engine`]: crate::engine::Engine
 
-use irc_proto::{Command, Message};
+use std::collections::VecDeque;
+
+use irc_proto::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
 
 use crate::bringup::{Action, BringupMachine};
-use crate::engine::Engine;
 use crate::event::Event;
 use crate::framing::LineFramer;
 
-/// A connection wrapping a byte stream and its line framer.
+/// A connection wrapping a byte stream, its line framer, and a buffer of framed
+/// but not-yet-returned lines.
 pub struct Connection<S> {
     stream: S,
     framer: LineFramer,
+    pending: VecDeque<String>,
 }
 
 impl<S> Connection<S>
@@ -37,104 +39,32 @@ where
         Connection {
             stream,
             framer: LineFramer::new(),
+            pending: VecDeque::new(),
         }
     }
 
-    /// Run the bring-up handshake to completion, returning the events emitted
-    /// (in order). Completes when the machine reaches `Registered`, or when the
-    /// stream ends first.
-    pub async fn run_bringup(
-        &mut self,
-        machine: &mut BringupMachine,
-    ) -> std::io::Result<Vec<Event>> {
-        let mut events = Vec::new();
-
-        // Opening handshake.
-        self.apply(machine.start(), &mut events).await?;
-        if machine.is_registered() {
-            return Ok(events);
-        }
-
+    /// Return the next parsed message, or `None` at end of stream.
+    ///
+    /// A single read can frame several lines; the extras are buffered and
+    /// returned by later calls, so nothing is dropped between `recv`s (this is
+    /// what lets the bring-up loop hand off to the runtime loop cleanly).
+    /// Unparseable lines are skipped.
+    pub async fn recv(&mut self) -> std::io::Result<Option<Message>> {
         let mut buf = [0u8; 4096];
         loop {
+            while let Some(line) = self.pending.pop_front() {
+                if let Ok(msg) = Message::parse(&line) {
+                    return Ok(Some(msg));
+                }
+            }
             let n = self.stream.read(&mut buf).await?;
             if n == 0 {
-                break; // EOF before registration
+                return Ok(None); // stream closed
             }
             for line in self.framer.push(&buf[..n]) {
-                if let Ok(msg) = Message::parse(&line) {
-                    let actions = machine.handle(&msg);
-                    self.apply(actions, &mut events).await?;
-                    if machine.is_registered() {
-                        return Ok(events);
-                    }
-                }
+                self.pending.push_back(line);
             }
         }
-
-        Ok(events)
-    }
-
-    /// Drive the whole session: bring-up, then the post-registration runtime.
-    ///
-    /// Sends the opening handshake, then loops selecting between inbound bytes
-    /// and outbound user lines from `outgoing`. Inbound messages go to the
-    /// bring-up machine until `Registered`, then to the `Engine`; server `PING`s
-    /// are answered in both phases. Outbound lines are only sent once registered
-    /// (earlier ones stay queued in the channel), so user input typed during
-    /// bring-up is not sent prematurely. Every event is passed to `on_event`.
-    /// Returns when the stream ends.
-    pub async fn run<F>(
-        &mut self,
-        machine: &mut BringupMachine,
-        engine: &mut Engine,
-        outgoing: &mut mpsc::UnboundedReceiver<String>,
-        mut on_event: F,
-    ) -> std::io::Result<()>
-    where
-        F: FnMut(&Event),
-    {
-        let opening = machine.start();
-        self.dispatch(opening, &mut on_event).await?;
-
-        let mut buf = [0u8; 4096];
-        let mut input_open = true;
-        loop {
-            tokio::select! {
-                result = self.stream.read(&mut buf) => {
-                    let n = result?;
-                    if n == 0 {
-                        break; // stream closed
-                    }
-                    for line in self.framer.push(&buf[..n]) {
-                        let Ok(msg) = Message::parse(&line) else {
-                            continue;
-                        };
-                        if machine.is_registered() {
-                            self.answer_ping(&msg).await?;
-                            for event in engine.handle(msg) {
-                                on_event(&event);
-                            }
-                        } else {
-                            let actions = machine.handle(&msg);
-                            self.dispatch(actions, &mut on_event).await?;
-                            if machine.is_closed() {
-                                return Ok(()); // bring-up aborted
-                            }
-                        }
-                    }
-                }
-                // Only accept user input once registered; before that it stays
-                // queued. Disabled entirely once the input channel closes.
-                maybe_line = outgoing.recv(), if input_open && machine.is_registered() => {
-                    match maybe_line {
-                        Some(line) => self.send(&line).await?,
-                        None => input_open = false,
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Send a raw line (a trailing CRLF is appended) and flush.
@@ -145,31 +75,27 @@ where
         Ok(())
     }
 
-    /// Reply to a server `PING` with a matching `PONG`.
-    async fn answer_ping(&mut self, msg: &Message) -> std::io::Result<()> {
-        if matches!(&msg.command, Command::Named(name) if name == "PING") {
-            let token = msg.params.first().cloned().unwrap_or_default();
-            self.send(&format!("PONG :{token}")).await?;
-        }
-        Ok(())
-    }
+    /// Drive bring-up: send the opening handshake, then feed messages to the
+    /// machine until it registers or aborts. Returns the events emitted, in
+    /// order. Buffered inbound lines survive in `pending` for the caller's
+    /// runtime loop.
+    pub async fn run_bringup(
+        &mut self,
+        machine: &mut BringupMachine,
+    ) -> std::io::Result<Vec<Event>> {
+        let mut events = Vec::new();
+        self.apply(machine.start(), &mut events).await?;
 
-    /// Write outgoing lines (appending CRLF) and route emitted events to a sink.
-    async fn dispatch<F>(&mut self, actions: Vec<Action>, on_event: &mut F) -> std::io::Result<()>
-    where
-        F: FnMut(&Event),
-    {
-        for action in actions {
-            match action {
-                Action::Send(line) => {
-                    self.stream.write_all(line.as_bytes()).await?;
-                    self.stream.write_all(b"\r\n").await?;
+        while !machine.is_registered() && !machine.is_closed() {
+            match self.recv().await? {
+                Some(msg) => {
+                    let actions = machine.handle(&msg);
+                    self.apply(actions, &mut events).await?;
                 }
-                Action::Emit(event) => on_event(&event),
+                None => break, // stream ended before registration
             }
         }
-        self.stream.flush().await?;
-        Ok(())
+        Ok(events)
     }
 
     /// Write outgoing lines (appending CRLF) and collect emitted events.

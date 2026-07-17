@@ -43,6 +43,10 @@ pub struct Cli {
     /// Disable TLS and connect in plaintext (for local test servers).
     #[arg(long, default_value_t = false)]
     pub no_tls: bool,
+
+    /// Channels to auto-join on connect (comma-separated, e.g. #rust,#tokio).
+    #[arg(long, value_delimiter = ',')]
+    pub join: Vec<String>,
 }
 
 /// Where and how to open the socket.
@@ -62,6 +66,8 @@ pub struct Settings {
     pub conn: ConnConfig,
     /// Engine bring-up configuration.
     pub bringup: BringupConfig,
+    /// Channels to auto-join once registered.
+    pub auto_join: Vec<String>,
 }
 
 impl Cli {
@@ -103,6 +109,7 @@ impl Cli {
                 tls,
             },
             bringup,
+            auto_join: self.join,
         }
     }
 }
