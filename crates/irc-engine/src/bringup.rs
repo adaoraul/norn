@@ -40,10 +40,11 @@ pub struct BringupConfig {
     /// Capability groups to request. Each group is `REQ`'d on its own line and
     /// is therefore ACK/NAK'd atomically (rule 5). Keep groups small.
     pub cap_groups: Vec<Vec<String>>,
-    /// Optional SASL mechanism (owns its credentials). When set and the server
-    /// offers `sasl`, it is requested and driven to completion before
-    /// `CAP END`.
-    pub sasl: Option<Box<dyn Mechanism>>,
+    /// SASL mechanisms in preference order (each owns its credentials). When
+    /// non-empty and the server offers `sasl`, one is selected (preferring the
+    /// server's advertised list) and driven to completion before `CAP END`. On
+    /// a `908` supported-mechanisms reply, the next listed candidate is tried.
+    pub sasl: Vec<Box<dyn Mechanism>>,
     /// Whether the underlying transport is TLS. PLAIN is refused without it
     /// (rule 9).
     pub tls: bool,
@@ -90,6 +91,8 @@ pub struct BringupMachine {
     enabled: CapSet,
     outstanding_reqs: usize,
     sasl_pending: bool,
+    /// Index into `config.sasl` of the mechanism currently being attempted.
+    current_mech: Option<usize>,
     account: Option<String>,
     cap_end_sent: bool,
 }
@@ -109,6 +112,7 @@ impl BringupMachine {
             enabled: CapSet::new(),
             outstanding_reqs: 0,
             sasl_pending: false,
+            current_mech: None,
             account: None,
             cap_end_sent: false,
         }
@@ -189,7 +193,7 @@ impl BringupMachine {
                     let sasl_acked = acked
                         .iter()
                         .any(|c| CapName::new(c.as_str()) == CapName::new("sasl"));
-                    if sasl_acked && self.config.sasl.is_some() {
+                    if sasl_acked && !self.config.sasl.is_empty() {
                         self.start_sasl(actions);
                     } else {
                         self.maybe_finish(actions);
@@ -253,10 +257,14 @@ impl BringupMachine {
                 }
             }
         };
-        let Some(mech) = self.config.sasl.as_mut() else {
+        let Some(idx) = self.current_mech else {
             return;
         };
-        match mech.respond(&challenge) {
+        let result = match self.config.sasl.get_mut(idx) {
+            Some(mech) => mech.respond(&challenge),
+            None => return,
+        };
+        match result {
             Ok(resp) => {
                 for line in response_lines(&resp) {
                     actions.push(Action::Send(line));
@@ -306,8 +314,44 @@ impl BringupMachine {
                 self.sasl_pending = false;
                 self.maybe_finish(actions);
             }
+            // 908 RPL_SASLMECHS: the server lists what it supports; retry with
+            // the next configured candidate rather than failing hard.
+            908 => {
+                let allowed: Vec<String> = msg
+                    .params
+                    .get(1)
+                    .map(|list| list.split(',').map(String::from).collect())
+                    .unwrap_or_default();
+                match self.select_mechanism(&allowed, self.current_mech) {
+                    Some(idx) => {
+                        self.current_mech = Some(idx);
+                        let name = self.config.sasl[idx].name().to_string();
+                        actions.push(Action::Send(format!("AUTHENTICATE {name}")));
+                    }
+                    None => self.sasl_fail(SaslError::Failed, actions),
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Pick a configured mechanism to try: the first that is usable (PLAIN
+    /// requires TLS, rule 9), not excluded, and permitted by `allowed` (an
+    /// empty `allowed` means no restriction).
+    fn select_mechanism(&self, allowed: &[String], exclude: Option<usize>) -> Option<usize> {
+        for (i, mech) in self.config.sasl.iter().enumerate() {
+            if Some(i) == exclude {
+                continue;
+            }
+            let name = mech.name();
+            if name == "PLAIN" && !self.config.tls {
+                continue;
+            }
+            if allowed.is_empty() || allowed.iter().any(|m| m == name) {
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// Build and send `CAP REQ` lines for the wanted-and-available caps, one
@@ -328,7 +372,7 @@ impl BringupMachine {
 
         // Ensure sasl is requested if configured and offered but not already in
         // a configured group.
-        if self.config.sasl.is_some() && self.available.contains("sasl") {
+        if !self.config.sasl.is_empty() && self.available.contains("sasl") {
             let already = groups
                 .iter()
                 .flatten()
@@ -346,19 +390,29 @@ impl BringupMachine {
     }
 
     fn start_sasl(&mut self, actions: &mut Vec<Action>) {
-        let Some(name) = self.config.sasl.as_ref().map(|m| m.name().to_string()) else {
-            return;
-        };
-        // Never offer PLAIN without TLS (rule 9): skip SASL entirely.
-        if name == "PLAIN" && !self.config.tls {
-            self.sasl_pending = false;
-            actions.push(Action::Emit(Event::AuthResult(Err(SaslError::Failed))));
-            self.maybe_finish(actions);
-            return;
+        // Prefer a mechanism the server advertised in the sasl cap value; fall
+        // back to any usable configured one.
+        let advertised: Vec<String> = self
+            .available
+            .values("sasl")
+            .iter()
+            .map(|m| (*m).to_string())
+            .collect();
+        match self.select_mechanism(&advertised, None) {
+            Some(idx) => {
+                self.current_mech = Some(idx);
+                self.sasl_pending = true;
+                self.state = State::SaslInProgress;
+                let name = self.config.sasl[idx].name().to_string();
+                actions.push(Action::Send(format!("AUTHENTICATE {name}")));
+            }
+            None => {
+                // Nothing usable (e.g. only PLAIN offered without TLS, rule 9).
+                self.sasl_pending = false;
+                actions.push(Action::Emit(Event::AuthResult(Err(SaslError::Failed))));
+                self.maybe_finish(actions);
+            }
         }
-        self.sasl_pending = true;
-        self.state = State::SaslInProgress;
-        actions.push(Action::Send(format!("AUTHENTICATE {name}")));
     }
 
     fn sasl_fail(&mut self, err: SaslError, actions: &mut Vec<Action>) {
@@ -393,6 +447,22 @@ impl BringupMachine {
             enabled: self.enabled.clone(),
         }));
     }
+}
+
+/// The phase-1 and phase-2 capabilities a modern client wants, grouped into
+/// small atomic `CAP REQ` sets (rule 5). `sasl` is added automatically by the
+/// machine when a mechanism is configured, so it is not listed here.
+pub fn recommended_caps() -> Vec<Vec<String>> {
+    [
+        &["server-time", "message-tags", "batch", "labeled-response"][..],
+        &["account-tag", "account-notify", "extended-join"][..],
+        &["chghost", "away-notify", "setname", "multi-prefix"][..],
+        &["msgid", "echo-message"][..],
+        &["chathistory"][..],
+    ]
+    .iter()
+    .map(|group| group.iter().map(|c| (*c).to_string()).collect())
+    .collect()
 }
 
 /// Extract `(more, cap_list)` from a `CAP ... LS/NEW ...` param list. A `*`
@@ -454,7 +524,11 @@ mod tests {
             user: "adao".into(),
             realname: "Adao".into(),
             cap_groups: vec![vec!["multi-prefix".into(), "server-time".into()]],
-            sasl: sasl.then(|| Box::new(Plain::new("adao", "hunter2")) as Box<dyn Mechanism>),
+            sasl: if sasl {
+                vec![Box::new(Plain::new("adao", "hunter2")) as Box<dyn Mechanism>]
+            } else {
+                Vec::new()
+            },
             tls,
             sasl_fail_policy: policy,
         }
@@ -582,11 +656,11 @@ mod tests {
         use irc_proto::sasl::{encode_b64, ScramSha256};
 
         let mut cfg = config(false, true, SaslFailPolicy::Continue);
-        cfg.sasl = Some(Box::new(ScramSha256::new(
+        cfg.sasl = vec![Box::new(ScramSha256::new(
             "user",
             "pencil",
             "rOprNGfwEbeRWgbNEkqO",
-        )));
+        ))];
         let mut d = Driver::new(cfg);
 
         d.feed("CAP * LS :sasl");
@@ -672,6 +746,53 @@ mod tests {
     }
 
     #[test]
+    fn sasl_908_retries_with_a_listed_mechanism() {
+        // Prefer EXTERNAL, fall back to PLAIN. The server rejects EXTERNAL with
+        // 908 listing only PLAIN, so the machine retries PLAIN, not fails.
+        use irc_proto::sasl::{External, Plain};
+
+        let mut cfg = config(false, true, SaslFailPolicy::Continue);
+        cfg.sasl = vec![
+            Box::new(External::new()) as Box<dyn Mechanism>,
+            Box::new(Plain::new("adao", "hunter2")) as Box<dyn Mechanism>,
+        ];
+        let mut d = Driver::new(cfg);
+
+        d.feed("CAP * LS :sasl");
+        d.feed("CAP * ACK :sasl");
+        assert!(d.sent_contains("AUTHENTICATE EXTERNAL"));
+
+        // Server: EXTERNAL not available, only PLAIN is.
+        d.feed("908 adao PLAIN :are available SASL mechanisms");
+        assert!(d.sent_contains("AUTHENTICATE PLAIN"));
+        // Not a hard failure: no auth error, negotiation still open.
+        assert!(!d
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::AuthResult(Err(_)))));
+        assert!(!d.sent_contains("CAP END"));
+
+        // PLAIN then completes normally.
+        d.feed("AUTHENTICATE +");
+        assert!(d.sent_contains("AUTHENTICATE AGFkYW8AaHVudGVyMg=="));
+        d.feed("903 adao :ok");
+        assert!(d.sent_contains("CAP END"));
+    }
+
+    #[test]
+    fn sasl_908_with_no_matching_mechanism_fails() {
+        let mut d = Driver::new(config(true, true, SaslFailPolicy::Continue));
+        d.feed("CAP * LS :sasl");
+        d.feed("CAP * ACK :sasl"); // starts PLAIN
+                                   // Server lists only mechanisms we do not have.
+        d.feed("908 adao ECDSA-NIST256P-CHALLENGE :are available SASL mechanisms");
+        assert!(d
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::AuthResult(Err(SaslError::Failed)))));
+    }
+
+    #[test]
     fn plain_without_tls_is_refused() {
         let mut d = Driver::new(config(true, false, SaslFailPolicy::Continue));
         d.feed("CAP * LS :sasl");
@@ -679,6 +800,16 @@ mod tests {
         // PLAIN over a non-TLS transport: no AUTHENTICATE, SASL skipped (rule 9).
         assert!(!d.sent_contains("AUTHENTICATE PLAIN"));
         assert!(d.sent_contains("CAP END"));
+    }
+
+    #[test]
+    fn recommended_caps_are_small_groups_without_sasl() {
+        let groups = recommended_caps();
+        assert!(groups.len() > 1, "should be split into small groups");
+        // sasl is added by the machine, not listed here.
+        assert!(!groups.iter().flatten().any(|c| c == "sasl"));
+        assert!(groups.iter().flatten().any(|c| c == "extended-join"));
+        assert!(groups.iter().flatten().any(|c| c == "chathistory"));
     }
 
     #[test]

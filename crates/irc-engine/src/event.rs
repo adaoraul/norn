@@ -4,7 +4,7 @@
 //! currently carries the variants produced during bring-up; more arrive in
 //! later build-order steps (message receipt, history, membership).
 
-use irc_proto::{CapSet, SaslError};
+use irc_proto::{CapSet, SaslError, Source};
 
 use crate::batch::CompletedBatch;
 use crate::chat::ChatMessage;
@@ -12,6 +12,56 @@ use crate::stdreply::StandardReply;
 
 /// An authenticated account name.
 pub type AccountName = String;
+
+/// A user identity from a message prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct User {
+    /// The nickname.
+    pub nick: String,
+    /// The user/ident, if known.
+    pub user: Option<String>,
+    /// The host, if known.
+    pub host: Option<String>,
+}
+
+impl User {
+    /// A user known only by nick (e.g. the target of a KICK).
+    pub fn nick(nick: impl Into<String>) -> Self {
+        User {
+            nick: nick.into(),
+            user: None,
+            host: None,
+        }
+    }
+
+    /// Build from a message source; `None` for a server prefix.
+    pub fn from_source(source: &Source) -> Option<User> {
+        match source {
+            Source::User { nick, user, host } => Some(User {
+                nick: nick.clone(),
+                user: user.clone(),
+                host: host.clone(),
+            }),
+            Source::Server(_) => None,
+        }
+    }
+}
+
+/// Why a member left a channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaveReason {
+    /// `PART`, with its reason.
+    Part(String),
+    /// `QUIT`, with its reason (applies to every shared channel).
+    Quit(String),
+    /// `KICK`, by whom and why.
+    Kicked {
+        /// The nick that issued the kick.
+        by: String,
+        /// The kick reason.
+        reason: String,
+    },
+}
 
 /// A semantic event emitted by the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +96,63 @@ pub enum Event {
     },
     /// A netsplit/netjoin (or other collapsible) batch folded into one event.
     BatchCollapsed(CompletedBatch),
+    /// A member joined a channel. `account` is present with `extended-join`.
+    MemberJoined {
+        /// The channel joined.
+        target: String,
+        /// Who joined.
+        who: User,
+        /// Their account, if `extended-join` supplied one.
+        account: Option<String>,
+    },
+    /// A member left a channel (PART/QUIT/KICK).
+    MemberLeft {
+        /// The channel left (empty for QUIT, which is channel-agnostic).
+        target: String,
+        /// Who left.
+        who: User,
+        /// How they left.
+        reason: LeaveReason,
+    },
+    /// A user changed nick (`NICK`).
+    NickChanged {
+        /// Previous nick.
+        old: String,
+        /// New nick.
+        new: String,
+    },
+    /// A user's account changed (`account-notify`): `Some` on login, `None` on
+    /// logout.
+    AccountChanged {
+        /// The affected nick.
+        nick: String,
+        /// The new account, or `None` if logged out.
+        account: Option<String>,
+    },
+    /// A user's user/host changed (`chghost`).
+    HostChanged {
+        /// The affected nick.
+        nick: String,
+        /// New user/ident.
+        user: String,
+        /// New host.
+        host: String,
+    },
+    /// A user's away state changed (`away-notify`): `Some(message)` when away,
+    /// `None` when back.
+    AwayChanged {
+        /// The affected nick.
+        nick: String,
+        /// The away message, or `None` if no longer away.
+        message: Option<String>,
+    },
+    /// A user changed their realname (`setname`).
+    RealnameChanged {
+        /// The affected nick.
+        nick: String,
+        /// The new realname.
+        realname: String,
+    },
     /// A `FAIL`/`WARN`/`NOTE` standard reply (rule 15).
     StandardReply(StandardReply),
     /// The connection was terminated.

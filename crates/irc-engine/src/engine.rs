@@ -15,6 +15,7 @@ use crate::batch::{BatchCollector, CollectorOutput, CompletedBatch};
 use crate::chat::ChatMessage;
 use crate::event::Event;
 use crate::history::ChatHistoryRequest;
+use crate::identity::identity_event;
 use crate::stdreply::StandardReply;
 
 /// Wires batch collection and request correlation into semantic events.
@@ -60,6 +61,11 @@ impl Engine {
         // Standard replies (rule 15) take precedence over chat interpretation.
         if let Some(reply) = StandardReply::from_message(msg) {
             events.push(Event::StandardReply(reply));
+            return;
+        }
+        // Membership/identity commands (JOIN/PART/QUIT/NICK/ACCOUNT/...).
+        if let Some(event) = identity_event(msg) {
+            events.push(event);
             return;
         }
         if let Some(chat) = ChatMessage::from_message(msg) {
@@ -231,6 +237,18 @@ mod tests {
             e.handle(Message::parse("@msgid=z :bob!u@h PRIVMSG #rust :live message").unwrap());
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], Event::MessageReceived(_)));
+    }
+
+    #[test]
+    fn join_surfaces_as_member_joined() {
+        let mut e = Engine::new();
+        let events = e.handle(Message::parse(":nick!u@h JOIN #rust adao :Adao").unwrap());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            Event::MemberJoined { target, account: Some(a), .. }
+                if target == "#rust" && a == "adao"
+        ));
     }
 
     #[test]

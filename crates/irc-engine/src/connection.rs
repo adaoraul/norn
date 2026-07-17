@@ -100,7 +100,7 @@ mod tests {
             user: "adao".into(),
             realname: "Adao".into(),
             cap_groups: vec![vec!["server-time".into()]],
-            sasl: Some(Box::new(Plain::new("adao", "hunter2")) as Box<dyn Mechanism>),
+            sasl: vec![Box::new(Plain::new("adao", "hunter2")) as Box<dyn Mechanism>],
             tls: true,
             sasl_fail_policy: SaslFailPolicy::Continue,
         }
