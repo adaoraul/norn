@@ -139,6 +139,21 @@ impl CapSet {
         }
     }
 
+    /// The name exactly as advertised for a logical capability, if present.
+    ///
+    /// Use this to build `CAP REQ`, which must echo the spelling the server
+    /// sent: if it advertised `draft/chathistory`, request that, not the
+    /// ratified `chathistory` (rule 14).
+    pub fn advertised(&self, name: &str) -> Option<&str> {
+        let target = CapName::new(name);
+        self.names().find(|n| **n == target).map(CapName::as_str)
+    }
+
+    /// Merge another set into this one (later values win). Used for `CAP NEW`.
+    pub fn extend(&mut self, other: CapSet) {
+        self.0.extend(other.0);
+    }
+
     /// Remove a capability (used for `CAP DEL`). Returns whether it was present.
     pub fn remove(&mut self, name: &str) -> bool {
         self.0.remove(&CapName::new(name)).is_some()

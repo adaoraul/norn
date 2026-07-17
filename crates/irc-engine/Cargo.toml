@@ -6,3 +6,4 @@ description = "Async IRCv3 engine: connection, TLS, bring-up machines, batch/lab
 
 [dependencies]
 irc-proto = { path = "../irc-proto" }
+tokio = { version = "1", features = ["io-util", "rt", "macros", "net", "time", "sync"] }
