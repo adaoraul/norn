@@ -6,6 +6,10 @@
 
 use irc_proto::{CapSet, SaslError};
 
+use crate::batch::CompletedBatch;
+use crate::chat::ChatMessage;
+use crate::stdreply::StandardReply;
+
 /// An authenticated account name.
 pub type AccountName = String;
 
@@ -27,6 +31,23 @@ pub enum Event {
     },
     /// The result of a SASL attempt: the account on success, or the failure.
     AuthResult(Result<AccountName, SaslError>),
+    /// A chat message (PRIVMSG/NOTICE) was received, with original metadata.
+    MessageReceived(ChatMessage),
+    /// A CHATHISTORY response resolved into an ordered page of messages, each
+    /// carrying its original `time`/`msgid`. `complete` is false when the
+    /// server returned exactly the requested limit (there may be more).
+    HistoryLoaded {
+        /// The conversation the history is for.
+        target: String,
+        /// The messages, in receive order.
+        messages: Vec<ChatMessage>,
+        /// Whether this is all there is (fewer than the limit returned).
+        complete: bool,
+    },
+    /// A netsplit/netjoin (or other collapsible) batch folded into one event.
+    BatchCollapsed(CompletedBatch),
+    /// A `FAIL`/`WARN`/`NOTE` standard reply (rule 15).
+    StandardReply(StandardReply),
     /// The connection was terminated.
     Disconnected(DisconnectReason),
 }

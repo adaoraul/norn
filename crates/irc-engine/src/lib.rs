@@ -10,14 +10,22 @@
 
 pub mod batch;
 pub mod bringup;
+pub mod chat;
 pub mod connection;
+pub mod engine;
 pub mod event;
 pub mod framing;
+pub mod history;
 pub mod labels;
+pub mod stdreply;
 
 pub use batch::{BatchCollector, BatchItem, CollectorOutput, CompletedBatch};
 pub use bringup::{Action, BringupConfig, BringupMachine, SaslFailPolicy, State};
+pub use chat::{ChatMessage, MessageKind};
 pub use connection::Connection;
+pub use engine::Engine;
 pub use event::{AccountName, DisconnectReason, Event};
 pub use framing::LineFramer;
+pub use history::{ChatHistoryRequest, Selector};
 pub use labels::{LabelRouter, LabeledResponse};
+pub use stdreply::{ReplyKind, StandardReply};
