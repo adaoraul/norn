@@ -8,12 +8,16 @@
 //! feeds it real bytes. Batch collection, label routing, and CHATHISTORY arrive
 //! in later build-order steps.
 
+pub mod batch;
 pub mod bringup;
 pub mod connection;
 pub mod event;
 pub mod framing;
+pub mod labels;
 
+pub use batch::{BatchCollector, BatchItem, CollectorOutput, CompletedBatch};
 pub use bringup::{Action, BringupConfig, BringupMachine, SaslFailPolicy, State};
 pub use connection::Connection;
 pub use event::{AccountName, DisconnectReason, Event};
 pub use framing::LineFramer;
+pub use labels::{LabelRouter, LabeledResponse};
