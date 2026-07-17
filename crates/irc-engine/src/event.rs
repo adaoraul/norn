@@ -165,4 +165,6 @@ pub enum DisconnectReason {
     /// SASL failed and the configured policy was to abort rather than continue
     /// unauthenticated.
     SaslAbortedByPolicy,
+    /// Every candidate nickname was already in use; registration was abandoned.
+    NickUnavailable,
 }

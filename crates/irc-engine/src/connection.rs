@@ -118,6 +118,9 @@ where
                         } else {
                             let actions = machine.handle(&msg);
                             self.dispatch(actions, &mut on_event).await?;
+                            if machine.is_closed() {
+                                return Ok(()); // bring-up aborted
+                            }
                         }
                     }
                 }

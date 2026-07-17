@@ -20,6 +20,9 @@ use irc_proto::{
 
 use crate::event::{DisconnectReason, Event};
 
+/// How many alternate nicknames to try after `433`/`436` before giving up.
+const MAX_NICK_ATTEMPTS: usize = 6;
+
 /// What to do if SASL fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaslFailPolicy {
@@ -93,6 +96,8 @@ pub struct BringupMachine {
     sasl_pending: bool,
     /// Index into `config.sasl` of the mechanism currently being attempted.
     current_mech: Option<usize>,
+    /// How many alternate nicks we have tried after `433`/`436`.
+    nick_attempts: usize,
     account: Option<String>,
     cap_end_sent: bool,
 }
@@ -113,6 +118,7 @@ impl BringupMachine {
             outstanding_reqs: 0,
             sasl_pending: false,
             current_mech: None,
+            nick_attempts: 0,
             account: None,
             cap_end_sent: false,
         }
@@ -126,6 +132,11 @@ impl BringupMachine {
     /// Whether registration has completed.
     pub fn is_registered(&self) -> bool {
         self.state == State::Registered
+    }
+
+    /// Whether bring-up was aborted (SASL abort policy, or nick exhaustion).
+    pub fn is_closed(&self) -> bool {
+        self.state == State::Closed
     }
 
     /// Whether `CAP END` has been sent (used to assert rule 6 in tests).
@@ -314,6 +325,8 @@ impl BringupMachine {
                 self.sasl_pending = false;
                 self.maybe_finish(actions);
             }
+            // 433/436: the nick is taken; try an alternate before giving up.
+            433 | 436 => self.try_alternate_nick(actions),
             // 908 RPL_SASLMECHS: the server lists what it supports; retry with
             // the next configured candidate rather than failing hard.
             908 => {
@@ -387,6 +400,25 @@ impl BringupMachine {
                 self.outstanding_reqs += 1;
             }
         }
+    }
+
+    /// React to a nick-in-use reply by proposing a new nick (the base nick with
+    /// trailing underscores), or aborting once the attempts are exhausted. Only
+    /// meaningful before registration completes.
+    fn try_alternate_nick(&mut self, actions: &mut Vec<Action>) {
+        if self.state == State::Registered || self.state == State::Closed {
+            return;
+        }
+        self.nick_attempts += 1;
+        if self.nick_attempts > MAX_NICK_ATTEMPTS {
+            self.state = State::Closed;
+            actions.push(Action::Emit(Event::Disconnected(
+                DisconnectReason::NickUnavailable,
+            )));
+            return;
+        }
+        let candidate = format!("{}{}", self.config.nick, "_".repeat(self.nick_attempts));
+        actions.push(Action::Send(format!("NICK {candidate}")));
     }
 
     fn start_sasl(&mut self, actions: &mut Vec<Action>) {
@@ -810,6 +842,44 @@ mod tests {
         assert!(!groups.iter().flatten().any(|c| c == "sasl"));
         assert!(groups.iter().flatten().any(|c| c == "extended-join"));
         assert!(groups.iter().flatten().any(|c| c == "chathistory"));
+    }
+
+    #[test]
+    fn nick_in_use_retries_with_an_alternate() {
+        let mut d = Driver::new(config(false, true, SaslFailPolicy::Continue));
+        d.feed("CAP * LS :server-time");
+        d.feed("CAP * ACK :server-time");
+        assert!(d.sent_contains("CAP END"));
+
+        // Server rejects the nick; the machine proposes the base nick + '_'.
+        d.feed("433 * adao :Nickname is already in use");
+        assert!(d.sent_contains("NICK adao_"));
+        assert!(!d.machine.is_registered());
+
+        // The server accepts the alternate and welcomes it.
+        d.feed("001 adao_ :Welcome");
+        assert!(d.machine.is_registered());
+        assert!(d
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Registered { nick } if nick == "adao_")));
+    }
+
+    #[test]
+    fn nick_in_use_gives_up_after_max_attempts() {
+        let mut d = Driver::new(config(false, true, SaslFailPolicy::Continue));
+        d.feed("CAP * LS :server-time");
+        d.feed("CAP * ACK :server-time");
+
+        for _ in 0..=MAX_NICK_ATTEMPTS {
+            d.feed("433 * adao :Nickname is already in use");
+        }
+        assert_eq!(d.machine.state(), State::Closed);
+        assert!(d.machine.is_closed());
+        assert!(d
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Disconnected(DisconnectReason::NickUnavailable))));
     }
 
     #[test]
