@@ -349,6 +349,7 @@ mod tests {
         AddonCtx {
             my_nick,
             network: "libera",
+            presence: &crate::addons::EMPTY_PRESENCE,
         }
     }
 

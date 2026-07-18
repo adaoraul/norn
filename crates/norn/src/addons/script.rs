@@ -15,9 +15,11 @@ use rhai::{Array, Dynamic, Engine, ImmutableString, Map, Scope, AST};
 
 use crate::session::NetworkId;
 
+#[cfg(test)]
+use super::EMPTY_PRESENCE;
 use super::{
     event_reply_target, AddonCtx, AddonEvent, AddonEventKind, AddonHost, PluginInfo, PluginStatus,
-    Reaction,
+    Presence, Reaction,
 };
 
 /// Per-invocation state the host API reads/writes while a hook runs. Shared with
@@ -35,6 +37,8 @@ struct HostState {
     store: HashMap<String, HashMap<String, String>>,
     /// Where the store is persisted; `None` for in-memory (tests).
     store_path: Option<PathBuf>,
+    /// Our presence on the event's network (for the read-only accessors).
+    presence: Presence,
 }
 
 /// The `store` handle scripts call methods on (`store.get`/`set`/...). Zero-sized;
@@ -233,6 +237,7 @@ impl AddonHost for RhaiHost {
             s.my_nick = ctx.my_nick.to_string();
             s.reply_to = event_reply_target(&event.kind, ctx.my_nick);
             s.reactions.clear();
+            s.presence = ctx.presence.clone();
         }
         let map = event_map(&event.kind, ctx);
         for script in &self.scripts {
@@ -422,6 +427,64 @@ fn build_engine(state: Rc<RefCell<HostState>>) -> Engine {
         });
     });
 
+    // Read-only presence accessors, from the per-event snapshot.
+    // am_away(): are we marked away on the event's network?
+    let st = state.clone();
+    engine.register_fn("am_away", move || -> bool { st.borrow().presence.away });
+    // my_account(): our services account ("" if not logged in).
+    let st = state.clone();
+    engine.register_fn("my_account", move || -> ImmutableString {
+        st.borrow()
+            .presence
+            .account
+            .clone()
+            .unwrap_or_default()
+            .into()
+    });
+    // channels(): the channels we are in.
+    let st = state.clone();
+    engine.register_fn("channels", move || -> Array {
+        st.borrow()
+            .presence
+            .channels
+            .iter()
+            .map(|(name, _)| Dynamic::from(name.clone()))
+            .collect()
+    });
+    // names(channel): the nicks in a channel we are in (empty if not a member).
+    let st = state.clone();
+    engine.register_fn("names", move |channel: ImmutableString| -> Array {
+        let s = st.borrow();
+        s.presence
+            .channels
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&channel))
+            .map(|(_, members)| {
+                members
+                    .iter()
+                    .map(|(nick, _)| Dynamic::from(nick.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    // is_op(channel, nick): does nick hold op (or higher) in channel?
+    let st = state.clone();
+    engine.register_fn(
+        "is_op",
+        move |channel: ImmutableString, nick: ImmutableString| -> bool {
+            let s = st.borrow();
+            s.presence
+                .channels
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&channel))
+                .is_some_and(|(_, members)| {
+                    members
+                        .iter()
+                        .any(|(n, op)| *op && n.eq_ignore_ascii_case(&nick))
+                })
+        },
+    );
+
     // KV store: `store.get/set/del/has/keys`, namespaced per plugin and persisted
     // by the host. Scripts never see the path or touch disk themselves.
     engine.register_type_with_name::<Store>("Store");
@@ -515,6 +578,7 @@ mod tests {
         AddonCtx {
             my_nick,
             network: "libera",
+            presence: &EMPTY_PRESENCE,
         }
     }
 
@@ -661,6 +725,56 @@ mod tests {
         let out = h.on_event(&message("#c", "bob", "hey"), &ctx("me"));
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], Reaction::Desktop { text } if text == "hi bob"));
+    }
+
+    #[test]
+    fn presence_accessors_read_the_snapshot() {
+        let mut h = RhaiHost::from_sources(
+            &[(
+                "p.rhai",
+                r##"fn on_message(m) {
+                       reply("away=" + am_away().to_string());
+                       reply("acct=" + my_account());
+                       reply("chans=" + channels().len().to_string());
+                       reply("op=" + is_op("#rust", "alice").to_string());
+                       reply("notop=" + is_op("#rust", "bob").to_string());
+                       reply("names=" + names("#rust").len().to_string());
+                   }"##,
+            )],
+            &[],
+        );
+        let presence = Presence {
+            away: true,
+            account: Some("svan".into()),
+            channels: vec![(
+                "#rust".into(),
+                vec![("alice".into(), true), ("bob".into(), false)],
+            )],
+        };
+        let ctx = AddonCtx {
+            my_nick: "me",
+            network: "libera",
+            presence: &presence,
+        };
+        let out = h.on_event(&message("#rust", "bob", "hi"), &ctx);
+        let sent: Vec<&str> = out
+            .iter()
+            .filter_map(|r| match r {
+                Reaction::Send { lines, .. } => lines.first().map(|s| s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                "PRIVMSG #rust :away=true",
+                "PRIVMSG #rust :acct=svan",
+                "PRIVMSG #rust :chans=1",
+                "PRIVMSG #rust :op=true",
+                "PRIVMSG #rust :notop=false",
+                "PRIVMSG #rust :names=2",
+            ]
+        );
     }
 
     #[test]

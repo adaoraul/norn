@@ -27,11 +27,11 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::addons::{
-    build_addon_host, AddonCtx, AddonEvent, AddonHost, PluginInfo, PluginStatus, Reaction,
+    build_addon_host, AddonCtx, AddonEvent, AddonHost, PluginInfo, PluginStatus, Presence, Reaction,
 };
 use crate::config::{ClientConfig, NetworkConfig, TriggerConfig};
 use crate::session::{NetCommand, UiEvent, UiEventKind};
-use state::{App, AppAction, NetworkMeta};
+use state::{App, AppAction, BufferKind, NetworkMeta};
 
 /// A terminal in raw/alternate-screen mode, restored on drop.
 struct TerminalGuard {
@@ -239,11 +239,37 @@ fn addon_reactions(app: &App, host: &mut dyn AddonHost, event: &UiEvent) -> Vec<
     let Some(addon_event) = AddonEvent::from_engine(engine_event, event.net, &my_nick) else {
         return Vec::new();
     };
+    // Snapshot our presence on this network for the read-only accessors.
+    let channels = app
+        .buffers
+        .iter()
+        .filter(|b| b.net == event.net && b.kind == BufferKind::Channel)
+        .map(|b| {
+            let members = b
+                .members
+                .iter()
+                .map(|m| (m.nick.clone(), member_is_op(m)))
+                .collect();
+            (b.name.clone(), members)
+        })
+        .collect();
+    let presence = Presence {
+        away: meta.away,
+        account: meta.account.clone(),
+        channels,
+    };
     let ctx = AddonCtx {
         my_nick: &my_nick,
         network: &network,
+        presence: &presence,
     };
     host.on_event(&addon_event, &ctx)
+}
+
+/// Whether a channel member holds op or higher (op, admin, or owner).
+fn member_is_op(m: &irc_engine::Member) -> bool {
+    use irc_engine::MemberPrefix::{Admin, Op, Owner};
+    m.prefixes.iter().any(|p| matches!(p, Owner | Admin | Op))
 }
 
 /// Perform the supervisor's queued actions: spawn new network tasks and signal

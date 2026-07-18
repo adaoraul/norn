@@ -51,6 +51,7 @@ mod tests {
     use super::*;
     use crate::addons::{
         AddonCtx, AddonEvent, AddonEventKind, AddonHost, PluginStatus, Reaction, RhaiHost,
+        EMPTY_PRESENCE,
     };
 
     #[test]
@@ -83,6 +84,7 @@ mod tests {
         let ctx = AddonCtx {
             my_nick: "me",
             network: "libera",
+            presence: &EMPTY_PRESENCE,
         };
         let out = host.on_event(&ev, &ctx);
         assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["JOIN #norn"]));
@@ -95,6 +97,7 @@ mod tests {
         let ctx = AddonCtx {
             my_nick: "me",
             network: "libera",
+            presence: &EMPTY_PRESENCE,
         };
         let msg = |nick: &str, text: &str| AddonEvent {
             net: 0,

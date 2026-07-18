@@ -172,12 +172,38 @@ pub(crate) fn event_reply_target(kind: &AddonEventKind, my_nick: &str) -> Option
     }
 }
 
+/// A read-only snapshot of our presence on the event's network, so scripts can
+/// answer `am_away()`/`my_account()`/`channels()`/`names()`/`is_op()` without the
+/// host exposing live app state.
+#[derive(Debug, Clone, Default)]
+pub struct Presence {
+    /// Whether we are currently marked away.
+    pub away: bool,
+    /// Our services account, if logged in.
+    pub account: Option<String>,
+    /// The channels we are in: `(channel, [(nick, is_op)])`.
+    pub channels: Vec<(String, Vec<(String, bool)>)>,
+}
+
+/// A shared empty presence, borrowable as `'static` (for tests that build an
+/// `AddonCtx` with no presence). A `static` rather than an associated `const` so
+/// `&EMPTY_PRESENCE` is a `'static` reference (`Presence` holds a `Vec`, so a
+/// `const` would only yield a short-lived temporary).
+#[cfg(test)]
+pub static EMPTY_PRESENCE: Presence = Presence {
+    away: false,
+    account: None,
+    channels: Vec::new(),
+};
+
 /// Read-only context passed to a host with each event.
 pub struct AddonCtx<'a> {
     /// Our nick on the event's network.
     pub my_nick: &'a str,
     /// The event's network name.
     pub network: &'a str,
+    /// Our presence on the event's network.
+    pub presence: &'a Presence,
 }
 
 /// What a host asks the supervisor to enact.
@@ -345,6 +371,7 @@ mod tests {
         let ctx = AddonCtx {
             my_nick: "me",
             network: "n",
+            presence: &EMPTY_PRESENCE,
         };
         let out = host.on_event(&ev, &ctx);
         assert_eq!(out.len(), 2);
