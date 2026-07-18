@@ -31,6 +31,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     ])
     .split(area);
 
+    // Indent the center content from the panes (the design has inner padding).
+    let center_area = Rect {
+        x: cols[1].x + 1,
+        y: cols[1].y,
+        width: cols[1].width.saturating_sub(2),
+        height: cols[1].height,
+    };
     let center = Layout::vertical([
         Constraint::Length(1), // header
         Constraint::Length(1), // header rule
@@ -38,7 +45,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Constraint::Length(1), // activity bar
         Constraint::Length(1), // input
     ])
-    .split(cols[1]);
+    .split(center_area);
 
     draw_sidebar(f, cols[0], app);
     draw_header(f, center[0], app);
@@ -148,7 +155,8 @@ fn sidebar_row(
     badge_fg: ratatui::style::Color,
     inner_w: usize,
 ) -> Line<'static> {
-    let name_w = inner_w.saturating_sub(1 + badge.width());
+    // Layout: accent bar (1) + a space + label + padding + badge.
+    let name_w = inner_w.saturating_sub(2 + badge.width());
     let name = truncate(label, name_w);
     let pad = " ".repeat(name_w.saturating_sub(name.width()));
     let bg = if active {
@@ -159,7 +167,7 @@ fn sidebar_row(
     let bar = if active { "▎" } else { " " };
     Line::from(vec![
         Span::styled(bar, Style::default().fg(accent).bg(bg)),
-        Span::styled(format!("{name}{pad}"), Style::default().fg(fg).bg(bg)),
+        Span::styled(format!(" {name}{pad}"), Style::default().fg(fg).bg(bg)),
         Span::styled(badge.to_string(), Style::default().fg(badge_fg).bg(bg)),
     ])
 }
