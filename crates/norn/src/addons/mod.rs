@@ -302,6 +302,9 @@ pub struct AddonReport {
     pub host: Box<dyn AddonHost>,
     /// Every discovered addon script.
     pub plugins: Vec<PluginInfo>,
+    /// Whether any loaded script uses a presence accessor (lets the supervisor
+    /// skip the per-event presence snapshot when nothing needs it).
+    pub needs_presence: bool,
 }
 
 /// Assemble the addon host: declarative triggers plus the Rhai plugin scripts
@@ -313,18 +316,21 @@ pub fn build_addon_host(
     plugin_config: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> AddonReport {
     let mut hosts: Vec<Box<dyn AddonHost>> = vec![Box::new(Triggers::from_configs(triggers))];
-    let plugins = match plugins_dir {
+    let (plugins, needs_presence) = match plugins_dir {
         Some(dir) => {
             let host = RhaiHost::load(dir, disabled, plugin_config);
             let plugins = host.plugins().to_vec();
+            let needs_presence = host.uses_presence();
             hosts.push(Box::new(host));
-            plugins
+            (plugins, needs_presence)
         }
-        None => Vec::new(),
+        // Triggers never use presence.
+        None => (Vec::new(), false),
     };
     AddonReport {
         host: Box::new(CompositeHost(hosts)),
         plugins,
+        needs_presence,
     }
 }
 

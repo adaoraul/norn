@@ -485,6 +485,9 @@ pub struct App {
     pub plugin_cfg: PluginConfigState,
     /// Discovered addon scripts with status/metadata for `/plugins` (runtime).
     pub plugins: Vec<PluginInfo>,
+    /// Whether any loaded plugin uses a presence accessor (skips the per-event
+    /// presence snapshot when false).
+    pub needs_presence: bool,
     /// Where to auto-save config (`None` if no config dir is available).
     pub config_path: Option<PathBuf>,
     /// Pending control-plane actions for the supervisor to execute.
@@ -553,6 +556,7 @@ impl App {
             plugin_config: std::collections::BTreeMap::new(),
             plugin_cfg: PluginConfigState::default(),
             plugins: Vec::new(),
+            needs_presence: false,
             config_path,
             actions: Vec::new(),
             history: Vec::new(),

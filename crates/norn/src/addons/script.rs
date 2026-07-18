@@ -62,12 +62,18 @@ struct Script {
     consts: Vec<(String, Dynamic)>,
 }
 
+/// Presence-accessor names; if no loaded script references one, the supervisor
+/// skips building the per-event presence snapshot.
+const PRESENCE_FNS: &[&str] = &["am_away(", "my_account(", "channels(", "names(", "is_op("];
+
 /// The Rhai scripting host.
 pub struct RhaiHost {
     engine: Engine,
     scripts: Vec<Script>,
     state: Rc<RefCell<HostState>>,
     plugins: Vec<PluginInfo>,
+    /// Whether any loaded script calls a presence accessor (drives snapshotting).
+    uses_presence: bool,
 }
 
 impl RhaiHost {
@@ -150,6 +156,9 @@ impl RhaiHost {
         let mut plugins = Vec::new();
         // Effective config per enabled plugin (stem -> key -> value), read by cfg().
         let mut effective: HashMap<String, HashMap<String, String>> = HashMap::new();
+        // Whether any enabled script calls a presence accessor (cheap source scan;
+        // a false positive only costs an occasional snapshot).
+        let mut uses_presence = false;
         for (file, source) in entries {
             let src = match source {
                 Ok(src) => src,
@@ -164,6 +173,9 @@ impl RhaiHost {
                     let schema = read_config_schema(&ast);
                     let off = disabled.contains(&file);
                     if !off {
+                        if PRESENCE_FNS.iter().any(|f| src.contains(f)) {
+                            uses_presence = true;
+                        }
                         let hooks: HashSet<String> =
                             ast.iter_functions().map(|f| f.name.to_string()).collect();
                         let consts: Vec<(String, Dynamic)> = ast
@@ -221,12 +233,19 @@ impl RhaiHost {
             scripts,
             state,
             plugins,
+            uses_presence,
         }
     }
 
     /// The discovered plugins with their status and metadata.
     pub fn plugins(&self) -> &[PluginInfo] {
         &self.plugins
+    }
+
+    /// Whether any loaded script calls a presence accessor. When false the
+    /// supervisor can skip building the per-event presence snapshot.
+    pub fn uses_presence(&self) -> bool {
+        self.uses_presence
     }
 }
 
@@ -847,6 +866,31 @@ mod tests {
         assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["PRIVMSG #c :v"]));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uses_presence_reflects_accessor_calls() {
+        // A script that calls a presence accessor is flagged.
+        let h = RhaiHost::from_sources(
+            &[(
+                "p.rhai",
+                r#"fn on_message(m) { if am_away() { reply("brb"); } }"#,
+            )],
+            &[],
+        );
+        assert!(h.uses_presence());
+        // One that does not is not.
+        let h = RhaiHost::from_sources(&[("q.rhai", r#"fn on_message(m) { reply("hi"); }"#)], &[]);
+        assert!(!h.uses_presence());
+        // A disabled presence-using script does not count (it never runs).
+        let h = RhaiHost::from_sources(
+            &[(
+                "p.rhai",
+                r##"fn on_message(m) { let x = is_op("#c", "a"); }"##,
+            )],
+            &["p.rhai"],
+        );
+        assert!(!h.uses_presence());
     }
 
     #[test]

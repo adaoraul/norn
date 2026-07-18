@@ -124,7 +124,7 @@ pub async fn run(
         &app.plugin_config,
     );
     let mut host = report.host;
-    report_addon_load(&mut app, report.plugins);
+    report_addon_load(&mut app, report.plugins, report.needs_presence);
     let mut term_events = EventStream::new();
     // Keystroke-idle tracking for the on_idle/on_active plugin hooks.
     let mut last_activity = Instant::now();
@@ -261,13 +261,14 @@ fn desktop_notify(text: String) {
 
 /// Store the discovered plugins on the app and report any load failures to the
 /// console.
-fn report_addon_load(app: &mut App, plugins: Vec<PluginInfo>) {
+fn report_addon_load(app: &mut App, plugins: Vec<PluginInfo>, needs_presence: bool) {
     for plugin in &plugins {
         if let PluginStatus::Failed(err) = &plugin.status {
             app.push_console(format!("plugin error: {}: {err}", plugin.file));
         }
     }
     app.plugins = plugins;
+    app.needs_presence = needs_presence;
 }
 
 /// Ask the addon host for reactions to an engine event (nothing for non-engine
@@ -283,7 +284,12 @@ fn addon_reactions(app: &App, host: &mut dyn AddonHost, event: &UiEvent) -> Vec<
     let Some(addon_event) = AddonEvent::from_engine(engine_event, event.net, &my_nick) else {
         return Vec::new();
     };
-    let presence = network_presence(app, event.net);
+    // Only snapshot presence when a loaded plugin actually reads it.
+    let presence = if app.needs_presence {
+        network_presence(app, event.net)
+    } else {
+        Presence::default()
+    };
     let ctx = AddonCtx {
         my_nick: &my_nick,
         network: &network,
@@ -312,7 +318,11 @@ fn fire_synthetic(
             let m = &app.networks[net];
             (m.my_nick.clone(), m.name.clone())
         };
-        let presence = network_presence(app, net);
+        let presence = if app.needs_presence {
+            network_presence(app, net)
+        } else {
+            Presence::default()
+        };
         let ev = AddonEvent {
             net,
             kind: make_kind(),
@@ -377,7 +387,7 @@ fn drain_actions(
                 let report =
                     build_addon_host(&app.triggers, plugins_dir, &disabled, &app.plugin_config);
                 *host = report.host;
-                report_addon_load(app, report.plugins);
+                report_addon_load(app, report.plugins, report.needs_presence);
             }
             AppAction::AddNetwork { id, config } => match config.resolve() {
                 Ok(settings) => {
