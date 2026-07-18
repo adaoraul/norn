@@ -409,15 +409,19 @@ fn find_word(text: &str, word: &str) -> Option<(usize, usize)> {
 }
 
 /// Greedy word-wrap `text` to `width` display columns, hard-breaking long words.
+/// A leading-space indent is preserved on the first line (the greedy pass below
+/// otherwise collapses it), so indented lines keep their indent.
 #[allow(unused_assignments)] // cur_w is a loop accumulator; its last write is dead
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
+    let indent_len = text.len() - text.trim_start_matches(' ').len();
+    let (indent, body) = text.split_at(indent_len);
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
-    for word in text.split(' ') {
+    for word in body.split(' ') {
         let ww = word.width();
         if ww > width {
             if cur_w > 0 {
@@ -449,6 +453,12 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         cur_w += ww;
     }
     out.push(cur);
+    // Restore the leading indent on the first visual line.
+    if !indent.is_empty() {
+        if let Some(first) = out.first_mut() {
+            first.insert_str(0, indent);
+        }
+    }
     out
 }
 
@@ -1583,6 +1593,13 @@ mod tests {
         let broken = wrap_text("supercalifragilistic", 5);
         assert!(broken.len() > 1);
         assert!(broken.iter().all(|l| l.width() <= 5));
+    }
+
+    #[test]
+    fn wrap_text_preserves_leading_indent() {
+        // A leading-space indent (e.g. whois detail lines) survives the wrap.
+        let wrapped = wrap_text("  realname: Alice A", 40);
+        assert_eq!(wrapped[0], "  realname: Alice A");
     }
 
     #[test]
