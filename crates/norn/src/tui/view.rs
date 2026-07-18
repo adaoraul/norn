@@ -655,7 +655,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let rows = app.settings_rows();
     let count = rows
         .iter()
-        .filter(|r| !matches!(r, SettingsRow::Header(_)))
+        .filter(|r| matches!(r, SettingsRow::Setting(_) | SettingsRow::Alias { .. }))
         .count();
     let width = inner.width as usize;
 
@@ -735,7 +735,7 @@ fn draw_settings_body(f: &mut Frame, area: Rect, app: &App, rows: &[SettingsRow]
                 format!(" {}", category.to_uppercase()),
                 Style::default().fg(theme::GOLD),
             ))),
-            SettingsRow::Setting(_) | SettingsRow::Alias { .. } => {
+            _ => {
                 let selected = ordinal == app.settings.sel;
                 if selected {
                     sel_line = body.len();
@@ -774,6 +774,21 @@ fn settings_row_line(app: &App, row: &SettingsRow, selected: bool, width: usize)
         theme::BRIGHT2
     };
 
+    // The "add alias" row: `＋ add alias`, or the edit buffer while creating one.
+    if let SettingsRow::AddAlias = row {
+        let (text, fg) = match (selected, &app.settings.editing) {
+            (true, Some(buf)) => (format!("＋ {buf}\u{2588}"), theme::BRIGHT),
+            _ => ("＋ add alias".to_string(), theme::DIM),
+        };
+        let text = truncate(&text, width.saturating_sub(2));
+        let pad = width.saturating_sub(2 + text.width());
+        return Line::from(vec![
+            Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
+            Span::styled(format!(" {text}"), Style::default().fg(fg).bg(bg)),
+            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        ]);
+    }
+
     let (label, value, typ) = match row {
         SettingsRow::Setting(doc) => (
             doc.key.to_string(),
@@ -781,7 +796,7 @@ fn settings_row_line(app: &App, row: &SettingsRow, selected: bool, width: usize)
             doc.kind.label(),
         ),
         SettingsRow::Alias { name, expansion } => (name.clone(), expansion.clone(), "alias"),
-        SettingsRow::Header(_) => (String::new(), String::new(), ""),
+        SettingsRow::Header(_) | SettingsRow::AddAlias => (String::new(), String::new(), ""),
     };
 
     // The selected row shows its inline edit buffer (with a cursor) as the value.
@@ -811,10 +826,13 @@ fn settings_detail_line(app: &App) -> Line<'static> {
         return Line::from(Span::styled(msg.clone(), Style::default().fg(theme::GOLD)));
     }
     if app.settings.editing.is_some() {
-        return Line::from(Span::styled(
-            "editing · Enter saves · Esc cancels",
-            Style::default().fg(theme::DIM),
-        ));
+        let hint = match app.selected_setting_row() {
+            Some(SettingsRow::AddAlias) => {
+                "new alias: type  name expansion  · Enter saves · Esc cancels"
+            }
+            _ => "editing · Enter saves · Esc cancels",
+        };
+        return Line::from(Span::styled(hint, Style::default().fg(theme::DIM)));
     }
     let text = match app.selected_setting_row() {
         Some(SettingsRow::Setting(doc)) => {
@@ -823,6 +841,7 @@ fn settings_detail_line(app: &App) -> Line<'static> {
         Some(SettingsRow::Alias { name, .. }) => {
             format!("alias /{name} · Enter edits · Delete removes")
         }
+        Some(SettingsRow::AddAlias) => "create a new alias (name and expansion)".to_string(),
         _ => String::new(),
     };
     Line::from(Span::styled(text, Style::default().fg(theme::DIM)))

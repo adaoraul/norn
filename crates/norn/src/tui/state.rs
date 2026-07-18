@@ -269,6 +269,8 @@ pub enum SettingsRow {
         /// What it expands to.
         expansion: String,
     },
+    /// The row that starts creating a new alias.
+    AddAlias,
 }
 
 /// Buffer-switcher overlay state.
@@ -810,25 +812,28 @@ impl App {
             }
             rows.push(SettingsRow::Setting(doc));
         }
-        let alias_hit = |name: &str, exp: &str| {
-            filter.is_empty()
-                || "aliases".contains(&filter)
-                || name.to_lowercase().contains(&filter)
-                || exp.to_lowercase().contains(&filter)
+        // Aliases are always their own section (with an "add" row) when the
+        // filter is empty or targets "aliases"; a filter matching specific alias
+        // names/expansions shows just those.
+        let include = |name: &str, exp: &str| {
+            name.to_lowercase().contains(&filter) || exp.to_lowercase().contains(&filter)
         };
-        let mut first_alias = true;
-        for (name, expansion) in &self.aliases {
-            if !alias_hit(name, expansion) {
-                continue;
+        let section_targeted = filter.is_empty() || "aliases".contains(filter.as_str());
+        let any_match = self.aliases.iter().any(|(n, e)| include(n, e));
+        if section_targeted || any_match {
+            rows.push(SettingsRow::Header("aliases"));
+            for (name, expansion) in &self.aliases {
+                if section_targeted || include(name, expansion) {
+                    rows.push(SettingsRow::Alias {
+                        name: name.clone(),
+                        expansion: expansion.clone(),
+                    });
+                }
             }
-            if first_alias {
-                rows.push(SettingsRow::Header("aliases"));
-                first_alias = false;
+            // The add row only shows when not narrowing to specific aliases.
+            if filter.is_empty() {
+                rows.push(SettingsRow::AddAlias);
             }
-            rows.push(SettingsRow::Alias {
-                name: name.clone(),
-                expansion: expansion.clone(),
-            });
         }
         rows
     }

@@ -277,6 +277,10 @@ fn activate_setting(app: &mut App) {
             app.settings.editing = Some(expansion);
             app.settings.msg = None;
         }
+        Some(SettingsRow::AddAlias) => {
+            app.settings.editing = Some(String::new());
+            app.settings.msg = None;
+        }
         _ => {}
     }
 }
@@ -368,6 +372,29 @@ fn commit_settings_edit(app: &mut App) {
                 app.save_config();
                 app.settings.editing = None;
                 app.settings.msg = None;
+            }
+        }
+        Some(SettingsRow::AddAlias) => {
+            // The buffer is `name expansion`; split on the first space.
+            let mut parts = buf.trim().splitn(2, ' ');
+            let name = parts
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('/')
+                .to_ascii_lowercase();
+            let expansion = parts.next().unwrap_or("").trim().to_string();
+            if name.is_empty() || expansion.is_empty() {
+                app.settings.msg = Some("type: name expansion".to_string());
+            } else if STRUCTURAL.contains(&name.as_str()) {
+                app.settings.msg = Some(format!("cannot alias the built-in /{name}"));
+            } else {
+                app.aliases.insert(name.clone(), expansion);
+                app.save_config();
+                app.settings.editing = None;
+                app.settings.msg = Some(format!("added alias /{name}"));
+                // A new alias row was inserted above the add row; keep the
+                // selection on the add row so another can be added.
+                app.settings.sel = app.settings_selectable().len().saturating_sub(1);
             }
         }
         _ => app.settings.editing = None,
@@ -1520,16 +1547,54 @@ mod tests {
     }
 
     #[test]
-    fn settings_screen_filters_and_deletes_alias() {
+    fn settings_screen_deletes_alias() {
         let mut app = app_with_channel();
         run_line(&mut app, "/alias hi msg $1 hi");
         run_line(&mut app, "/settings");
-        // Move to the last selectable row (the alias) and delete it.
+        // The last selectable row is the "add alias" row; the alias is just above.
         for _ in 0..30 {
             handle_key(&mut app, key(KeyCode::Down));
         }
+        handle_key(&mut app, key(KeyCode::Up));
+        assert!(
+            matches!(app.selected_setting_row(), Some(crate::tui::state::SettingsRow::Alias { name, .. }) if name == "hi")
+        );
         handle_key(&mut app, key(KeyCode::Delete));
         assert!(!app.aliases.contains_key("hi"));
+    }
+
+    #[test]
+    fn settings_screen_adds_alias_via_add_row() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/settings");
+        // With no aliases, the add row is the last selectable one.
+        for _ in 0..30 {
+            handle_key(&mut app, key(KeyCode::Down));
+        }
+        assert!(matches!(
+            app.selected_setting_row(),
+            Some(crate::tui::state::SettingsRow::AddAlias)
+        ));
+        handle_key(&mut app, key(KeyCode::Enter)); // begin creating
+        assert_eq!(app.settings.editing.as_deref(), Some(""));
+        for c in "bye quit".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter)); // commit
+        assert_eq!(app.aliases.get("bye").map(String::as_str), Some("quit"));
+        // A structural name is refused.
+        handle_key(&mut app, key(KeyCode::Enter));
+        for c in "set nope".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(!app.aliases.contains_key("set"));
+        assert!(app
+            .settings
+            .msg
+            .as_deref()
+            .unwrap_or("")
+            .contains("built-in"));
     }
 
     #[test]
