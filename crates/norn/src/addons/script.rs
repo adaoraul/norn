@@ -239,6 +239,7 @@ fn hook_for(kind: &AddonEventKind) -> &'static str {
         AddonEventKind::Message { .. } => "on_message",
         AddonEventKind::Join { .. } => "on_join",
         AddonEventKind::Part { .. } => "on_part",
+        AddonEventKind::Kick { .. } => "on_kick",
         AddonEventKind::Quit { .. } => "on_quit",
         AddonEventKind::NickChange { .. } => "on_nick",
     }
@@ -255,9 +256,11 @@ fn event_map(kind: &AddonEventKind, ctx: &AddonCtx) -> Map {
     m.insert("channel".into(), Dynamic::from(String::new()));
     m.insert("reason".into(), Dynamic::from(String::new()));
     m.insert("new".into(), Dynamic::from(String::new()));
+    m.insert("by".into(), Dynamic::from(String::new()));
     m.insert("notice".into(), Dynamic::from(false));
     m.insert("highlight".into(), Dynamic::from(false));
     m.insert("from_self".into(), Dynamic::from(false));
+    m.insert("is_me".into(), Dynamic::from(false));
 
     let reply_to = event_reply_target(kind, ctx.my_nick).unwrap_or_default();
     match kind {
@@ -294,6 +297,20 @@ fn event_map(kind: &AddonEventKind, ctx: &AddonCtx) -> Map {
             m.insert("nick".into(), Dynamic::from(nick.clone()));
             m.insert("channel".into(), Dynamic::from(channel.clone()));
             m.insert("reason".into(), Dynamic::from(reason.clone()));
+        }
+        AddonEventKind::Kick {
+            channel,
+            nick,
+            by,
+            reason,
+            is_me,
+        } => {
+            m.insert("type".into(), Dynamic::from("kick".to_string()));
+            m.insert("nick".into(), Dynamic::from(nick.clone()));
+            m.insert("channel".into(), Dynamic::from(channel.clone()));
+            m.insert("by".into(), Dynamic::from(by.clone()));
+            m.insert("reason".into(), Dynamic::from(reason.clone()));
+            m.insert("is_me".into(), Dynamic::from(*is_me));
         }
         AddonEventKind::Quit { nick, reason } => {
             m.insert("type".into(), Dynamic::from("quit".to_string()));
@@ -430,6 +447,41 @@ mod tests {
         // No mention -> nothing.
         let out = h.on_event(&message("#c", "bob", "hey you"), &ctx("me"));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn on_kick_hook_sees_is_me() {
+        let mut h = RhaiHost::from_sources(
+            &[(
+                "rejoin.rhai",
+                r#"fn on_kick(m) { if m.is_me { raw("JOIN " + m.channel); } }"#,
+            )],
+            &[],
+        );
+        let kicked_me = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Kick {
+                channel: "#rust".into(),
+                nick: "me".into(),
+                by: "op".into(),
+                reason: "bye".into(),
+                is_me: true,
+            },
+        };
+        let out = h.on_event(&kicked_me, &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["JOIN #rust"]));
+        // Someone else kicked -> is_me false -> nothing.
+        let kicked_other = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Kick {
+                channel: "#rust".into(),
+                nick: "bob".into(),
+                by: "op".into(),
+                reason: String::new(),
+                is_me: false,
+            },
+        };
+        assert!(h.on_event(&kicked_other, &ctx("me")).is_empty());
     }
 
     #[test]

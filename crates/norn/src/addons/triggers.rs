@@ -14,6 +14,7 @@ enum MatchKind {
     Notice,
     Join,
     Part,
+    Kick,
     Quit,
     Nick,
 }
@@ -35,6 +36,7 @@ impl Matcher {
             "notice" => MatchKind::Notice,
             "join" => MatchKind::Join,
             "part" => MatchKind::Part,
+            "kick" => MatchKind::Kick,
             "quit" => MatchKind::Quit,
             "nick" => MatchKind::Nick,
             _ => return None,
@@ -132,6 +134,20 @@ impl Matcher {
                     channel,
                     nick,
                     reason,
+                },
+            ) => {
+                if !self.channel_ok(channel) {
+                    return None;
+                }
+                (nick.clone(), channel.clone(), reason.clone())
+            }
+            (
+                MatchKind::Kick,
+                K::Kick {
+                    channel,
+                    nick,
+                    reason,
+                    ..
                 },
             ) => {
                 if !self.channel_ok(channel) {
@@ -412,6 +428,25 @@ mod tests {
         let reactions = t.on_event(&ev, &ctx("svan"));
         assert!(matches!(&reactions[0], Reaction::Send { lines, .. }
             if lines == &["PRIVMSG carol :hi carol"]));
+    }
+
+    #[test]
+    fn kick_trigger_matches_channel() {
+        let mut t =
+            Triggers::from_configs(&[cfg("kick #rust", "notify $nick kicked from $chan ($msg)")]);
+        let ev = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Kick {
+                channel: "#rust".into(),
+                nick: "bob".into(),
+                by: "op".into(),
+                reason: "spam".into(),
+                is_me: false,
+            },
+        };
+        let out = t.on_event(&ev, &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Notify { text, .. }
+            if text == "bob kicked from #rust (spam)"));
     }
 
     #[test]

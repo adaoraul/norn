@@ -61,6 +61,19 @@ pub enum AddonEventKind {
         /// The part reason.
         reason: String,
     },
+    /// Someone was kicked from a channel.
+    Kick {
+        /// The channel.
+        channel: String,
+        /// Who was kicked.
+        nick: String,
+        /// Who did the kicking.
+        by: String,
+        /// The kick reason.
+        reason: String,
+        /// Whether the kicked person is us.
+        is_me: bool,
+    },
     /// Someone quit the network.
     Quit {
         /// Who quit.
@@ -122,8 +135,13 @@ impl AddonEvent {
                     nick: who.nick.clone(),
                     reason: r.clone(),
                 },
-                // A kick is not a trigger kind for now.
-                LeaveReason::Kicked { .. } => return None,
+                LeaveReason::Kicked { by, reason } => AddonEventKind::Kick {
+                    channel: target.clone(),
+                    is_me: who.nick.eq_ignore_ascii_case(my_nick),
+                    nick: who.nick.clone(),
+                    by: by.clone(),
+                    reason: reason.clone(),
+                },
             },
             Event::NickChanged { old, new } => AddonEventKind::NickChange {
                 old: old.clone(),
@@ -146,9 +164,9 @@ pub(crate) fn event_reply_target(kind: &AddonEventKind, my_nick: &str) -> Option
                 target.clone()
             })
         }
-        AddonEventKind::Join { channel, .. } | AddonEventKind::Part { channel, .. } => {
-            Some(channel.clone())
-        }
+        AddonEventKind::Join { channel, .. }
+        | AddonEventKind::Part { channel, .. }
+        | AddonEventKind::Kick { channel, .. } => Some(channel.clone()),
         _ => None,
     }
 }
@@ -274,6 +292,28 @@ mod tests {
                 }],
             }
         }
+    }
+
+    #[test]
+    fn kick_event_maps_with_is_me() {
+        use irc_engine::{Event, LeaveReason, User};
+        let ev = Event::MemberLeft {
+            target: "#rust".into(),
+            who: User::nick("me"),
+            reason: LeaveReason::Kicked {
+                by: "op".into(),
+                reason: "bye".into(),
+            },
+        };
+        let a = AddonEvent::from_engine(&ev, 0, "me").unwrap();
+        assert!(matches!(
+            a.kind,
+            AddonEventKind::Kick {
+                is_me: true,
+                by,
+                ..
+            } if by == "op"
+        ));
     }
 
     #[test]

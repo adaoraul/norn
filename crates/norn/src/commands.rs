@@ -186,8 +186,8 @@ const TRIGGER_SUBS: &[SubDoc] = &[
         name: "add",
         usage: "/trigger add <on> = <run>",
         desc: "Define a trigger: when the <on> event fires, run the <run> command \
-template. Events: highlight, message, notice, join, part, quit, nick (each may \
-add a #channel filter). Templates use $nick, $chan, $msg, $me, chain with ;, and \
+template. Events: highlight, message, notice, join, part, kick, quit, nick (each \
+may add a #channel filter). Templates use $nick, $chan, $msg, $me, chain with ;, and \
 `notify <text>` shows a local notification.",
         params: &[
             req("on", ArgKind::Free, "the event to match, e.g. join #norn"),
