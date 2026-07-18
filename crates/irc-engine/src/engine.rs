@@ -184,6 +184,27 @@ impl Engine {
                 }
                 true
             }
+            // 352 RPL_WHOREPLY: <me> <chan> <user> <host> <server> <nick> <flags> :<hop> <real>
+            // The first flag char is H (here) or G (gone/away). `away-notify`
+            // only reports live transitions, so a WHO poll on join seeds the
+            // initial away state; emit AwayChanged for members flagged away.
+            Command::Numeric(352) => {
+                if let (Some(nick), Some(flags)) = (msg.params.get(5), msg.params.get(6)) {
+                    if flags.starts_with('G') {
+                        for roster in self.rosters.values_mut() {
+                            roster.set_away(nick, true);
+                        }
+                        events.push(Event::AwayChanged {
+                            nick: nick.clone(),
+                            // WHO does not carry the away text, only the flag.
+                            message: Some(String::new()),
+                        });
+                    }
+                }
+                true
+            }
+            // 315 RPL_ENDOFWHO: consume it (the roster is already seeded).
+            Command::Numeric(315) => true,
             _ => false,
         }
     }
@@ -333,6 +354,20 @@ mod tests {
         assert_eq!(*change, TopicChange::Unchanged);
         assert_eq!(set_by.as_deref(), Some("setter"));
         assert!(set_at.is_some());
+    }
+
+    #[test]
+    fn who_reply_seeds_away_state() {
+        let mut e = Engine::new();
+        // An away member (G flag) emits AwayChanged; a present one (H) does not.
+        let away = feed(&mut e, ":s 352 me #rust ~u host serv alice G@ :0 Alice");
+        assert!(matches!(
+            &away[0],
+            Event::AwayChanged { nick, message: Some(m) } if nick == "alice" && m.is_empty()
+        ));
+        assert!(feed(&mut e, ":s 352 me #rust ~u host serv bob H+ :0 Bob").is_empty());
+        // End-of-WHO is consumed, not surfaced.
+        assert!(feed(&mut e, ":s 315 me #rust :End of /WHO list").is_empty());
     }
 
     #[test]

@@ -213,6 +213,9 @@ where
                 let line = engine
                     .request_history(ChatHistoryRequest::latest(target.clone(), HISTORY_LIMIT));
                 conn.send(&line).await?;
+                // Seed away state for members already gone (away-notify only
+                // reports live changes, not the state at join time).
+                conn.send(&format!("WHO {target}")).await?;
             }
         }
         let _ = ui_tx.send(UiEvent {
