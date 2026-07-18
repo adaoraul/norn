@@ -36,6 +36,8 @@ pub enum Line {
         notice: bool,
         /// Whether it mentions us.
         mention: bool,
+        /// Whether this is a CTCP ACTION (`/me`).
+        action: bool,
     },
     /// A status/event line (joins, topics, notices).
     Event {
@@ -62,6 +64,12 @@ fn event_line(text: String) -> Line {
         time: Some(now_hm()),
         text,
     }
+}
+
+/// The inner text of a CTCP ACTION (`\x01ACTION ...\x01`), if `text` is one.
+fn ctcp_action(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix('\u{1}')?.strip_prefix("ACTION ")?;
+    Some(inner.strip_suffix('\u{1}').unwrap_or(inner))
 }
 
 /// A network's metadata.
@@ -318,15 +326,20 @@ impl App {
                 } else {
                     (msg.target.clone(), BufferKind::Channel)
                 };
-                let mention = mentions(&msg.text, &my_nick);
+                let (text, action) = match ctcp_action(&msg.text) {
+                    Some(inner) => (inner.to_string(), true),
+                    None => (msg.text.clone(), false),
+                };
+                let mention = mentions(&text, &my_nick);
                 let line = Line::Chat {
                     // Fall back to the local receipt time when the message has no
                     // server-time tag (e.g. NickServ notices during connect).
                     time: Some(msg.time.map(local_hm).unwrap_or_else(now_hm)),
                     nick: sender,
-                    text: msg.text.clone(),
+                    text,
                     notice: msg.kind == MessageKind::Notice,
                     mention,
+                    action,
                 };
                 self.push_to(net, &target, kind, line, mention);
             }
@@ -336,17 +349,24 @@ impl App {
                 let idx = self.ensure_buffer(net, &target, BufferKind::Channel);
                 let mut lines: Vec<Line> = messages
                     .iter()
-                    .map(|m| Line::Chat {
-                        time: m.time.map(local_hm),
-                        nick: m
-                            .sender
-                            .as_ref()
-                            .map(source_nick)
-                            .unwrap_or("?")
-                            .to_string(),
-                        text: m.text.clone(),
-                        notice: m.kind == MessageKind::Notice,
-                        mention: false,
+                    .map(|m| {
+                        let (text, action) = match ctcp_action(&m.text) {
+                            Some(inner) => (inner.to_string(), true),
+                            None => (m.text.clone(), false),
+                        };
+                        Line::Chat {
+                            time: m.time.map(local_hm),
+                            nick: m
+                                .sender
+                                .as_ref()
+                                .map(source_nick)
+                                .unwrap_or("?")
+                                .to_string(),
+                            text,
+                            notice: m.kind == MessageKind::Notice,
+                            mention: false,
+                            action,
+                        }
                     })
                     .collect();
                 lines.append(&mut self.buffers[idx].lines);
@@ -628,6 +648,23 @@ mod tests {
         let mut a = app();
         a.apply(engine(0, Event::MessageReceived(chat("me", "bob", "yo"))));
         assert!(a.buffer_index(0, "bob").is_some());
+    }
+
+    #[test]
+    fn ctcp_action_becomes_an_action_line() {
+        let mut a = app();
+        a.apply(engine(
+            0,
+            Event::MessageReceived(chat("#rust", "alice", "\u{1}ACTION waves\u{1}")),
+        ));
+        let idx = a.buffer_index(0, "#rust").unwrap();
+        match &a.buffers[idx].lines[0] {
+            Line::Chat { action, text, .. } => {
+                assert!(*action);
+                assert_eq!(text, "waves");
+            }
+            other => panic!("expected an action chat line, got {other:?}"),
+        }
     }
 
     #[test]

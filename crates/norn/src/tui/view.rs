@@ -263,7 +263,7 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
             theme::EVENT,
             Style::default().fg(theme::EVENT),
             None,
-            text,
+            text.clone(),
         ),
         BufLine::Chat {
             time,
@@ -271,21 +271,37 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
             text,
             notice,
             mention,
-        } => (
-            time.clone(),
-            nick.clone(),
-            theme::nick_color(nick),
-            if *notice {
-                Style::default().fg(theme::DIM)
+            action,
+        } => {
+            let color = theme::nick_color(nick);
+            if *action {
+                // `* nick does something`, all in the sender's color.
+                (
+                    time.clone(),
+                    "*".to_string(),
+                    color,
+                    Style::default().fg(color),
+                    mention.then(|| app.my_nick().to_string()),
+                    format!("{nick} {text}"),
+                )
             } else {
-                Style::default().fg(theme::TEXT)
-            },
-            mention.then(|| app.my_nick().to_string()),
-            text,
-        ),
+                (
+                    time.clone(),
+                    nick.clone(),
+                    color,
+                    if *notice {
+                        Style::default().fg(theme::DIM)
+                    } else {
+                        Style::default().fg(theme::TEXT)
+                    },
+                    mention.then(|| app.my_nick().to_string()),
+                    text.clone(),
+                )
+            }
+        }
     };
 
-    let chunks = wrap_text(text, text_w);
+    let chunks = wrap_text(&text, text_w);
     let mut out = Vec::with_capacity(chunks.len());
     for (i, chunk) in chunks.iter().enumerate() {
         let mut spans: Vec<Span> = Vec::new();
