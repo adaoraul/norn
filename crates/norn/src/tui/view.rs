@@ -41,8 +41,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_sidebar(f, cols[0], app);
     draw_header(f, center[0], app);
-    draw_messages(f, center[1], app);
-    draw_activity(f, center[2], app);
+    let lines_above = draw_messages(f, center[1], app);
+    draw_activity(f, center[2], app, lines_above);
     draw_input(f, center[3], app);
     if nick_w > 0 {
         draw_nicklist(f, cols[2], app);
@@ -155,57 +155,199 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
-    let buffer = app.active_buffer();
-    let height = area.height as usize;
-    let total = buffer.lines.len();
-    let end = total.saturating_sub(buffer.scroll);
-    let start = end.saturating_sub(height);
-    let lines: Vec<Line> = buffer.lines[start..end]
-        .iter()
-        .map(|l| render_buf_line(app, l))
-        .collect();
-    f.render_widget(Paragraph::new(lines), area);
+/// The fixed left gutter width: timestamp + nick column + `" │ "`.
+fn prefix_width(app: &App) -> usize {
+    (if app.timestamps { 6 } else { 0 }) + NICK_COL + 3
 }
 
-fn render_buf_line<'a>(app: &App, line: &'a BufLine) -> Line<'a> {
-    match line {
-        BufLine::Event(text) => Line::from(vec![
-            Span::styled(pad_left("-!-", NICK_COL), Style::default().fg(theme::EVENT)),
-            Span::styled(" │ ", Style::default().fg(theme::FAINT)),
-            Span::styled(text.clone(), Style::default().fg(theme::EVENT)),
-        ]),
+/// Draw the message list, bottom-anchored and word-wrapped, with the unread
+/// divider. Returns the number of raw lines above the top of the viewport (for
+/// the `↑ N more` hint).
+fn draw_messages(f: &mut Frame, area: Rect, app: &App) -> usize {
+    let buffer = app.active_buffer();
+    let width = area.width as usize;
+    let height = area.height as usize;
+    let want = height + buffer.scroll;
+
+    // Build wrapped visual lines from the bottom up, tagged with their source
+    // line index; insert the unread divider above the marked line.
+    let mut visual: Vec<(usize, Line)> = Vec::new();
+    for (i, line) in buffer.lines.iter().enumerate().rev() {
+        for vl in wrap_buf_line(app, line, width).into_iter().rev() {
+            visual.push((i, vl));
+        }
+        if buffer.unread_marker == Some(i) {
+            visual.push((i, divider_line(width)));
+        }
+        if visual.len() >= want {
+            break;
+        }
+    }
+    let vis: Vec<(usize, Line)> = visual.into_iter().rev().collect();
+    let n = vis.len();
+    let end = n.saturating_sub(buffer.scroll);
+    let start = end.saturating_sub(height);
+    let lines_above = vis.get(start).map(|(i, _)| *i).unwrap_or(0);
+    let shown: Vec<Line> = vis[start..end].iter().map(|(_, l)| l.clone()).collect();
+    f.render_widget(Paragraph::new(shown), area);
+    lines_above
+}
+
+/// The `──── unread ────` divider line.
+fn divider_line(width: usize) -> Line<'static> {
+    let label = " unread ";
+    let dashes = width.saturating_sub(label.width());
+    let left = dashes / 2;
+    let right = dashes - left;
+    Line::from(vec![
+        Span::styled("─".repeat(left), Style::default().fg(theme::FAINT)),
+        Span::styled(label, Style::default().fg(theme::FAINT)),
+        Span::styled("─".repeat(right), Style::default().fg(theme::FAINT)),
+    ])
+}
+
+/// Wrap one buffer line into its visual (possibly multiple) lines.
+fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> {
+    let pw = prefix_width(app);
+    let text_w = width.saturating_sub(pw).max(1);
+    let (time, gutter_nick, nick_color, base, mention_nick, text) = match line {
+        BufLine::Event { time, text } => (
+            time.clone(),
+            "-!-".to_string(),
+            theme::EVENT,
+            Style::default().fg(theme::EVENT),
+            None,
+            text,
+        ),
         BufLine::Chat {
             time,
             nick,
             text,
             notice,
             mention,
-        } => {
-            let mut spans: Vec<Span> = Vec::new();
+        } => (
+            time.clone(),
+            nick.clone(),
+            theme::nick_color(nick),
+            if *notice {
+                Style::default().fg(theme::DIM)
+            } else {
+                Style::default().fg(theme::TEXT)
+            },
+            mention.then(|| app.my_nick().to_string()),
+            text,
+        ),
+    };
+
+    let chunks = wrap_text(text, text_w);
+    let mut out = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        if i == 0 {
             if app.timestamps {
-                let t = time.clone().unwrap_or_default();
                 spans.push(Span::styled(
-                    format!("{t:5} "),
+                    format!("{:5} ", time.clone().unwrap_or_default()),
                     Style::default().fg(theme::DIM2),
                 ));
             }
             spans.push(Span::styled(
-                pad_left(nick, NICK_COL),
-                Style::default().fg(theme::nick_color(nick)),
+                pad_left(&gutter_nick, NICK_COL),
+                Style::default().fg(nick_color),
             ));
             spans.push(Span::styled(" │ ", Style::default().fg(theme::FAINT)));
-            let text_style = if *mention {
-                Style::default().fg(theme::GOLD).bg(theme::HL_BG)
-            } else if *notice {
-                Style::default().fg(theme::DIM)
-            } else {
-                Style::default().fg(theme::TEXT)
-            };
-            spans.push(Span::styled(text.clone(), text_style));
-            Line::from(spans)
+        } else {
+            spans.push(Span::raw(" ".repeat(pw)));
+        }
+        spans.extend(styled_chunk(chunk, base, mention_nick.as_deref()));
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// Style a text chunk, highlighting a whole-word mention of `nick` if present.
+fn styled_chunk(chunk: &str, base: Style, mention: Option<&str>) -> Vec<Span<'static>> {
+    if let Some(nick) = mention {
+        if let Some((start, end)) = find_word(chunk, nick) {
+            return vec![
+                Span::styled(chunk[..start].to_string(), base),
+                Span::styled(
+                    chunk[start..end].to_string(),
+                    Style::default().fg(theme::GOLD).bg(theme::HL_BG),
+                ),
+                Span::styled(chunk[end..].to_string(), base),
+            ];
         }
     }
+    vec![Span::styled(chunk.to_string(), base)]
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Find the byte range of a whole-word, ASCII-case-insensitive `word` in `text`.
+fn find_word(text: &str, word: &str) -> Option<(usize, usize)> {
+    if word.is_empty() {
+        return None;
+    }
+    let (tb, wb, wl) = (text.as_bytes(), word.as_bytes(), word.len());
+    let mut i = 0;
+    while i + wl <= text.len() {
+        if tb[i..i + wl].eq_ignore_ascii_case(wb)
+            && (i == 0 || !is_word_byte(tb[i - 1]))
+            && (i + wl == text.len() || !is_word_byte(tb[i + wl]))
+            && text.is_char_boundary(i)
+            && text.is_char_boundary(i + wl)
+        {
+            return Some((i, i + wl));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Greedy word-wrap `text` to `width` display columns, hard-breaking long words.
+#[allow(unused_assignments)] // cur_w is a loop accumulator; its last write is dead
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split(' ') {
+        let ww = word.width();
+        if ww > width {
+            if cur_w > 0 {
+                out.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            let mut piece_w = 0;
+            for ch in word.chars() {
+                let cw = ch.to_string().width();
+                if piece_w + cw > width {
+                    out.push(std::mem::take(&mut cur));
+                    piece_w = 0;
+                }
+                cur.push(ch);
+                piece_w += cw;
+            }
+            cur_w = piece_w;
+            continue;
+        }
+        if cur_w > 0 && cur_w + 1 + ww > width {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        if cur_w > 0 {
+            cur.push(' ');
+            cur_w += 1;
+        }
+        cur.push_str(word);
+        cur_w += ww;
+    }
+    out.push(cur);
+    out
 }
 
 fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
@@ -215,11 +357,20 @@ fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
     );
     let buffer = app.active_buffer();
     let members = buffer.sorted_members();
+    let total = members.len();
     let mut lines = vec![Line::from(Span::styled(
-        format!("{} nicks", members.len()),
+        format!("{total} · F9"),
         Style::default().fg(theme::DIM2),
     ))];
-    for m in members {
+
+    // Reserve the last row for a "…N more" line when the list overflows.
+    let rows = (area.height as usize).saturating_sub(1);
+    let (show, overflow) = if total > rows {
+        (rows.saturating_sub(1), total - rows + 1)
+    } else {
+        (total, 0)
+    };
+    for m in members.into_iter().take(show) {
         let (sym, color) = match m.highest() {
             Some(p) if p.symbol() == '@' => ('@', theme::GOLD),
             Some(p) if p.symbol() == '+' => ('+', theme::ACCENT),
@@ -231,10 +382,16 @@ fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(color),
         )));
     }
+    if overflow > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("…{overflow} more"),
+            Style::default().fg(theme::DIM2),
+        )));
+    }
     f.render_widget(Paragraph::new(lines), inset(area));
 }
 
-fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
+fn draw_activity(f: &mut Frame, area: Rect, app: &App, lines_above: usize) {
     let act: Vec<&str> = app
         .buffers
         .iter()
@@ -251,8 +408,19 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::GOLD),
         ));
     }
+
+    let mut left_line = Line::from(spans);
+    if lines_above > 0 {
+        let hint = format!("↑ {lines_above} more ");
+        let used: usize = left_line.spans.iter().map(|s| s.content.width()).sum();
+        let pad = (area.width as usize).saturating_sub(used + hint.width());
+        left_line.spans.push(Span::raw(" ".repeat(pad)));
+        left_line
+            .spans
+            .push(Span::styled(hint, Style::default().fg(theme::DIM2)));
+    }
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::ACTIVE_BG)),
+        Paragraph::new(left_line).style(Style::default().bg(theme::ACTIVE_BG)),
         area,
     );
 }
@@ -503,5 +671,75 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn wrap_text_wraps_words_and_hard_breaks() {
+        let wrapped = wrap_text("the quick brown fox jumps", 9);
+        assert!(wrapped.len() > 1);
+        assert!(wrapped.iter().all(|l| l.width() <= 9));
+        // A word longer than the width is hard-broken.
+        let broken = wrap_text("supercalifragilistic", 5);
+        assert!(broken.len() > 1);
+        assert!(broken.iter().all(|l| l.width() <= 5));
+    }
+
+    #[test]
+    fn find_word_matches_whole_word_case_insensitively() {
+        assert_eq!(find_word("hey Svan!", "svan"), Some((4, 8)));
+        assert_eq!(find_word("svansong", "svan"), None); // not a whole word
+        assert_eq!(find_word("no match", "svan"), None);
+    }
+
+    fn one_net_app() -> App {
+        let nets = vec![NetworkMeta {
+            name: "libera".into(),
+            my_nick: "svan".into(),
+            state: ConnState::Registered {
+                nick: "svan".into(),
+            },
+        }];
+        App::new(nets, true, theme::ACCENT)
+    }
+
+    #[test]
+    fn unread_divider_appears_after_leaving_and_returning() {
+        let mut app = one_net_app();
+        app.apply(UiEvent {
+            net: 0,
+            kind: UiEventKind::Engine(Event::MessageReceived(chat("#rust", "a", "first"))),
+        });
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        app.switch_to(0); // leave #rust -> marker set at its length
+        app.apply(UiEvent {
+            net: 0,
+            kind: UiEventKind::Engine(Event::MessageReceived(chat("#rust", "b", "second"))),
+        });
+        app.switch_to(rust); // return -> divider before the unread line
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("unread"));
+    }
+
+    #[test]
+    fn event_line_renders_with_marker() {
+        let mut app = one_net_app();
+        app.apply(UiEvent {
+            net: 0,
+            kind: UiEventKind::Engine(Event::MemberJoined {
+                target: "#rust".into(),
+                who: irc_engine::User::nick("kex"),
+                account: None,
+            }),
+        });
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("-!-"));
+        assert!(content.contains("kex joined"));
     }
 }

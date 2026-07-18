@@ -1,5 +1,6 @@
 //! TUI application state and engine-event routing.
 
+use chrono::Local;
 use irc_engine::{Event, LeaveReason, Member, MessageKind};
 use irc_proto::Source;
 use ratatui::style::Color;
@@ -37,7 +38,30 @@ pub enum Line {
         mention: bool,
     },
     /// A status/event line (joins, topics, notices).
-    Event(String),
+    Event {
+        /// Local `HH:MM` when the event was received.
+        time: Option<String>,
+        /// The event text.
+        text: String,
+    },
+}
+
+/// Current local time as `HH:MM`.
+fn now_hm() -> String {
+    Local::now().format("%H:%M").to_string()
+}
+
+/// Format a UTC message time as local `HH:MM`.
+fn local_hm(time: chrono::DateTime<chrono::Utc>) -> String {
+    time.with_timezone(&Local).format("%H:%M").to_string()
+}
+
+/// Build a timestamped event line.
+fn event_line(text: String) -> Line {
+    Line::Event {
+        time: Some(now_hm()),
+        text,
+    }
 }
 
 /// A network's metadata.
@@ -70,6 +94,8 @@ pub struct Buffer {
     pub unread: usize,
     /// Whether an unread line mentions us.
     pub mentioned: bool,
+    /// Line index where reading last stopped (for the unread divider).
+    pub unread_marker: Option<usize>,
     /// Lines scrolled up from the bottom (0 = following live).
     pub scroll: usize,
 }
@@ -85,6 +111,7 @@ impl Buffer {
             topic: None,
             unread: 0,
             mentioned: false,
+            unread_marker: None,
             scroll: 0,
         }
     }
@@ -94,6 +121,9 @@ impl Buffer {
         if self.lines.len() > MAX_LINES {
             let overflow = self.lines.len() - MAX_LINES;
             self.lines.drain(0..overflow);
+            if let Some(marker) = &mut self.unread_marker {
+                *marker = marker.saturating_sub(overflow);
+            }
         }
     }
 
@@ -245,7 +275,7 @@ impl App {
             UiEventKind::ConnState(state) => self.apply_conn_state(event.net, state),
             UiEventKind::Info(text) => {
                 let i = self.server_buffer(event.net);
-                self.buffers[i].push(Line::Event(text));
+                self.buffers[i].push(event_line(text));
             }
             UiEventKind::Engine(engine_event) => self.apply_engine(event.net, engine_event),
         }
@@ -269,7 +299,7 @@ impl App {
         };
         self.networks[net].state = state;
         let i = self.server_buffer(net);
-        self.buffers[i].push(Line::Event(text));
+        self.buffers[i].push(event_line(text));
     }
 
     fn apply_engine(&mut self, net: NetworkId, event: Event) {
@@ -290,7 +320,7 @@ impl App {
                 };
                 let mention = mentions(&msg.text, &my_nick);
                 let line = Line::Chat {
-                    time: msg.time.map(|t| t.format("%H:%M").to_string()),
+                    time: msg.time.map(local_hm),
                     nick: sender,
                     text: msg.text.clone(),
                     notice: msg.kind == MessageKind::Notice,
@@ -305,7 +335,7 @@ impl App {
                 let mut lines: Vec<Line> = messages
                     .iter()
                     .map(|m| Line::Chat {
-                        time: m.time.map(|t| t.format("%H:%M").to_string()),
+                        time: m.time.map(local_hm),
                         nick: m
                             .sender
                             .as_ref()
@@ -339,7 +369,7 @@ impl App {
                     self.buffers[idx].topic = None;
                 }
                 if let Some(text) = topic_line(&target, &topic, &set_by) {
-                    self.buffers[idx].push(Line::Event(text));
+                    self.buffers[idx].push(event_line(text));
                 }
             }
             Event::MemberJoined { target, who, .. } => {
@@ -354,7 +384,7 @@ impl App {
                         prefixes: Vec::new(),
                     });
                 }
-                self.buffers[idx].push(Line::Event(format!("{} joined {target}", who.nick)));
+                self.buffers[idx].push(event_line(format!("{} joined {target}", who.nick)));
             }
             Event::MemberLeft {
                 target,
@@ -377,7 +407,7 @@ impl App {
                     self.buffers[idx]
                         .members
                         .retain(|m| !m.nick.eq_ignore_ascii_case(&who.nick));
-                    self.buffers[idx].push(Line::Event(text));
+                    self.buffers[idx].push(event_line(text));
                 }
             }
             Event::NickChanged { old, new } => {
@@ -391,7 +421,7 @@ impl App {
             }
             Event::StandardReply(reply) => {
                 let i = self.server_buffer(net);
-                self.buffers[i].push(Line::Event(format!(
+                self.buffers[i].push(event_line(format!(
                     "{:?} {} {}: {}",
                     reply.kind, reply.command, reply.code, reply.description
                 )));
@@ -402,7 +432,7 @@ impl App {
                     Err(err) => format!("authentication failed: {err}"),
                 };
                 let i = self.server_buffer(net);
-                self.buffers[i].push(Line::Event(text));
+                self.buffers[i].push(event_line(text));
             }
             // Registered / caps / other state: surfaced via ConnState + server
             // buffer; ignore here to avoid duplicate lines.
@@ -422,21 +452,28 @@ impl App {
         }
     }
 
-    /// Switch to a buffer by index, clearing its unread state.
+    /// Switch to a buffer by index, clearing its unread state and marking where
+    /// reading stopped in the buffer we leave (for the unread divider).
     pub fn switch_to(&mut self, index: usize) {
-        if index < self.buffers.len() {
-            self.active = index;
-            self.buffers[index].unread = 0;
-            self.buffers[index].mentioned = false;
-            self.buffers[index].scroll = 0;
-            self.dirty = true;
+        if index >= self.buffers.len() {
+            return;
         }
+        let old = self.active;
+        if old != index {
+            let len = self.buffers[old].lines.len();
+            self.buffers[old].unread_marker = Some(len);
+        }
+        self.active = index;
+        self.buffers[index].unread = 0;
+        self.buffers[index].mentioned = false;
+        self.buffers[index].scroll = 0;
+        self.dirty = true;
     }
 
     /// Push a local feedback/status line into the active buffer.
     pub fn push_active_event(&mut self, text: String) {
         let idx = self.active;
-        self.buffers[idx].push(Line::Event(text));
+        self.buffers[idx].push(event_line(text));
         self.dirty = true;
     }
 

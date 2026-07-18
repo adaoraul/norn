@@ -431,9 +431,9 @@ mod tests {
         }
         let out = handle_key(&mut app, key(KeyCode::Enter));
         assert!(out.is_empty(), "nothing is sent to the server");
-        let has_feedback = app.active_buffer().lines.iter().any(
-            |l| matches!(l, crate::tui::state::Line::Event(t) if t.contains("unknown command")),
-        );
+        let has_feedback = app.active_buffer().lines.iter().any(|l| {
+            matches!(l, crate::tui::state::Line::Event { text, .. } if text.contains("unknown command"))
+        });
         assert!(has_feedback, "feedback shows in the active buffer");
     }
 
