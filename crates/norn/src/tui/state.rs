@@ -116,6 +116,10 @@ pub struct NetworkMeta {
     pub my_nick: String,
     /// Connection status.
     pub state: ConnState,
+    /// Whether we are currently marked away (RPL_NOWAWAY/RPL_UNAWAY).
+    pub away: bool,
+    /// Our services account, if logged in (SASL or `account-notify`).
+    pub account: Option<String>,
 }
 
 /// A single buffer (server status, channel, or query).
@@ -769,6 +773,24 @@ impl App {
                     }
                 }
             }
+            // Our own away state, from RPL_NOWAWAY/RPL_UNAWAY.
+            Event::AwayStatus(now_away) => {
+                if let Some(meta) = self.networks.get_mut(net) {
+                    meta.away = now_away;
+                }
+            }
+            // Track our own services account (member accounts are not stored).
+            Event::AccountChanged { nick, account } => {
+                let mine = self
+                    .networks
+                    .get(net)
+                    .is_some_and(|m| m.my_nick.eq_ignore_ascii_case(&nick));
+                if mine {
+                    if let Some(meta) = self.networks.get_mut(net) {
+                        meta.account = account;
+                    }
+                }
+            }
             Event::StandardReply(reply) => {
                 let i = self.server_buffer(net);
                 self.buffers[i].push(event_line(format!(
@@ -777,8 +799,13 @@ impl App {
                 )));
             }
             Event::AuthResult(result) => {
-                let text = match result {
-                    Ok(account) => format!("authenticated as {account}"),
+                let text = match &result {
+                    Ok(account) => {
+                        if let Some(meta) = self.networks.get_mut(net) {
+                            meta.account = Some(account.clone());
+                        }
+                        format!("authenticated as {account}")
+                    }
                     Err(err) => format!("authentication failed: {err}"),
                 };
                 let i = self.server_buffer(net);
@@ -1230,6 +1257,8 @@ impl App {
             name: config.name.clone(),
             my_nick: config.nick.clone(),
             state: ConnState::Connecting,
+            away: false,
+            account: None,
         });
         let idx = self.ensure_buffer(id, "*", BufferKind::Server);
         self.actions.push(AppAction::AddNetwork { id, config });
@@ -1660,11 +1689,15 @@ mod tests {
                 name: "neta".into(),
                 my_nick: "me".into(),
                 state: ConnState::Connecting,
+                away: false,
+                account: None,
             },
             NetworkMeta {
                 name: "netb".into(),
                 my_nick: "me2".into(),
                 state: ConnState::Connecting,
+                away: false,
+                account: None,
             },
         ];
         App::new(
@@ -1831,6 +1864,47 @@ mod tests {
             },
         ));
         assert!(!alice(&a));
+    }
+
+    #[test]
+    fn self_away_and_account_track_on_network() {
+        let mut a = app();
+        assert!(!a.networks[0].away);
+        assert!(a.networks[0].account.is_none());
+        a.apply(engine(0, Event::AwayStatus(true)));
+        assert!(a.networks[0].away);
+        a.apply(engine(0, Event::AwayStatus(false)));
+        assert!(!a.networks[0].away);
+        // SASL success records our account.
+        a.apply(engine(0, Event::AuthResult(Ok("myacct".into()))));
+        assert_eq!(a.networks[0].account.as_deref(), Some("myacct"));
+        // account-notify for our own nick updates it; a logout clears it.
+        a.apply(engine(
+            0,
+            Event::AccountChanged {
+                nick: "me".into(),
+                account: Some("other".into()),
+            },
+        ));
+        assert_eq!(a.networks[0].account.as_deref(), Some("other"));
+        a.apply(engine(
+            0,
+            Event::AccountChanged {
+                nick: "me".into(),
+                account: None,
+            },
+        ));
+        assert!(a.networks[0].account.is_none());
+        // A different nick's account-notify does not touch ours.
+        a.apply(engine(0, Event::AuthResult(Ok("mine".into()))));
+        a.apply(engine(
+            0,
+            Event::AccountChanged {
+                nick: "bob".into(),
+                account: Some("bobacct".into()),
+            },
+        ));
+        assert_eq!(a.networks[0].account.as_deref(), Some("mine"));
     }
 
     #[test]

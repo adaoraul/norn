@@ -1575,6 +1575,8 @@ mod tests {
             state: ConnState::Registered {
                 nick: "svan".into(),
             },
+            away: false,
+            account: None,
         }];
         let mut app = App::new(
             nets,
@@ -1642,6 +1644,8 @@ mod tests {
             name: "libera".into(),
             my_nick: "svan".into(),
             state: ConnState::Connecting,
+            away: false,
+            account: None,
         }];
         let mut app = App::new(
             nets,
@@ -1812,6 +1816,8 @@ mod tests {
             state: ConnState::Registered {
                 nick: "svan".into(),
             },
+            away: false,
+            account: None,
         }];
         App::new(
             nets,

@@ -1587,6 +1587,8 @@ mod tests {
             name: "net".into(),
             my_nick: "me".into(),
             state: ConnState::Connecting,
+            away: false,
+            account: None,
         }];
         let mut app = App::new(
             nets,

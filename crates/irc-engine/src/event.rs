@@ -217,6 +217,9 @@ pub enum Event {
         /// The away message, or `None` if no longer away.
         message: Option<String>,
     },
+    /// Our own away state, from `RPL_NOWAWAY` (306, now away) / `RPL_UNAWAY`
+    /// (305, back). `true` means we are now marked away.
+    AwayStatus(bool),
     /// A user changed their realname (`setname`).
     RealnameChanged {
         /// The affected nick.

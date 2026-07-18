@@ -57,6 +57,8 @@ async fn main() -> std::io::Result<()> {
             name: settings.name.clone(),
             my_nick: settings.nick().to_string(),
             state: ConnState::Connecting,
+            away: false,
+            account: None,
         });
         let ui_tx = ui_tx.clone();
         let quit = quit.clone();

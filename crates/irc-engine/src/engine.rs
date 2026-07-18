@@ -212,6 +212,15 @@ impl Engine {
             }
             // 315 RPL_ENDOFWHO: consume it (the roster is already seeded).
             Command::Numeric(315) => true,
+            // 305 RPL_UNAWAY / 306 RPL_NOWAWAY: our own away state toggled.
+            Command::Numeric(305) => {
+                events.push(Event::AwayStatus(false));
+                true
+            }
+            Command::Numeric(306) => {
+                events.push(Event::AwayStatus(true));
+                true
+            }
             _ => false,
         }
     }
@@ -432,6 +441,17 @@ mod tests {
         assert_eq!(members.len(), 3);
         let alice = members.iter().find(|m| m.nick == "alice").unwrap();
         assert_eq!(alice.highest(), Some(crate::roster::MemberPrefix::Op));
+    }
+
+    #[test]
+    fn self_away_status_from_305_306() {
+        let mut e = Engine::new();
+        // 306 RPL_NOWAWAY: we are now away.
+        let events = feed(&mut e, ":s 306 me :You have been marked as being away");
+        assert!(matches!(&events[0], Event::AwayStatus(true)));
+        // 305 RPL_UNAWAY: we are back.
+        let events = feed(&mut e, ":s 305 me :You are no longer marked as being away");
+        assert!(matches!(&events[0], Event::AwayStatus(false)));
     }
 
     #[test]

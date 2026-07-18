@@ -87,6 +87,10 @@ pub fn render(event: &Event) -> Vec<String> {
             Some(message) => vec![format!("-- {nick} is away ({message})")],
             None => vec![format!("-- {nick} is back")],
         },
+        Event::AwayStatus(away) => match away {
+            true => vec!["-- you are now marked as away".to_string()],
+            false => vec!["-- you are no longer marked as away".to_string()],
+        },
         Event::RealnameChanged { nick, realname } => {
             vec![format!("-- {nick} set realname to {realname}")]
         }
