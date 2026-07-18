@@ -320,7 +320,9 @@ impl App {
                 };
                 let mention = mentions(&msg.text, &my_nick);
                 let line = Line::Chat {
-                    time: msg.time.map(local_hm),
+                    // Fall back to the local receipt time when the message has no
+                    // server-time tag (e.g. NickServ notices during connect).
+                    time: Some(msg.time.map(local_hm).unwrap_or_else(now_hm)),
                     nick: sender,
                     text: msg.text.clone(),
                     notice: msg.kind == MessageKind::Notice,
@@ -626,6 +628,21 @@ mod tests {
         let mut a = app();
         a.apply(engine(0, Event::MessageReceived(chat("me", "bob", "yo"))));
         assert!(a.buffer_index(0, "bob").is_some());
+    }
+
+    #[test]
+    fn message_without_server_time_gets_a_receipt_timestamp() {
+        let mut a = app();
+        // `chat` builds a message with time: None (like a NickServ notice).
+        a.apply(engine(
+            0,
+            Event::MessageReceived(chat("me", "NickServ", "registered")),
+        ));
+        let idx = a.buffer_index(0, "NickServ").unwrap();
+        match &a.buffers[idx].lines[0] {
+            Line::Chat { time, .. } => assert!(time.is_some(), "gets a fallback time"),
+            other => panic!("expected a chat line, got {other:?}"),
+        }
     }
 
     #[test]
