@@ -65,6 +65,8 @@ pub struct Member {
     pub nick: String,
     /// Prefixes held, sorted most-privileged first.
     pub prefixes: Vec<MemberPrefix>,
+    /// Whether the member is currently marked away (`away-notify`).
+    pub away: bool,
 }
 
 impl Member {
@@ -116,6 +118,7 @@ impl Roster {
                 Member {
                     nick: nick.to_string(),
                     prefixes,
+                    away: false,
                 },
             );
         }
@@ -128,12 +131,24 @@ impl Roster {
             .or_insert_with(|| Member {
                 nick: nick.to_string(),
                 prefixes: Vec::new(),
+                away: false,
             });
     }
 
     /// Remove a member. Returns whether they were present.
     pub fn remove(&mut self, nick: &str) -> bool {
         self.members.remove(&nick.to_ascii_lowercase()).is_some()
+    }
+
+    /// Set a member's away state. Returns whether the nick was present.
+    pub fn set_away(&mut self, nick: &str, away: bool) -> bool {
+        match self.members.get_mut(&nick.to_ascii_lowercase()) {
+            Some(member) => {
+                member.away = away;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Rename a member, preserving their prefixes.
@@ -216,5 +231,17 @@ mod tests {
         assert!(r.contains("bobby"));
         assert!(r.remove("bobby"));
         assert!(!r.remove("bobby"));
+    }
+
+    #[test]
+    fn away_state_tracks_and_reports_presence() {
+        let mut r = Roster::new();
+        r.apply_names_reply("@alice bob");
+        assert!(!r.members().find(|m| m.nick == "alice").unwrap().away);
+        assert!(r.set_away("ALICE", true)); // case-insensitive
+        assert!(r.members().find(|m| m.nick == "alice").unwrap().away);
+        assert!(r.set_away("alice", false));
+        assert!(!r.members().find(|m| m.nick == "alice").unwrap().away);
+        assert!(!r.set_away("nobody", true)); // absent nick
     }
 }

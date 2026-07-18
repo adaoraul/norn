@@ -1,7 +1,7 @@
 //! Rendering the TUI: sidebar, message view, nicklist, input, and overlays.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -444,10 +444,13 @@ fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
             Some(p) => (p.symbol(), theme::TEXT),
             None => (' ', theme::nick_color(&m.nick)),
         };
-        lines.push(Line::from(Span::styled(
-            format!("{sym}{}", m.nick),
-            Style::default().fg(color),
-        )));
+        // Away members render dimmed while keeping their hue identity.
+        let style = if m.away {
+            Style::default().fg(theme::DIM2).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(color)
+        };
+        lines.push(Line::from(Span::styled(format!("{sym}{}", m.nick), style)));
     }
     if overflow > 0 {
         lines.push(Line::from(Span::styled(

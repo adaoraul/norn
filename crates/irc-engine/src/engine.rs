@@ -214,6 +214,14 @@ impl Engine {
                     roster.rename(old, new);
                 }
             }
+            // `away-notify` is network-wide: mirror it into every channel the
+            // engine tracks so NAMES snapshots stay accurate.
+            Event::AwayChanged { nick, message } => {
+                let away = message.is_some();
+                for roster in self.rosters.values_mut() {
+                    roster.set_away(nick, away);
+                }
+            }
             _ => {}
         }
     }

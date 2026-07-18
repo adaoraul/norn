@@ -355,6 +355,7 @@ mod tests {
         irc_engine::Member {
             nick: n.into(),
             prefixes: vec![],
+            away: false,
         }
     }
 

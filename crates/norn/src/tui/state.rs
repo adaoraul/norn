@@ -415,6 +415,7 @@ impl App {
                     self.buffers[idx].members.push(Member {
                         nick: who.nick.clone(),
                         prefixes: Vec::new(),
+                        away: false,
                     });
                 }
                 self.buffers[idx].push(event_line(format!("{} joined {target}", who.nick)));
@@ -448,6 +449,18 @@ impl App {
                     for m in &mut b.members {
                         if m.nick.eq_ignore_ascii_case(&old) {
                             m.nick = new.clone();
+                        }
+                    }
+                }
+            }
+            // `away-notify` is network-wide: reflect it in every channel where we
+            // share membership so the nicklist can dim away nicks.
+            Event::AwayChanged { nick, message } => {
+                let away = message.is_some();
+                for b in self.buffers.iter_mut().filter(|b| b.net == net) {
+                    for m in &mut b.members {
+                        if m.nick.eq_ignore_ascii_case(&nick) {
+                            m.away = away;
                         }
                     }
                 }
@@ -750,6 +763,53 @@ mod tests {
             },
         ));
         assert_eq!(a.buffers[idx].members.len(), 3);
+    }
+
+    #[test]
+    fn away_notify_marks_member_away_across_channels() {
+        let mut a = app();
+        a.apply(engine(
+            0,
+            Event::NamesLoaded {
+                target: "#rust".into(),
+                members: vec![member("@alice"), member("bob")],
+            },
+        ));
+        let idx = a.buffer_index(0, "#rust").unwrap();
+        // Going away sets the flag on the matching member only.
+        a.apply(engine(
+            0,
+            Event::AwayChanged {
+                nick: "alice".into(),
+                message: Some("lunch".into()),
+            },
+        ));
+        let alice = |a: &App| {
+            a.buffers[idx]
+                .members
+                .iter()
+                .find(|m| m.nick == "alice")
+                .unwrap()
+                .away
+        };
+        assert!(alice(&a));
+        assert!(
+            !a.buffers[idx]
+                .members
+                .iter()
+                .find(|m| m.nick == "bob")
+                .unwrap()
+                .away
+        );
+        // Coming back clears it.
+        a.apply(engine(
+            0,
+            Event::AwayChanged {
+                nick: "alice".into(),
+                message: None,
+            },
+        ));
+        assert!(!alice(&a));
     }
 
     #[test]
