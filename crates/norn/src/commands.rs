@@ -396,6 +396,22 @@ saved to config and auto-connect on next launch; use /connect to dial one now.",
         ],
     },
     CommandDoc {
+        name: "networks",
+        category: "Networks",
+        usage: "/networks",
+        summary: "Open the networks manager",
+        description: "Open the interactive networks manager: a list of your \
+network definitions with live connection markers, and an edit form for the \
+selected one. Enter/→ edits fields, c connects, d disconnects, x removes, and the \
+add row creates a new network. Passwords are never entered here - set \
+password_command (a shell command). Use /network for the same actions from the \
+input line.",
+        aliases: &[],
+        params: &[],
+        subcommands: &[],
+        examples: &["/networks"],
+    },
+    CommandDoc {
         name: "connect",
         category: "Networks",
         usage: "/connect <name>",

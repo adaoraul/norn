@@ -2,7 +2,10 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use super::state::{App, BufferKind, Completion, Mode, Switcher};
+use super::state::{
+    network_field_value, App, BufferKind, Completion, Mode, NetFieldKind, NetworksFocus, Switcher,
+    NETWORK_FIELDS,
+};
 use crate::session::NetCommand;
 
 /// Width of the sidebar column.
@@ -100,6 +103,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
         handle_settings(app, key);
         return Vec::new();
     }
+    if app.mode == Mode::Networks {
+        handle_networks(app, key);
+        return Vec::new();
+    }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -111,6 +118,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
             app.switcher = Switcher::default();
         }
         KeyCode::F(2) => app.open_settings(),
+        KeyCode::F(3) => app.open_networks(),
         KeyCode::F(9) => app.nicklist_visible = !app.nicklist_visible,
         KeyCode::Left if alt => switch_relative(app, -1),
         KeyCode::Right if alt => switch_relative(app, 1),
@@ -401,6 +409,149 @@ fn commit_settings_edit(app: &mut App) {
     }
 }
 
+/// Keys for the `/networks` manager. Routes to the list pane, the form pane, or
+/// the inline field editor depending on focus and edit state.
+fn handle_networks(app: &mut App, key: KeyEvent) {
+    if app.networks_ui.editing.is_some() {
+        handle_networks_edit(app, key);
+        return;
+    }
+    match app.networks_ui.focus {
+        NetworksFocus::List => handle_networks_list(app, key),
+        NetworksFocus::Form => handle_networks_form(app, key),
+    }
+}
+
+/// List pane: move over the definitions and the add row; Enter/Right opens the
+/// form (or creates a network on the add row); c/d connect/disconnect; x/Delete
+/// removes; Esc closes.
+fn handle_networks_list(app: &mut App, key: KeyEvent) {
+    let add_row = app.definitions.len(); // index of the "+ add network" row
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Up => {
+            app.networks_ui.sel = app.networks_ui.sel.saturating_sub(1);
+            app.networks_ui.msg = None;
+        }
+        KeyCode::Down => {
+            app.networks_ui.sel = (app.networks_ui.sel + 1).min(add_row);
+            app.networks_ui.msg = None;
+        }
+        KeyCode::Enter | KeyCode::Right => {
+            if app.networks_ui.sel >= add_row {
+                app.add_network_definition();
+            } else {
+                app.networks_ui.focus = NetworksFocus::Form;
+                app.networks_ui.field = 0;
+                app.networks_ui.msg = None;
+            }
+        }
+        KeyCode::Char('c') => connect_selected_network(app),
+        KeyCode::Char('d') => disconnect_selected_network(app),
+        KeyCode::Char('x') | KeyCode::Delete => {
+            let sel = app.networks_ui.sel;
+            if sel < add_row {
+                app.delete_network_definition(sel);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Form pane: move between fields; Enter edits a text field or toggles/cycles a
+/// bool/mech; Space/Right also toggles/cycles; Left/Esc returns to the list.
+fn handle_networks_form(app: &mut App, key: KeyEvent) {
+    let last = NETWORK_FIELDS.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Left => {
+            app.networks_ui.focus = NetworksFocus::List;
+            app.networks_ui.msg = None;
+        }
+        KeyCode::Up => app.networks_ui.field = app.networks_ui.field.saturating_sub(1),
+        KeyCode::Down => app.networks_ui.field = (app.networks_ui.field + 1).min(last),
+        KeyCode::Enter => activate_network_field(app),
+        KeyCode::Char(' ') | KeyCode::Right => adjust_selected_network_field(app),
+        _ => {}
+    }
+}
+
+/// Enter on a form field: begin editing a text field, or toggle/cycle a
+/// bool/mech field in place.
+fn activate_network_field(app: &mut App) {
+    let (idx, field) = (app.networks_ui.sel, app.networks_ui.field);
+    match NETWORK_FIELDS.get(field).map(|f| f.kind) {
+        Some(NetFieldKind::Text) => {
+            if let Some(cfg) = app.definitions.get(idx) {
+                app.networks_ui.editing = Some(network_field_value(cfg, field));
+                app.networks_ui.msg = None;
+            }
+        }
+        Some(NetFieldKind::Toggle) | Some(NetFieldKind::Mech) => adjust_selected_network_field(app),
+        None => {}
+    }
+}
+
+/// Toggle/cycle the selected bool/mech field (a no-op on a text field).
+fn adjust_selected_network_field(app: &mut App) {
+    let (idx, field) = (app.networks_ui.sel, app.networks_ui.field);
+    if let Err(err) = app.adjust_network_field(idx, field) {
+        app.networks_ui.msg = Some(err);
+    }
+}
+
+/// Connect the network on the selected list row.
+fn connect_selected_network(app: &mut App) {
+    let sel = app.networks_ui.sel;
+    if let Some(name) = app.definitions.get(sel).map(|c| c.name.clone()) {
+        app.connect_network(&name);
+        app.networks_ui.msg = Some(format!("connecting to {name}..."));
+    }
+}
+
+/// Disconnect the network on the selected list row.
+fn disconnect_selected_network(app: &mut App) {
+    let sel = app.networks_ui.sel;
+    if let Some(name) = app.definitions.get(sel).map(|c| c.name.clone()) {
+        app.disconnect_network(&name);
+        app.networks_ui.msg = Some(format!("disconnecting {name}"));
+    }
+}
+
+/// Keys while inline-editing a network field: type into the buffer, Enter
+/// commits (keeping the editor open on a validation error), Esc cancels.
+fn handle_networks_edit(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.networks_ui.editing = None;
+            app.networks_ui.msg = None;
+        }
+        KeyCode::Enter => {
+            let Some(buf) = app.networks_ui.editing.clone() else {
+                return;
+            };
+            let (idx, field) = (app.networks_ui.sel, app.networks_ui.field);
+            match app.set_network_field(idx, field, &buf) {
+                Ok(()) => {
+                    app.networks_ui.editing = None;
+                    app.networks_ui.msg = None;
+                }
+                Err(err) => app.networks_ui.msg = Some(err),
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(buf) = app.networks_ui.editing.as_mut() {
+                buf.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(buf) = app.networks_ui.editing.as_mut() {
+                buf.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Buffer indices matching the switcher query.
 pub fn switcher_matches(app: &App) -> Vec<usize> {
     let q = app.switcher.query.to_lowercase();
@@ -437,6 +588,7 @@ const STRUCTURAL: &[&str] = &[
     "set",
     "settings",
     "network",
+    "networks",
     "net",
     "connect",
     "server",
@@ -506,6 +658,10 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
             }
             "network" | "net" => {
                 handle_network(app, arg);
+                return Vec::new();
+            }
+            "networks" => {
+                app.open_networks();
                 return Vec::new();
             }
             "connect" | "server" => {
@@ -1365,6 +1521,60 @@ mod tests {
             candidates.contains(&"nap".to_string()),
             "aliases are offered"
         );
+    }
+
+    #[test]
+    fn networks_screen_adds_and_edits_a_definition() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/networks");
+        assert_eq!(app.mode, Mode::Networks);
+        assert_eq!(app.networks_ui.focus, NetworksFocus::List);
+        // No definitions yet: the add row is index 0; Enter creates one and
+        // lands on the form's host field.
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.definitions.len(), 1);
+        assert_eq!(app.networks_ui.focus, NetworksFocus::Form);
+        assert_eq!(app.networks_ui.field, 1);
+        // Edit host inline.
+        handle_key(&mut app, key(KeyCode::Enter));
+        for c in "irc.libera.chat".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.definitions[0].host, "irc.libera.chat");
+        assert!(app.networks_ui.editing.is_none());
+        // tls is field 3; Space toggles it.
+        handle_key(&mut app, key(KeyCode::Down));
+        handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.networks_ui.field, 3);
+        let tls = app.definitions[0].tls;
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(app.definitions[0].tls, !tls);
+        // Left returns to the list; Esc closes.
+        handle_key(&mut app, key(KeyCode::Left));
+        assert_eq!(app.networks_ui.focus, NetworksFocus::List);
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn networks_screen_connect_and_delete() {
+        use crate::tui::state::AppAction;
+        let mut app = app_with_channel();
+        run_line(
+            &mut app,
+            "/network add libera host=irc.libera.chat nick=svan",
+        );
+        run_line(&mut app, "/networks");
+        // sel 0 = libera; `c` dials it (queues an AddNetwork since it is not live).
+        handle_key(&mut app, key(KeyCode::Char('c')));
+        assert!(app
+            .actions
+            .iter()
+            .any(|a| matches!(a, AppAction::AddNetwork { .. })));
+        // `x` removes the definition.
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        assert!(app.definitions.is_empty());
     }
 
     #[test]

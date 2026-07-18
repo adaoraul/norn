@@ -7,8 +7,12 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::state::{App, BufferKind, Line as BufLine, Mode, SettingsRow};
+use super::state::{
+    network_field_value, App, BufferKind, Line as BufLine, Mode, NetFieldKind, NetworksFocus,
+    SettingsRow, NETWORK_FIELDS,
+};
 use super::theme;
+use crate::session::ConnState;
 
 const NICK_COL: usize = 9;
 
@@ -73,6 +77,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_help(f, area, app);
     } else if app.mode == Mode::Settings {
         draw_settings(f, area, app);
+    } else if app.mode == Mode::Networks {
+        draw_networks(f, area, app);
     } else if let Some(completion) = &app.completion {
         draw_completion(f, center[4], completion);
     }
@@ -847,6 +853,237 @@ fn settings_detail_line(app: &App) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(theme::DIM)))
 }
 
+/// The `/networks` manager: a master-detail view. The left pane lists network
+/// definitions (with a live-state marker) plus an add row; the right pane is the
+/// selected definition's edit form. There is deliberately no password field.
+fn draw_networks(f: &mut Frame, area: Rect, app: &App) {
+    let w = 96.min(area.width.saturating_sub(2));
+    let h = 30.min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::BORDER_BRIGHT))
+        .title(Span::styled(
+            " networks ",
+            Style::default().fg(theme::BRIGHT),
+        ))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 4 || inner.width < 24 {
+        return;
+    }
+
+    // Split: list | divider | form. Two footer lines (message + hint) sit below.
+    let panes_h = inner.height.saturating_sub(2);
+    let list_w = 26.min(inner.width / 2);
+    let list_rect = Rect {
+        width: list_w,
+        height: panes_h,
+        ..inner
+    };
+    let divider_x = inner.x + list_w;
+    let form_rect = Rect {
+        x: divider_x + 1,
+        width: inner.width - list_w - 1,
+        height: panes_h,
+        ..inner
+    };
+    let list_focused = app.networks_ui.focus == NetworksFocus::List;
+
+    draw_networks_list(f, list_rect, app, list_focused);
+    for y in inner.y..inner.y + panes_h {
+        f.render_widget(
+            Paragraph::new(Span::styled("│", Style::default().fg(theme::BORDER))),
+            Rect {
+                x: divider_x,
+                y,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
+    draw_networks_form(f, form_rect, app, !list_focused);
+
+    // Message line (a transient status), then the context-sensitive hint.
+    let msg = app
+        .networks_ui
+        .msg
+        .clone()
+        .unwrap_or_else(|| networks_context(app));
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(theme::GOLD),
+        )))
+        .style(Style::default().bg(theme::PANEL)),
+        Rect {
+            y: inner.y + inner.height - 2,
+            height: 1,
+            ..inner
+        },
+    );
+    let hint = if app.networks_ui.editing.is_some() {
+        "type · Enter saves · Esc cancels"
+    } else if list_focused {
+        "↑↓ select · → edit · c connect · d disconnect · x delete · Esc closes"
+    } else {
+        "↑↓ field · Enter edit · Space toggle · ← back · Esc closes"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme::DIM2),
+        )))
+        .style(Style::default().bg(theme::PANEL)),
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+/// A non-message context line for the `/networks` footer: the selected
+/// definition's address and live state, or the add-row prompt.
+fn networks_context(app: &App) -> String {
+    match app.definitions.get(app.networks_ui.sel) {
+        Some(cfg) => {
+            let state = app
+                .network_live_state(&cfg.name)
+                .map(|s| format!(" · {}", conn_state_label(&s)))
+                .unwrap_or_default();
+            format!("{}:{}{}", cfg.host, cfg.port, state)
+        }
+        None => "press Enter to create a new network".to_string(),
+    }
+}
+
+/// A short label for a connection state.
+fn conn_state_label(state: &ConnState) -> &'static str {
+    match state {
+        ConnState::Connecting => "connecting",
+        ConnState::Registered { .. } => "connected",
+        ConnState::Reconnecting { .. } => "reconnecting",
+        ConnState::Disconnected => "disconnected",
+        ConnState::Closed => "closed",
+    }
+}
+
+/// The left pane of `/networks`: definition names with a live-state marker, plus
+/// the add row, with the selection bar-highlighted.
+fn draw_networks_list(f: &mut Frame, area: Rect, app: &App, focused: bool) {
+    let width = area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, cfg) in app.definitions.iter().enumerate() {
+        let selected = i == app.networks_ui.sel;
+        let (marker, marker_fg) = match app.network_live_state(&cfg.name) {
+            Some(ConnState::Registered { .. }) => ("●", theme::GOLD),
+            Some(ConnState::Connecting | ConnState::Reconnecting { .. }) => ("◐", theme::ACCENT),
+            Some(_) => ("○", theme::DIM2),
+            None => ("·", theme::FAINT),
+        };
+        let bg = if selected && focused {
+            theme::ACTIVE_BG
+        } else {
+            theme::PANEL
+        };
+        let bar = if selected { "▎" } else { " " };
+        let name_fg = if selected { theme::BRIGHT } else { theme::TEXT };
+        let name = truncate(&cfg.name, width.saturating_sub(4));
+        lines.push(Line::from(vec![
+            Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
+            Span::styled(format!(" {marker} "), Style::default().fg(marker_fg).bg(bg)),
+            Span::styled(name, Style::default().fg(name_fg).bg(bg)),
+        ]));
+    }
+    // The add row.
+    let add_selected = app.networks_ui.sel >= app.definitions.len();
+    let bg = if add_selected && focused {
+        theme::ACTIVE_BG
+    } else {
+        theme::PANEL
+    };
+    let bar = if add_selected { "▎" } else { " " };
+    lines.push(Line::from(vec![
+        Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
+        Span::styled(" ＋ add network", Style::default().fg(theme::DIM).bg(bg)),
+    ]));
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The right pane of `/networks`: the selected definition's edit form (or the
+/// add-row prompt). Bools render as checkboxes; the field under edit shows the
+/// inline buffer. Passwords are never shown - only `password_command`.
+fn draw_networks_form(f: &mut Frame, area: Rect, app: &App, focused: bool) {
+    let width = area.width as usize;
+    let Some(cfg) = app.definitions.get(app.networks_ui.sel) else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "＋ press Enter to create a new network",
+                Style::default().fg(theme::DIM),
+            ))),
+            area,
+        );
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, field) in NETWORK_FIELDS.iter().enumerate() {
+        let selected = focused && i == app.networks_ui.field;
+        let bg = if selected {
+            theme::ACTIVE_BG
+        } else {
+            theme::PANEL
+        };
+        let bar = if selected { "▎" } else { " " };
+
+        // Value: a checkbox for a bool, the edit buffer while editing, else text.
+        let editing_here = selected && app.networks_ui.editing.is_some();
+        let value = if field.kind == NetFieldKind::Toggle {
+            if cfg.tls {
+                "[x]".to_string()
+            } else {
+                "[ ]".to_string()
+            }
+        } else if editing_here {
+            format!(
+                "{}\u{2588}",
+                app.networks_ui.editing.as_deref().unwrap_or("")
+            )
+        } else {
+            let v = network_field_value(cfg, i);
+            if v.is_empty() {
+                "-".to_string()
+            } else {
+                v
+            }
+        };
+        let value_fg = if editing_here {
+            theme::BRIGHT
+        } else if value == "-" {
+            theme::DIM2
+        } else {
+            theme::GOLD
+        };
+
+        let label = format!("{:<16}", field.name);
+        let value = truncate(&value, width.saturating_sub(2 + label.width()));
+        lines.push(Line::from(vec![
+            Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
+            Span::styled(format!(" {label}"), Style::default().fg(theme::TEXT).bg(bg)),
+            Span::styled(value, Style::default().fg(value_fg).bg(bg)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 /// The `/help` panel: a master-detail command reference. The left pane is a
 /// searchable, categorized command list; the right pane shows the selected
 /// command's full documentation. `→` focuses the detail to scroll it.
@@ -1279,6 +1516,34 @@ mod tests {
         assert!(text.contains("theme"));
         assert!(text.contains("scrollback_lines"));
         assert!(text.contains("filter:"));
+    }
+
+    #[test]
+    fn networks_panel_renders() {
+        let mut app = one_net_app();
+        app.definitions.push(crate::config::NetworkConfig {
+            name: "libera".into(),
+            host: "irc.libera.chat".into(),
+            port: 6697,
+            tls: true,
+            nick: "svan".into(),
+            user: None,
+            realname: None,
+            sasl_account: None,
+            sasl_mech: crate::config::SaslMech::Plain,
+            password_command: None,
+            auto_join: vec![],
+        });
+        app.open_networks();
+        let mut terminal = Terminal::new(TestBackend::new(90, 28)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("networks"));
+        assert!(text.contains("libera"));
+        assert!(text.contains("add network"));
+        // The form shows fields including password_command, never a bare password.
+        assert!(text.contains("host"));
+        assert!(text.contains("password_command"));
     }
 
     fn chat(target: &str, from: &str, text: &str) -> irc_engine::ChatMessage {

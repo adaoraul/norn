@@ -8,7 +8,7 @@ use irc_engine::{Event, LeaveReason, Member, MessageKind, TopicChange};
 use irc_proto::Source;
 use ratatui::style::Color;
 
-use crate::config::{ClientConfig, Config, NetworkConfig};
+use crate::config::{ClientConfig, Config, NetworkConfig, SaslMech};
 use crate::session::{ConnState, NetCommand, NetworkId, UiEvent, UiEventKind};
 use crate::tui::theme;
 
@@ -213,6 +213,8 @@ pub enum Mode {
     Help,
     /// The `/settings` panel is open.
     Settings,
+    /// The `/networks` manager is open.
+    Networks,
 }
 
 /// Which pane of the `/help` panel has focus.
@@ -273,6 +275,102 @@ pub enum SettingsRow {
     AddAlias,
 }
 
+/// Which pane of the `/networks` manager has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworksFocus {
+    /// The list of network definitions (plus the add row).
+    #[default]
+    List,
+    /// The edit form for the selected definition.
+    Form,
+}
+
+/// State of the `/networks` manager: the selected list row, which pane has
+/// focus, the selected form field, an optional inline edit buffer, and a
+/// transient message.
+#[derive(Debug, Clone, Default)]
+pub struct NetworksState {
+    /// Index into the left list (definitions, then the add row).
+    pub sel: usize,
+    /// Which pane is focused.
+    pub focus: NetworksFocus,
+    /// Selected form field index (into [`NETWORK_FIELDS`]).
+    pub field: usize,
+    /// When editing a text field, the in-progress value.
+    pub editing: Option<String>,
+    /// A transient status line (validation error or confirmation).
+    pub msg: Option<String>,
+}
+
+/// How a network form field is edited and rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetFieldKind {
+    /// Freeform text (parsed on commit for `port`).
+    Text,
+    /// A boolean, toggled in place and shown as a checkbox.
+    Toggle,
+    /// The SASL mechanism, cycled in place.
+    Mech,
+}
+
+/// One field of the network edit form. Deliberately has no plaintext password
+/// field: authentication is configured through `password_command` only.
+#[derive(Debug, Clone, Copy)]
+pub struct NetField {
+    /// The field name (matches the `NetworkConfig` field / `/network add` key).
+    pub name: &'static str,
+    /// How it is edited and rendered.
+    pub kind: NetFieldKind,
+}
+
+/// The editable network fields, in form order.
+pub const NETWORK_FIELDS: &[NetField] = &[
+    NetField {
+        name: "name",
+        kind: NetFieldKind::Text,
+    },
+    NetField {
+        name: "host",
+        kind: NetFieldKind::Text,
+    },
+    NetField {
+        name: "port",
+        kind: NetFieldKind::Text,
+    },
+    NetField {
+        name: "tls",
+        kind: NetFieldKind::Toggle,
+    },
+    NetField {
+        name: "nick",
+        kind: NetFieldKind::Text,
+    },
+    NetField {
+        name: "user",
+        kind: NetFieldKind::Text,
+    },
+    NetField {
+        name: "realname",
+        kind: NetFieldKind::Text,
+    },
+    NetField {
+        name: "sasl_account",
+        kind: NetFieldKind::Text,
+    },
+    NetField {
+        name: "sasl_mech",
+        kind: NetFieldKind::Mech,
+    },
+    NetField {
+        name: "password_command",
+        kind: NetFieldKind::Text,
+    },
+    NetField {
+        name: "auto_join",
+        kind: NetFieldKind::Text,
+    },
+];
+
 /// Buffer-switcher overlay state.
 #[derive(Debug, Clone, Default)]
 pub struct Switcher {
@@ -316,6 +414,8 @@ pub struct App {
     pub help: HelpState,
     /// Settings-panel state.
     pub settings: SettingsState,
+    /// Networks-manager state.
+    pub networks_ui: NetworksState,
     /// Tab-completion state.
     pub completion: Option<Completion>,
     /// Whether the nicklist is shown.
@@ -384,6 +484,7 @@ impl App {
             switcher: Switcher::default(),
             help: HelpState::default(),
             settings: SettingsState::default(),
+            networks_ui: NetworksState::default(),
             completion: None,
             nicklist_visible: client.nicklist,
             timestamps: client.timestamps,
@@ -1023,6 +1124,172 @@ impl App {
         self.actions.push(AppAction::Connect(net));
     }
 
+    /// Open the `/networks` manager, reset to the list pane.
+    pub fn open_networks(&mut self) {
+        self.mode = Mode::Networks;
+        self.networks_ui = NetworksState::default();
+        self.dirty = true;
+    }
+
+    /// Append a new network definition with safe defaults, select it, and focus
+    /// the form (on the host field, since the name is prefilled). Auto-saved.
+    pub fn add_network_definition(&mut self) {
+        let nick = self
+            .definitions
+            .first()
+            .map(|d| d.nick.clone())
+            .or_else(|| self.networks.first().map(|n| n.my_nick.clone()))
+            .unwrap_or_else(|| "norn".to_string());
+        // A unique default name so a second "new-network" does not collide.
+        let mut name = "new-network".to_string();
+        let mut n = 2;
+        while self
+            .definitions
+            .iter()
+            .any(|d| d.name.eq_ignore_ascii_case(&name))
+        {
+            name = format!("new-network-{n}");
+            n += 1;
+        }
+        self.definitions.push(NetworkConfig {
+            name,
+            host: String::new(),
+            port: 6697,
+            tls: true,
+            nick,
+            user: None,
+            realname: None,
+            sasl_account: None,
+            sasl_mech: SaslMech::Plain,
+            password_command: None,
+            auto_join: Vec::new(),
+        });
+        self.save_config();
+        self.networks_ui.sel = self.definitions.len() - 1;
+        self.networks_ui.focus = NetworksFocus::Form;
+        self.networks_ui.field = 1;
+        self.networks_ui.editing = None;
+        self.networks_ui.msg =
+            Some("new network — set host and nick, then press c to connect".into());
+    }
+
+    /// Remove the definition at `idx`, disconnecting a live network of that name
+    /// first. Auto-saved.
+    pub fn delete_network_definition(&mut self, idx: usize) {
+        if idx >= self.definitions.len() {
+            return;
+        }
+        let name = self.definitions[idx].name.clone();
+        self.disconnect_network(&name);
+        self.definitions.remove(idx);
+        self.save_config();
+        self.networks_ui.msg = Some(format!("removed network '{name}'"));
+        // The list shrank; keep the selection in range (add row = len).
+        if self.networks_ui.sel > self.definitions.len() {
+            self.networks_ui.sel = self.definitions.len();
+        }
+    }
+
+    /// Disconnect a live network by name (a no-op if it is not connected).
+    pub fn disconnect_network(&mut self, name: &str) {
+        if let Some(id) = self
+            .networks
+            .iter()
+            .position(|n| n.name.eq_ignore_ascii_case(name))
+        {
+            if !matches!(
+                self.networks[id].state,
+                ConnState::Disconnected | ConnState::Closed
+            ) {
+                self.actions
+                    .push(AppAction::Disconnect(id, Some("disconnected".into())));
+            }
+        }
+    }
+
+    /// Validate and apply a network form field from raw text, then auto-save.
+    /// Returns a message on invalid input. Passwords are never a field here.
+    pub fn set_network_field(&mut self, idx: usize, field: usize, raw: &str) -> Result<(), String> {
+        let raw = raw.trim();
+        let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
+        let cfg = self.definitions.get_mut(idx).ok_or("no such network")?;
+        match NETWORK_FIELDS.get(field).map(|f| f.name) {
+            Some("name") => {
+                if raw.is_empty() {
+                    return Err("name cannot be empty".into());
+                }
+                cfg.name = raw.to_string();
+            }
+            Some("host") => {
+                if raw.is_empty() {
+                    return Err("host cannot be empty".into());
+                }
+                cfg.host = raw.to_string();
+            }
+            Some("port") => cfg.port = raw.parse().map_err(|_| format!("bad port '{raw}'"))?,
+            Some("tls") => {
+                cfg.tls = parse_bool(raw).ok_or_else(|| format!("expected on/off, got '{raw}'"))?
+            }
+            Some("nick") => {
+                if raw.is_empty() {
+                    return Err("nick cannot be empty".into());
+                }
+                cfg.nick = raw.to_string();
+            }
+            Some("user") => cfg.user = opt(raw),
+            Some("realname") => cfg.realname = opt(raw),
+            Some("sasl_account") => cfg.sasl_account = opt(raw),
+            Some("sasl_mech") => {
+                cfg.sasl_mech = match raw.to_ascii_lowercase().as_str() {
+                    "plain" => SaslMech::Plain,
+                    "scram" => SaslMech::Scram,
+                    _ => return Err("expected plain|scram".into()),
+                }
+            }
+            Some("password_command") => cfg.password_command = opt(raw),
+            Some("auto_join") => {
+                cfg.auto_join = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            }
+            _ => return Err("unknown field".into()),
+        }
+        self.save_config();
+        Ok(())
+    }
+
+    /// Toggle the `tls` field or cycle `sasl_mech` on the definition at `idx`,
+    /// then auto-save. Returns a message on error (e.g. a non-toggle field).
+    pub fn adjust_network_field(&mut self, idx: usize, field: usize) -> Result<(), String> {
+        let cfg = self.definitions.get(idx).ok_or("no such network")?;
+        match NETWORK_FIELDS.get(field).map(|f| (f.name, f.kind)) {
+            Some((_, NetFieldKind::Toggle)) => {
+                let now = if cfg.tls { "off" } else { "on" };
+                self.set_network_field(idx, field, now)
+            }
+            Some(("sasl_mech", _)) => {
+                let next = match cfg.sasl_mech {
+                    SaslMech::Plain => "scram",
+                    SaslMech::Scram => "plain",
+                };
+                self.set_network_field(idx, field, next)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The live connection state of a defined network, if a network of that name
+    /// exists (for the list markers).
+    pub fn network_live_state(&self, name: &str) -> Option<ConnState> {
+        self.networks
+            .iter()
+            .find(|n| n.name.eq_ignore_ascii_case(name))
+            .map(|n| n.state.clone())
+    }
+
     /// Clear the active buffer's scrollback.
     pub fn clear_active(&mut self) {
         let idx = self.active;
@@ -1101,6 +1368,25 @@ impl App {
     }
 }
 
+/// The display value of a network form field (an empty string for an unset
+/// optional). `tls` renders as `on`/`off`; callers show it as a checkbox.
+pub fn network_field_value(cfg: &NetworkConfig, field: usize) -> String {
+    match NETWORK_FIELDS.get(field).map(|f| f.name) {
+        Some("name") => cfg.name.clone(),
+        Some("host") => cfg.host.clone(),
+        Some("port") => cfg.port.to_string(),
+        Some("tls") => if cfg.tls { "on" } else { "off" }.to_string(),
+        Some("nick") => cfg.nick.clone(),
+        Some("user") => cfg.user.clone().unwrap_or_default(),
+        Some("realname") => cfg.realname.clone().unwrap_or_default(),
+        Some("sasl_account") => cfg.sasl_account.clone().unwrap_or_default(),
+        Some("sasl_mech") => format!("{:?}", cfg.sasl_mech).to_lowercase(),
+        Some("password_command") => cfg.password_command.clone().unwrap_or_default(),
+        Some("auto_join") => cfg.auto_join.join(","),
+        _ => String::new(),
+    }
+}
+
 /// Parse `on|off|true|false|yes|no|1|0` into a bool.
 fn parse_bool(s: &str) -> Option<bool> {
     match s.to_ascii_lowercase().as_str() {
@@ -1122,18 +1408,18 @@ fn mentions(text: &str, nick: &str) -> bool {
         .any(|word| word == nick)
 }
 
-/// The console's opening lines. Always point the user at `/help`; when nothing
-/// is configured yet, also show the quickest path to a first connection.
+/// The console's opening lines. Point the user at the discoverable commands;
+/// when nothing is configured yet, also show the quickest path to a connection.
 fn welcome_lines(no_networks: bool) -> Vec<String> {
     let mut lines = vec![
         "welcome to norn".to_string(),
-        "type /help to browse commands (arrows to move, → for details, Enter to use)".to_string(),
-        "or press Tab while typing a / command to autocomplete it".to_string(),
+        "/help      browse every command (Tab also completes as you type)".to_string(),
+        "/settings  configure the client (theme, timestamps, aliases, ...)".to_string(),
+        "/networks  add, edit, connect, and disconnect networks".to_string(),
     ];
     if no_networks {
-        lines.push("no networks configured yet. to get started:".to_string());
-        lines.push("  /network add <name> host=<server> nick=<you>   define a network".to_string());
-        lines.push("  /connect <name>                                connect to it".to_string());
+        lines.push("no networks yet — open /networks and press Enter on the add row,".to_string());
+        lines.push("or run /network add <name> host=<server> nick=<you> then /connect".to_string());
     }
     lines
 }
@@ -1457,6 +1743,79 @@ mod tests {
             Event::MessageReceived(chat("#rust", "x", "me again")),
         ));
         assert!(!a.bell, "no bell when the setting is off");
+    }
+
+    #[test]
+    fn network_form_has_no_password_field() {
+        // The hard rule: the form never exposes a plaintext password, only
+        // password_command.
+        assert!(NETWORK_FIELDS
+            .iter()
+            .all(|f| f.name != "password" && f.name != "pass"));
+        assert!(NETWORK_FIELDS.iter().any(|f| f.name == "password_command"));
+    }
+
+    #[test]
+    fn network_field_edit_toggle_and_cycle() {
+        let mut a = app();
+        a.definitions.push(NetworkConfig {
+            name: "libera".into(),
+            host: "h".into(),
+            port: 6697,
+            tls: true,
+            nick: "n".into(),
+            user: None,
+            realname: None,
+            sasl_account: None,
+            sasl_mech: SaslMech::Plain,
+            password_command: None,
+            auto_join: vec![],
+        });
+        let idx = |name: &str| NETWORK_FIELDS.iter().position(|f| f.name == name).unwrap();
+        // port: rejects non-numeric, accepts a number.
+        assert!(a.set_network_field(0, idx("port"), "nope").is_err());
+        a.set_network_field(0, idx("port"), "6667").unwrap();
+        assert_eq!(a.definitions[0].port, 6667);
+        // tls toggles; sasl_mech cycles.
+        a.adjust_network_field(0, idx("tls")).unwrap();
+        assert!(!a.definitions[0].tls);
+        a.adjust_network_field(0, idx("sasl_mech")).unwrap();
+        assert_eq!(a.definitions[0].sasl_mech, SaslMech::Scram);
+        // Optional fields clear to None on empty; auto_join splits on commas.
+        a.set_network_field(0, idx("user"), "bob").unwrap();
+        assert_eq!(a.definitions[0].user.as_deref(), Some("bob"));
+        a.set_network_field(0, idx("user"), "").unwrap();
+        assert_eq!(a.definitions[0].user, None);
+        a.set_network_field(0, idx("auto_join"), "#a, #b").unwrap();
+        assert_eq!(a.definitions[0].auto_join, vec!["#a", "#b"]);
+        // Required fields refuse to blank.
+        assert!(a.set_network_field(0, idx("host"), "").is_err());
+    }
+
+    #[test]
+    fn delete_network_definition_removes_and_clamps() {
+        let mut a = app();
+        for name in ["a", "b"] {
+            a.definitions.push(NetworkConfig {
+                name: name.into(),
+                host: "h".into(),
+                port: 6697,
+                tls: true,
+                nick: "n".into(),
+                user: None,
+                realname: None,
+                sasl_account: None,
+                sasl_mech: SaslMech::Plain,
+                password_command: None,
+                auto_join: vec![],
+            });
+        }
+        a.networks_ui.sel = 2; // the add row
+        a.delete_network_definition(1);
+        assert_eq!(a.definitions.len(), 1);
+        assert_eq!(a.definitions[0].name, "a");
+        // The add row is now index 1; the selection clamps to it.
+        assert_eq!(a.networks_ui.sel, 1);
     }
 
     #[test]
