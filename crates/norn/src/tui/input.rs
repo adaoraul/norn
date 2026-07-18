@@ -10,8 +10,9 @@ const SIDEBAR_W: u16 = 24;
 const NICKLIST_W: u16 = 18;
 
 /// Handle a mouse event: click the sidebar to switch buffers, click a nick to
-/// open a query, or scroll the message view.
-pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) {
+/// open a query, or scroll the message view. Returns any lines to send (a scroll
+/// to the top may request older history).
+pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) -> Vec<String> {
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // Sidebar and nicklist span the full height; out-of-range rows map to
@@ -30,16 +31,11 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) 
                 }
             }
         }
-        MouseEventKind::ScrollUp => {
-            scroll(app, 1);
-            app.dirty = true;
-        }
-        MouseEventKind::ScrollDown => {
-            scroll(app, -1);
-            app.dirty = true;
-        }
+        MouseEventKind::ScrollUp => return app.scroll(1).into_iter().collect(),
+        MouseEventKind::ScrollDown => return app.scroll(-1).into_iter().collect(),
         _ => {}
     }
+    Vec::new()
 }
 
 /// Which buffer index is at sidebar row `y` (matches `view::draw_sidebar`).
@@ -118,8 +114,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<String> {
         KeyCode::End => app.cursor = app.input.len(),
         KeyCode::Up => app.history_prev(),
         KeyCode::Down => app.history_next(),
-        KeyCode::PageUp => scroll(app, 1),
-        KeyCode::PageDown => scroll(app, -1),
+        KeyCode::PageUp => return app.scroll(1).into_iter().collect(),
+        KeyCode::PageDown => return app.scroll(-1).into_iter().collect(),
         KeyCode::Char(c) if !ctrl && !alt => {
             app.input.insert(app.cursor, c);
             app.cursor += c.len_utf8();
@@ -182,14 +178,6 @@ fn switch_relative(app: &mut App, delta: isize) {
     let n = app.buffers.len() as isize;
     let next = (app.active as isize + delta).rem_euclid(n) as usize;
     app.switch_to(next);
-}
-
-fn scroll(app: &mut App, pages: isize) {
-    let buffer = &mut app.buffers[app.active];
-    let step = 10isize * pages;
-    let new = buffer.scroll as isize + step;
-    let max = buffer.lines.len() as isize;
-    buffer.scroll = new.clamp(0, max) as usize;
 }
 
 fn submit(app: &mut App) -> Vec<String> {

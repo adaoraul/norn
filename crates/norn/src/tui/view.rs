@@ -272,6 +272,7 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
             notice,
             mention,
             action,
+            ..
         } => {
             let color = theme::nick_color(nick);
             if *action {

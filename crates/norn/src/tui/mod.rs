@@ -108,7 +108,11 @@ pub async fn run(
                     }
                     Some(Ok(CrosstermEvent::Mouse(mouse))) => {
                         let size = guard.terminal.size().unwrap_or_default();
-                        input::handle_mouse(&mut app, mouse, size.width, size.height);
+                        let lines = input::handle_mouse(&mut app, mouse, size.width, size.height);
+                        let net = app.active_buffer().net;
+                        for line in lines {
+                            let _ = cmd_txs[net].send(NetCommand::Raw(line));
+                        }
                     }
                     Some(Ok(CrosstermEvent::Resize(_, _))) => app.dirty = true,
                     Some(Ok(_)) => {}

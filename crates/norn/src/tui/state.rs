@@ -1,7 +1,7 @@
 //! TUI application state and engine-event routing.
 
 use chrono::Local;
-use irc_engine::{Event, LeaveReason, Member, MessageKind};
+use irc_engine::{ChatHistoryRequest, Event, LeaveReason, Member, MessageKind, Selector};
 use irc_proto::Source;
 use ratatui::style::Color;
 
@@ -38,6 +38,8 @@ pub enum Line {
         mention: bool,
         /// Whether this is a CTCP ACTION (`/me`).
         action: bool,
+        /// The message id, if any (for history pagination cursors).
+        msgid: Option<String>,
     },
     /// A status/event line (joins, topics, notices).
     Event {
@@ -104,6 +106,8 @@ pub struct Buffer {
     pub mentioned: bool,
     /// Line index where reading last stopped (for the unread divider).
     pub unread_marker: Option<usize>,
+    /// Whether an older-history request is in flight (avoids duplicate loads).
+    pub history_pending: bool,
     /// Lines scrolled up from the bottom (0 = following live).
     pub scroll: usize,
 }
@@ -120,6 +124,7 @@ impl Buffer {
             unread: 0,
             mentioned: false,
             unread_marker: None,
+            history_pending: false,
             scroll: 0,
         }
     }
@@ -340,6 +345,7 @@ impl App {
                     notice: msg.kind == MessageKind::Notice,
                     mention,
                     action,
+                    msgid: msg.msgid.clone(),
                 };
                 self.push_to(net, &target, kind, line, mention);
             }
@@ -366,11 +372,16 @@ impl App {
                             notice: m.kind == MessageKind::Notice,
                             mention: false,
                             action,
+                            msgid: m.msgid.clone(),
                         }
                     })
                     .collect();
+                // Prepend older messages. The view is anchored from the bottom,
+                // so the visible window stays put; the user scrolls further up to
+                // reach the newly loaded lines.
                 lines.append(&mut self.buffers[idx].lines);
                 self.buffers[idx].lines = lines;
+                self.buffers[idx].history_pending = false;
             }
             Event::NamesLoaded { target, members } => {
                 let idx = self.ensure_buffer(net, &target, BufferKind::Channel);
@@ -490,6 +501,42 @@ impl App {
         self.buffers[index].mentioned = false;
         self.buffers[index].scroll = 0;
         self.dirty = true;
+    }
+
+    /// Scroll the active buffer by `pages` (positive = up/older). Returns a
+    /// CHATHISTORY line to send when scrolling reaches the top of a channel
+    /// (to load older messages).
+    pub fn scroll(&mut self, pages: isize) -> Option<String> {
+        self.dirty = true;
+        let idx = self.active;
+        let buffer = &mut self.buffers[idx];
+        let step = 10 * pages;
+        let max = buffer.lines.len() as isize;
+        let requested = buffer.scroll as isize + step;
+        buffer.scroll = requested.clamp(0, max) as usize;
+        // Reached (or pushed past) the top while scrolling up: pull older history.
+        if pages > 0 && requested >= max {
+            return self.request_older_history();
+        }
+        None
+    }
+
+    /// Build a CHATHISTORY BEFORE request for the active channel's oldest known
+    /// message, unless one is already in flight or there is no msgid cursor.
+    fn request_older_history(&mut self) -> Option<String> {
+        let idx = self.active;
+        if self.buffers[idx].kind != BufferKind::Channel || self.buffers[idx].history_pending {
+            return None;
+        }
+        let target = self.buffers[idx].name.clone();
+        let oldest = self.buffers[idx].lines.iter().find_map(|l| match l {
+            Line::Chat {
+                msgid: Some(id), ..
+            } => Some(id.clone()),
+            _ => None,
+        })?;
+        self.buffers[idx].history_pending = true;
+        Some(ChatHistoryRequest::before(target, Selector::msgid(oldest), 50).command())
     }
 
     /// Push a local feedback/status line into the active buffer.
@@ -730,6 +777,33 @@ mod tests {
             },
         ));
         assert_eq!(a.buffers[idx].topic.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn scroll_to_top_requests_older_history_once() {
+        let mut a = app();
+        let mut msg = chat("#rust", "alice", "hello");
+        msg.msgid = Some("m1".into());
+        a.apply(engine(0, Event::MessageReceived(msg)));
+        let idx = a.buffer_index(0, "#rust").unwrap();
+        a.switch_to(idx);
+
+        // Scrolling up to the top requests older history.
+        let cmd = a.scroll(1);
+        assert_eq!(cmd.as_deref(), Some("CHATHISTORY BEFORE #rust msgid=m1 50"));
+        assert!(a.buffers[idx].history_pending);
+        // A second scroll does not re-request while one is in flight.
+        assert!(a.scroll(1).is_none());
+        // HistoryLoaded clears the pending flag.
+        a.apply(engine(
+            0,
+            Event::HistoryLoaded {
+                target: "#rust".into(),
+                messages: vec![],
+                complete: true,
+            },
+        ));
+        assert!(!a.buffers[idx].history_pending);
     }
 
     #[test]
