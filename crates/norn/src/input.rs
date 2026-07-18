@@ -36,6 +36,38 @@ pub const HELP: &str = "commands: /join /part /msg /query /nick /names /me /topi
 /whois /away /kick /mode /notice /invite /raw · client: /set /network ls|add|rm|show \
 /connect /disconnect /reconnect /clear /alias /unalias /help /quit";
 
+/// Canonical command names, the single registry used for Tab-completion. Short
+/// aliases (`j`, `m`, `q`, ...) are intentionally omitted so completion offers
+/// the full names.
+pub const COMMANDS: &[&str] = &[
+    "alias",
+    "away",
+    "clear",
+    "close",
+    "connect",
+    "disconnect",
+    "help",
+    "invite",
+    "join",
+    "kick",
+    "me",
+    "mode",
+    "msg",
+    "names",
+    "network",
+    "nick",
+    "notice",
+    "part",
+    "query",
+    "quit",
+    "raw",
+    "reconnect",
+    "set",
+    "topic",
+    "unalias",
+    "whois",
+];
+
 /// Translate one input line for the given current target.
 pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
     let input = input.trim();

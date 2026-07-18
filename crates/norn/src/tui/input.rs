@@ -725,6 +725,15 @@ fn complete(app: &mut App) {
         return;
     }
     let start = word_start(&app.input, app.cursor);
+    // Completing the command name: cursor is in the first token of a `/command`.
+    if app.input.starts_with('/') && start == 0 {
+        if let Some(completion) = command_completion(app) {
+            app.completion = Some(completion);
+            apply_completion(app, 0);
+        }
+        return;
+    }
+    // Otherwise complete a nick from the channel roster.
     let stem = app.input[start..app.cursor].to_lowercase();
     if stem.is_empty() {
         return;
@@ -744,8 +753,37 @@ fn complete(app: &mut App) {
         matches,
         idx: 0,
         start,
+        suffix: if start == 0 { ": " } else { "" },
     });
     apply_completion(app, 0);
+}
+
+/// Build a command-name completion from the stem after the leading `/`:
+/// built-in `COMMANDS` plus the user's alias names, prefix-filtered.
+fn command_completion(app: &App) -> Option<Completion> {
+    let stem = app.input[1..app.cursor].to_lowercase();
+    let mut matches: Vec<String> = crate::input::COMMANDS
+        .iter()
+        .filter(|c| c.starts_with(&stem))
+        .map(|c| c.to_string())
+        .chain(
+            app.aliases
+                .keys()
+                .filter(|name| name.starts_with(&stem))
+                .cloned(),
+        )
+        .collect();
+    matches.sort();
+    matches.dedup();
+    if matches.is_empty() {
+        return None;
+    }
+    Some(Completion {
+        matches,
+        idx: 0,
+        start: 1, // just after the leading '/'
+        suffix: " ",
+    })
 }
 
 fn apply_completion(app: &mut App, idx: usize) {
@@ -753,10 +791,10 @@ fn apply_completion(app: &mut App, idx: usize) {
         return;
     };
     completion.idx = idx;
-    let nick = completion.matches[idx].clone();
+    let candidate = completion.matches[idx].clone();
     let start = completion.start;
-    let suffix = if start == 0 { ": " } else { "" };
-    app.input = format!("{}{nick}{suffix}", &app.input[..start]);
+    let suffix = completion.suffix;
+    app.input = format!("{}{candidate}{suffix}", &app.input[..start]);
     app.cursor = app.input.len();
 }
 
@@ -877,6 +915,35 @@ mod tests {
         assert_eq!(app.input, "alice: "); // first match, at line start
         handle_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.input, "albert: "); // cycles to next
+    }
+
+    #[test]
+    fn tab_completes_command_names() {
+        let mut app = app_with_channel();
+        // A unique prefix fills the whole command with a trailing space.
+        for c in "/wh".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.input, "/whois ");
+    }
+
+    #[test]
+    fn tab_cycles_multiple_command_matches_and_includes_aliases() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/alias nap away napping"); // an alias starting with 'n'
+        for c in "/n".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Tab));
+        // Candidates (sorted): names, nap, network, nick, notice -> first is "names".
+        assert_eq!(app.input, "/names ");
+        let candidates = app.completion.as_ref().unwrap().matches.clone();
+        assert!(candidates.contains(&"network".to_string()));
+        assert!(
+            candidates.contains(&"nap".to_string()),
+            "aliases are offered"
+        );
     }
 
     #[test]

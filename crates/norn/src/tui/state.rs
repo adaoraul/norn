@@ -210,12 +210,15 @@ pub struct Switcher {
 /// In-progress tab completion.
 #[derive(Debug, Clone)]
 pub struct Completion {
-    /// Candidate nicks.
+    /// Candidate completions (nicks or command names).
     pub matches: Vec<String>,
     /// Selected candidate.
     pub idx: usize,
-    /// Byte range in the input being replaced.
+    /// Byte offset in the input where the replaced token starts.
     pub start: usize,
+    /// Text appended after the inserted candidate (e.g. `": "` for a leading
+    /// nick, `" "` for a command, `""` mid-line).
+    pub suffix: &'static str,
 }
 
 /// The whole TUI application state.
