@@ -106,10 +106,8 @@ NickServ), it is resolved at connect time from, in order:
   and SASL, settings, the full command reference, keybindings, and features.
 - **[Plugin developer guide](docs/PLUGINS.md)** - writing Rhai plugins: hooks,
   the host API, per-plugin config, the sandbox, and worked examples.
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** - the engine design and wire-level
+- **[IRCv3 Engine: Architecture](docs/ARCHITECTURE.md)** - the engine design and wire-level
   traces.
-- **[TESTS.md](TESTS.md)** - the executable spec that pins down the tricky
-  protocol behavior.
 
 ## License
 
