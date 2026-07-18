@@ -30,6 +30,23 @@ pub const FAINT: Color = Color::Rgb(0x3d, 0x42, 0x50);
 
 /// Default accent (teal).
 pub const ACCENT: Color = Color::Rgb(0x6b, 0xac, 0xae);
+
+/// Resolve a theme name to its accent color. Unknown names fall back to teal.
+/// The names here are the valid values for `/set theme` and the config
+/// `[client] theme` key.
+pub fn accent_for(name: &str) -> Color {
+    match name.to_ascii_lowercase().as_str() {
+        "amber" | "gold" => Color::Rgb(0xe0, 0xc0, 0x60),
+        "green" => Color::Rgb(0x8f, 0xae, 0x6b),
+        "blue" => Color::Rgb(0x6b, 0x8f, 0xae),
+        "purple" | "violet" => Color::Rgb(0xc7, 0x8f, 0xd6),
+        "pink" => Color::Rgb(0xae, 0x6b, 0x8f),
+        _ => ACCENT, // teal
+    }
+}
+
+/// The theme names `accent_for` recognizes, for help text and completion.
+pub const THEME_NAMES: &[&str] = &["teal", "amber", "green", "blue", "purple", "pink"];
 /// Op (`@`) color, also the >2 unread badge and highlight text.
 pub const GOLD: Color = Color::Rgb(0xe0, 0xc0, 0x60);
 /// Highlight background for own-nick mentions.

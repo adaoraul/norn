@@ -26,22 +26,13 @@ use tui::state::NetworkMeta;
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
-    let networks = match config::resolve_startup(&cli) {
-        Ok(Startup::Connect(networks)) => networks,
-        Ok(Startup::WroteTemplate(path)) => {
-            println!(
-                "Created a starter config at {}.\nEdit it to add a network, then run norn again.",
-                path.display()
-            );
-            return Ok(());
-        }
-        Ok(Startup::NoNetworks(path)) => {
-            println!(
-                "No networks configured in {}.\nAdd a [[network]] block (or pass --server/--nick).",
-                path.display()
-            );
-            return Ok(());
-        }
+    let Startup {
+        connect,
+        definitions,
+        client,
+        path,
+    } = match config::resolve_startup(&cli) {
+        Ok(startup) => startup,
         Err(err) => {
             eprintln!("norn: {err}");
             std::process::exit(2);
@@ -53,7 +44,7 @@ async fn main() -> std::io::Result<()> {
     let mut cmd_txs: Vec<mpsc::UnboundedSender<NetCommand>> = Vec::new();
     let mut metas: Vec<NetworkMeta> = Vec::new();
 
-    for (id, settings) in networks.into_iter().enumerate() {
+    for (id, settings) in connect.into_iter().enumerate() {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<NetCommand>();
         cmd_txs.push(cmd_tx);
         metas.push(NetworkMeta {
@@ -65,14 +56,25 @@ async fn main() -> std::io::Result<()> {
         let quit = quit.clone();
         tokio::spawn(session::run_network(id, settings, ui_tx, cmd_rx, quit));
     }
-    drop(ui_tx); // so ui_rx closes once every network task ends
 
     if cli.plain {
+        drop(ui_tx); // so ui_rx closes once every network task ends
         let net_names = metas.iter().map(|m| m.name.clone()).collect();
         plain::run(ui_rx, cmd_txs, net_names, quit).await;
         Ok(())
     } else {
-        let accent = ratatui::style::Color::Rgb(0x6b, 0xac, 0xae);
-        tui::run(ui_rx, cmd_txs, metas, true, accent, quit).await
+        // The TUI keeps a `ui_tx` clone so it can spawn networks at runtime and
+        // so `ui_rx` stays open even with zero networks (the console stays up).
+        tui::run(
+            ui_rx,
+            ui_tx,
+            cmd_txs,
+            metas,
+            definitions,
+            client,
+            path,
+            quit,
+        )
+        .await
     }
 }

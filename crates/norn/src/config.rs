@@ -7,7 +7,7 @@
 //! `NORN_PASSWORD` environment variable.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
 
 use clap::{Parser, ValueEnum};
@@ -15,13 +15,13 @@ use directories::ProjectDirs;
 use irc_engine::{recommended_caps, BringupConfig, SaslFailPolicy};
 use irc_proto::{Mechanism, Plain, ScramSha256};
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Environment variable holding a fallback SASL password.
 pub const PASSWORD_ENV: &str = "NORN_PASSWORD";
 
 /// Which SASL mechanism to authenticate with.
-#[derive(ValueEnum, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(ValueEnum, Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SaslMech {
     /// PLAIN: password base64'd, TLS only.
@@ -95,9 +95,12 @@ fn default_true() -> bool {
 fn default_port() -> u16 {
     6697
 }
+fn default_theme() -> String {
+    "teal".to_string()
+}
 
 /// A network as declared in the TOML file (or synthesized from CLI flags).
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NetworkConfig {
     /// Display name for the network.
     pub name: String,
@@ -112,31 +115,80 @@ pub struct NetworkConfig {
     /// Nickname.
     pub nick: String,
     /// Username/ident (defaults to the nick).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Realname (defaults to the nick).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realname: Option<String>,
     /// SASL account, if authenticating.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sasl_account: Option<String>,
     /// SASL mechanism.
     #[serde(default)]
     pub sasl_mech: SaslMech,
     /// Shell command whose stdout is the SASL password.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_command: Option<String>,
     /// Channels to auto-join.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_join: Vec<String>,
 }
 
+/// Client-wide UI preferences (the TOML `[client]` table).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ClientConfig {
+    /// Whether to show message timestamps.
+    #[serde(default = "default_true")]
+    pub timestamps: bool,
+    /// Accent theme name (see `tui::theme::accent_for`).
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// Whether the channel nicklist is shown by default.
+    #[serde(default = "default_true")]
+    pub nicklist: bool,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        ClientConfig {
+            timestamps: true,
+            theme: default_theme(),
+            nicklist: true,
+        }
+    }
+}
+
 /// The whole config file.
-#[derive(Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Config {
+    /// Client-wide UI preferences.
+    #[serde(default)]
+    pub client: ClientConfig,
     /// Declared networks (TOML `[[network]]` or `[[networks]]`).
-    #[serde(default, alias = "network")]
+    #[serde(default, alias = "network", skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<NetworkConfig>,
+}
+
+/// Header prepended to a saved config (auto-save rewrites the file, so any
+/// hand-written comments are lost; this reminds the user where guidance lives).
+const SAVE_HEADER: &str = "\
+# norn configuration (auto-generated).
+# Edit in-app with /set and /network, or by hand while norn is not running.
+# Passwords are never stored here: use `password_command` or NORN_PASSWORD.
+
+";
+
+impl Config {
+    /// Serialize and write the config to `path`, creating parent dirs. Only
+    /// `password_command` is ever written for a network, never a password.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let body = toml::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, format!("{SAVE_HEADER}{body}"))
+    }
 }
 
 /// Where and how to open the socket.
@@ -270,84 +322,56 @@ impl Cli {
     }
 }
 
-/// The commented template written on first run.
-const CONFIG_TEMPLATE: &str = "\
-# norn configuration.
-#
-# Define one or more [[network]] blocks below, then run `norn` again.
-# Passwords are never stored here: set `password_command` to a shell command
-# whose stdout is the password (or leave it out and use the NORN_PASSWORD env
-# var).
-
-# [[network]]
-# name = \"libera\"
-# host = \"irc.libera.chat\"
-# port = 6697
-# tls = true
-# nick = \"yournick\"
-# # SASL (optional):
-# sasl_account = \"yournick\"
-# sasl_mech = \"scram\"                    # plain | scram
-# password_command = \"pass irc/libera\"   # stdout is the password
-# auto_join = [\"#rust\", \"#ratatui\"]
-";
-
-/// The outcome of resolving startup configuration.
-pub enum Startup {
-    /// Ready to connect to these networks.
-    Connect(Vec<NetworkSettings>),
-    /// No config existed; a template was written here. The user should edit it.
-    WroteTemplate(PathBuf),
-    /// Config exists but declares no networks.
-    NoNetworks(PathBuf),
+/// Everything resolved at startup: what to connect now, the persisted network
+/// definitions, client preferences, and where to auto-save.
+pub struct Startup {
+    /// Networks to dial at launch (file networks plus any CLI ad-hoc one),
+    /// resolved and ready to connect.
+    pub connect: Vec<NetworkSettings>,
+    /// The persisted network definitions (file only; the CLI ad-hoc network is
+    /// connected but never written back). Authoritative list for in-app editing.
+    pub definitions: Vec<NetworkConfig>,
+    /// Client UI preferences.
+    pub client: ClientConfig,
+    /// The config file to auto-save to (`None` if no config dir is available).
+    pub path: Option<PathBuf>,
 }
 
-/// Resolve networks from the config file and/or CLI flags. On a first run with
-/// no config and no CLI network, write a template and ask the user to edit it
-/// (irssi-style), rather than connecting.
+/// Resolve startup configuration from the config file and/or CLI flags. Unlike
+/// before, this never exits early: with no config and no CLI network it returns
+/// an empty `connect`/`definitions`, and the TUI launches into its status
+/// console where the user configures networks in-app (irssi-style).
 pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
     let path = cli.config.clone().or_else(default_config_path);
-    let mut configs: Vec<NetworkConfig> = Vec::new();
-    let mut file_existed = false;
+    let mut client = ClientConfig::default();
+    let mut definitions: Vec<NetworkConfig> = Vec::new();
 
     if let Some(path) = &path {
         if path.exists() {
-            file_existed = true;
             let text = std::fs::read_to_string(path)?;
             let config: Config = toml::from_str(&text)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            configs.extend(config.networks);
+            client = config.client;
+            definitions = config.networks;
         }
     }
 
+    // The CLI ad-hoc network connects at launch but is not a persisted definition.
+    let mut to_connect = definitions.clone();
     if let Some(network) = cli.ad_hoc_network() {
-        configs.push(network);
+        to_connect.push(network);
     }
+    let connect = to_connect
+        .iter()
+        .map(NetworkConfig::resolve)
+        .collect::<io::Result<Vec<_>>>()?;
 
-    if !configs.is_empty() {
-        let settings = configs
-            .iter()
-            .map(NetworkConfig::resolve)
-            .collect::<io::Result<Vec<_>>>()?;
-        return Ok(Startup::Connect(settings));
-    }
-
-    match path {
-        // First run: no config file yet -> write a template and stop.
-        Some(path) if !file_existed => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, CONFIG_TEMPLATE)?;
-            Ok(Startup::WroteTemplate(path))
-        }
-        // Config exists but is empty of networks.
-        Some(path) => Ok(Startup::NoNetworks(path)),
-        None => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no config directory available; pass --config or --server/--nick",
-        )),
-    }
+    Ok(Startup {
+        connect,
+        definitions,
+        client,
+        path,
+    })
 }
 
 #[cfg(test)]
@@ -355,8 +379,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn template_is_valid_toml_with_no_active_networks() {
-        let config: Config = toml::from_str(CONFIG_TEMPLATE).unwrap();
+    fn config_round_trips_through_save_serialization() {
+        let config = Config {
+            client: ClientConfig {
+                timestamps: false,
+                theme: "amber".into(),
+                nicklist: true,
+            },
+            networks: vec![NetworkConfig {
+                name: "libera".into(),
+                host: "irc.libera.chat".into(),
+                port: 6697,
+                tls: true,
+                nick: "svan".into(),
+                user: None,
+                realname: None,
+                sasl_account: Some("svan".into()),
+                sasl_mech: SaslMech::Scram,
+                password_command: Some("pass irc/libera".into()),
+                auto_join: vec!["#rust".into()],
+            }],
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        // Never leak a resolved password (there is no password field to leak),
+        // and the password_command is preserved.
+        assert!(!text.contains("password ="));
+        assert!(text.contains("password_command"));
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.client.theme, "amber");
+        assert!(!back.client.timestamps);
+        assert_eq!(back.networks.len(), 1);
+        assert_eq!(back.networks[0].sasl_mech, SaslMech::Scram);
+        assert_eq!(back.networks[0].auto_join, vec!["#rust"]);
+    }
+
+    #[test]
+    fn client_config_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.client.timestamps);
+        assert!(config.client.nicklist);
+        assert_eq!(config.client.theme, "teal");
         assert!(config.networks.is_empty());
     }
 

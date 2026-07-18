@@ -10,6 +10,7 @@ pub mod theme;
 pub mod view;
 
 use std::io::{self, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -21,10 +22,10 @@ use crossterm::terminal::{
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
-use ratatui::style::Color;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
+use crate::config::{ClientConfig, NetworkConfig};
 use crate::session::{NetCommand, UiEvent};
 use state::{App, NetworkMeta};
 
@@ -55,6 +56,17 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Route commands to the active buffer's network. The console (and any buffer
+/// on a network with no live task) has no sender, so its commands are dropped.
+fn send_to_active(app: &App, cmd_txs: &[mpsc::UnboundedSender<NetCommand>], cmds: Vec<NetCommand>) {
+    let net = app.active_buffer().net;
+    if let Some(tx) = cmd_txs.get(net) {
+        for cmd in cmds {
+            let _ = tx.send(cmd);
+        }
+    }
+}
+
 /// Restore the terminal on panic before running the default hook.
 fn install_panic_hook() {
     let hook = std::panic::take_hook();
@@ -66,18 +78,24 @@ fn install_panic_hook() {
     }));
 }
 
-/// Run the TUI until the user quits or all networks close.
+/// Run the TUI until the user quits.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut ui_rx: mpsc::UnboundedReceiver<UiEvent>,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
     cmd_txs: Vec<mpsc::UnboundedSender<NetCommand>>,
     networks: Vec<NetworkMeta>,
-    timestamps: bool,
-    accent: Color,
+    definitions: Vec<NetworkConfig>,
+    client: ClientConfig,
+    config_path: Option<PathBuf>,
     quit: Arc<AtomicBool>,
 ) -> io::Result<()> {
     install_panic_hook();
+    // Held so `ui_rx` stays open even with zero networks (the console stays up);
+    // the supervisor will clone it to spawn networks at runtime.
+    let _ui_tx = ui_tx;
     let mut guard = TerminalGuard::new()?;
-    let mut app = App::new(networks, timestamps, accent);
+    let mut app = App::new(networks, client, definitions, config_path);
     let mut term_events = EventStream::new();
 
     loop {
@@ -101,18 +119,12 @@ pub async fn run(
                 match term {
                     Some(Ok(CrosstermEvent::Key(key))) if key.kind == KeyEventKind::Press => {
                         let cmds = input::handle_key(&mut app, key);
-                        let net = app.active_buffer().net;
-                        for cmd in cmds {
-                            let _ = cmd_txs[net].send(cmd);
-                        }
+                        send_to_active(&app, &cmd_txs, cmds);
                     }
                     Some(Ok(CrosstermEvent::Mouse(mouse))) => {
                         let size = guard.terminal.size().unwrap_or_default();
                         let cmds = input::handle_mouse(&mut app, mouse, size.width, size.height);
-                        let net = app.active_buffer().net;
-                        for cmd in cmds {
-                            let _ = cmd_txs[net].send(cmd);
-                        }
+                        send_to_active(&app, &cmd_txs, cmds);
                     }
                     Some(Ok(CrosstermEvent::Resize(_, _))) => app.dirty = true,
                     Some(Ok(_)) => {}

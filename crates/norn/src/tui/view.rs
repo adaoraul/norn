@@ -88,6 +88,25 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
     let inner_w = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
 
+    // The global console is the first row, above every network.
+    let console_active = app
+        .buffers
+        .get(app.active)
+        .is_some_and(|b| b.kind == BufferKind::Status);
+    lines.push(sidebar_row(
+        app.accent,
+        console_active,
+        "norn",
+        "",
+        if console_active {
+            theme::BRIGHT
+        } else {
+            theme::DIM2
+        },
+        theme::DIM2,
+        inner_w,
+    ));
+
     for (net_id, net) in app.networks.iter().enumerate() {
         // The network name header is the server/status buffer's entry.
         let server_active = app
@@ -576,10 +595,15 @@ fn draw_switcher(f: &mut Frame, area: Rect, app: &App) {
     ])];
     for (i, &idx) in matches.iter().enumerate() {
         let b = &app.buffers[idx];
-        let label = if b.kind == BufferKind::Server {
-            format!("{} (status)", app.networks[b.net].name)
-        } else {
-            format!("{}  {}", b.name, app.networks[b.net].name)
+        let net_name = app
+            .networks
+            .get(b.net)
+            .map(|n| n.name.as_str())
+            .unwrap_or("");
+        let label = match b.kind {
+            BufferKind::Status => b.name.clone(),
+            BufferKind::Server => format!("{net_name} (status)"),
+            _ => format!("{}  {net_name}", b.name),
         };
         let style = if i == app.switcher.sel {
             Style::default().fg(theme::BRIGHT).bg(theme::ACTIVE_BG)
@@ -632,6 +656,7 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientConfig;
     use crate::session::{ConnState, UiEvent, UiEventKind};
     use crate::tui::state::{App, NetworkMeta};
     use irc_engine::{Event, TopicChange};
@@ -649,7 +674,7 @@ mod tests {
                 nick: "svan".into(),
             },
         }];
-        let mut app = App::new(nets, true, theme::ACCENT);
+        let mut app = App::new(nets, ClientConfig::default(), Vec::new(), None);
         app.apply(UiEvent {
             net: 0,
             kind: UiEventKind::Engine(Event::TopicChanged {
@@ -710,7 +735,7 @@ mod tests {
             my_nick: "svan".into(),
             state: ConnState::Connecting,
         }];
-        let mut app = App::new(nets, true, theme::ACCENT);
+        let mut app = App::new(nets, ClientConfig::default(), Vec::new(), None);
         app.mode = Mode::Switcher;
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -770,7 +795,7 @@ mod tests {
                 nick: "svan".into(),
             },
         }];
-        App::new(nets, true, theme::ACCENT)
+        App::new(nets, ClientConfig::default(), Vec::new(), None)
     }
 
     #[test]

@@ -1,20 +1,32 @@
 //! TUI application state and engine-event routing.
 
+use std::path::PathBuf;
+
 use chrono::Local;
 use irc_engine::{Event, LeaveReason, Member, MessageKind, TopicChange};
 use irc_proto::Source;
 use ratatui::style::Color;
 
+use crate::config::{ClientConfig, Config, NetworkConfig};
 use crate::session::{ConnState, NetCommand, NetworkId, UiEvent, UiEventKind};
+use crate::tui::theme;
 
 /// Max lines kept per buffer.
 const MAX_LINES: usize = 5000;
 /// How many older messages to pull per scroll-up page.
 const HISTORY_PAGE: usize = 50;
 
+/// Sentinel `NetworkId` for the global console buffer, which belongs to no
+/// network. Being out of range of `networks`/`cmd_txs`, it is naturally
+/// excluded from every per-network iteration and lookup.
+pub const CONSOLE: NetworkId = usize::MAX;
+
 /// The kind of a buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferKind {
+    /// The global "norn" console: welcome text, settings, and network output.
+    /// Not tied to any network.
+    Status,
     /// A network's status/server buffer.
     Server,
     /// A channel.
@@ -212,6 +224,12 @@ pub struct App {
     pub timestamps: bool,
     /// Accent color.
     pub accent: Color,
+    /// Client preferences (persisted `[client]` section).
+    pub client: ClientConfig,
+    /// The persisted network definitions (authoritative for `/network`).
+    pub definitions: Vec<NetworkConfig>,
+    /// Where to auto-save config (`None` if no config dir is available).
+    pub config_path: Option<PathBuf>,
     /// Previously submitted input lines (for recall).
     pub history: Vec<String>,
     /// Position while navigating history (`None` = at the live draft).
@@ -225,25 +243,43 @@ pub struct App {
 }
 
 impl App {
-    /// Build an app with a server buffer per network.
-    pub fn new(networks: Vec<NetworkMeta>, timestamps: bool, accent: Color) -> Self {
-        let buffers = networks
-            .iter()
-            .enumerate()
-            .map(|(id, _)| Buffer::new(id, "*", BufferKind::Server))
-            .collect();
+    /// Build an app with the global console (buffer 0) plus a server buffer per
+    /// network. Client preferences seed the live UI toggles.
+    pub fn new(
+        networks: Vec<NetworkMeta>,
+        client: ClientConfig,
+        definitions: Vec<NetworkConfig>,
+        config_path: Option<PathBuf>,
+    ) -> Self {
+        let mut console = Buffer::new(CONSOLE, "norn", BufferKind::Status);
+        for line in welcome_lines(networks.is_empty()) {
+            console.lines.push(event_line(line));
+        }
+        let mut buffers = vec![console];
+        buffers.extend(
+            networks
+                .iter()
+                .enumerate()
+                .map(|(id, _)| Buffer::new(id, "*", BufferKind::Server)),
+        );
+        // Land on the console when nothing is configured; otherwise the first
+        // network's server buffer (index 1, right after the console).
+        let active = if networks.is_empty() { 0 } else { 1 };
         App {
             networks,
             buffers,
-            active: 0,
+            active,
             input: String::new(),
             cursor: 0,
             mode: Mode::Normal,
             switcher: Switcher::default(),
             completion: None,
-            nicklist_visible: true,
-            timestamps,
-            accent,
+            nicklist_visible: client.nicklist,
+            timestamps: client.timestamps,
+            accent: theme::accent_for(&client.theme),
+            client,
+            definitions,
+            config_path,
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
@@ -257,9 +293,13 @@ impl App {
         &self.buffers[self.active]
     }
 
-    /// The nick we use on the active buffer's network.
+    /// The nick we use on the active buffer's network (falls back to "norn" on
+    /// the console, which belongs to no network).
     pub fn my_nick(&self) -> &str {
-        &self.networks[self.active_buffer().net].my_nick
+        self.networks
+            .get(self.active_buffer().net)
+            .map(|n| n.my_nick.as_str())
+            .unwrap_or("norn")
     }
 
     fn buffer_index(&self, net: NetworkId, name: &str) -> Option<usize> {
@@ -578,6 +618,43 @@ impl App {
         self.dirty = true;
     }
 
+    /// The global console buffer index.
+    fn console(&self) -> usize {
+        self.buffers
+            .iter()
+            .position(|b| b.kind == BufferKind::Status)
+            .unwrap_or(0)
+    }
+
+    /// Push a line into the console buffer (not necessarily the active one).
+    pub fn push_console(&mut self, text: String) {
+        let idx = self.console();
+        self.buffers[idx].push(event_line(text));
+        self.dirty = true;
+    }
+
+    /// Switch to the console buffer.
+    pub fn switch_to_console(&mut self) {
+        let idx = self.console();
+        self.switch_to(idx);
+    }
+
+    /// Persist current client prefs and network definitions to the config file.
+    /// A missing path or write error is reported into the active buffer.
+    pub fn save_config(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            self.push_active_event("no config file path; change not saved".to_string());
+            return;
+        };
+        let config = Config {
+            client: self.client.clone(),
+            networks: self.definitions.clone(),
+        };
+        if let Err(err) = config.save(&path) {
+            self.push_active_event(format!("save failed: {err}"));
+        }
+    }
+
     /// Open (or focus) a query buffer with `nick` on `net`.
     pub fn open_query(&mut self, net: NetworkId, nick: &str) {
         let idx = self.ensure_buffer(net, nick, BufferKind::Query);
@@ -657,6 +734,19 @@ fn mentions(text: &str, nick: &str) -> bool {
         .any(|word| word == nick)
 }
 
+/// The console's opening lines. When nothing is configured yet, point the user
+/// at the commands that add and connect a network.
+fn welcome_lines(no_networks: bool) -> Vec<String> {
+    let mut lines = vec!["welcome to norn".to_string()];
+    if no_networks {
+        lines.push("no networks configured yet.".to_string());
+        lines.push("  /network add <name> host=<server> nick=<you>".to_string());
+        lines.push("  /connect <name>       connect a defined network".to_string());
+        lines.push("  /set                  view and change settings".to_string());
+    }
+    lines
+}
+
 fn source_nick(source: &Source) -> &str {
     match source {
         Source::User { nick, .. } => nick,
@@ -690,7 +780,7 @@ mod tests {
                 state: ConnState::Connecting,
             },
         ];
-        App::new(nets, true, Color::Reset)
+        App::new(nets, ClientConfig::default(), Vec::new(), None)
     }
 
     fn engine(net: NetworkId, event: Event) -> UiEvent {
@@ -701,10 +791,22 @@ mod tests {
     }
 
     #[test]
-    fn server_buffers_exist_per_network() {
+    fn console_plus_a_server_buffer_per_network() {
         let a = app();
-        assert_eq!(a.buffers.len(), 2);
-        assert!(a.buffers.iter().all(|b| b.kind == BufferKind::Server));
+        // Buffer 0 is the global console; then one server buffer per network.
+        assert_eq!(a.buffers.len(), 3);
+        assert_eq!(a.buffers[0].kind, BufferKind::Status);
+        assert!(a.buffers[1..].iter().all(|b| b.kind == BufferKind::Server));
+        // With networks present, we land on the first server buffer, not the console.
+        assert_eq!(a.active, 1);
+    }
+
+    #[test]
+    fn zero_networks_lands_on_console() {
+        let a = App::new(Vec::new(), ClientConfig::default(), Vec::new(), None);
+        assert_eq!(a.buffers.len(), 1);
+        assert_eq!(a.buffers[0].kind, BufferKind::Status);
+        assert_eq!(a.active, 0);
     }
 
     #[test]

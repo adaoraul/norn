@@ -40,9 +40,18 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) 
 }
 
 /// Which buffer index is at sidebar row `y` (matches `view::draw_sidebar`).
-/// The network header row selects that network's server/status buffer.
+/// Row 0 is the console; each network header row selects that network's server
+/// buffer, followed by its channels/queries.
 fn sidebar_buffer_at(app: &App, y: u16) -> Option<usize> {
     let mut row = 0u16;
+    // Row 0: the global console.
+    if y == row {
+        return app
+            .buffers
+            .iter()
+            .position(|b| b.kind == BufferKind::Status);
+    }
+    row += 1;
     for net_id in 0..app.networks.len() {
         if row == y {
             return app
@@ -213,16 +222,24 @@ fn submit(app: &mut App) -> Vec<NetCommand> {
                     None => Vec::new(),
                 };
             }
+            "set" => {
+                handle_set(app, arg);
+                return Vec::new();
+            }
+            "network" | "net" => {
+                handle_network(app, arg);
+                return Vec::new();
+            }
             _ => {}
         }
     }
 
     let buffer = app.active_buffer();
     let target = match buffer.kind {
-        BufferKind::Server => None,
+        BufferKind::Status | BufferKind::Server => None,
         _ => Some(buffer.name.clone()),
     };
-    // Plain text needs a target; a server buffer only takes commands.
+    // Plain text needs a target; the console and server buffers only take commands.
     if target.is_none() && !text.starts_with('/') {
         app.push_active_event("no target here; join a channel or /query <nick>".to_string());
         return Vec::new();
@@ -238,6 +255,227 @@ fn submit(app: &mut App) -> Vec<NetCommand> {
         return Vec::new();
     }
     result.lines.into_iter().map(NetCommand::Raw).collect()
+}
+
+/// `/set` - view or change a client setting, applied live and auto-saved.
+fn handle_set(app: &mut App, arg: &str) {
+    let mut it = arg.split_whitespace();
+    let Some(key) = it.next() else {
+        // No args: show the current settings in the console.
+        app.push_console("settings:".to_string());
+        app.push_console(format!("  timestamps = {}", app.client.timestamps));
+        app.push_console(format!("  nicklist   = {}", app.client.nicklist));
+        app.push_console(format!(
+            "  theme      = {}   ({})",
+            app.client.theme,
+            crate::tui::theme::THEME_NAMES.join(", ")
+        ));
+        app.switch_to_console();
+        return;
+    };
+    let value = it.collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        app.push_active_event(format!("usage: /set {key} <value>"));
+        return;
+    }
+    match key {
+        "timestamps" => match parse_bool(&value) {
+            Some(on) => {
+                app.timestamps = on;
+                app.client.timestamps = on;
+            }
+            None => return app.push_active_event(format!("expected on/off, got '{value}'")),
+        },
+        "nicklist" => match parse_bool(&value) {
+            Some(on) => {
+                app.nicklist_visible = on;
+                app.client.nicklist = on;
+            }
+            None => return app.push_active_event(format!("expected on/off, got '{value}'")),
+        },
+        "theme" => {
+            if !crate::tui::theme::THEME_NAMES.contains(&value.as_str()) {
+                return app.push_active_event(format!(
+                    "unknown theme '{value}' (try: {})",
+                    crate::tui::theme::THEME_NAMES.join(", ")
+                ));
+            }
+            app.accent = crate::tui::theme::accent_for(&value);
+            app.client.theme = value.clone();
+        }
+        other => return app.push_active_event(format!("unknown setting '{other}'")),
+    }
+    app.save_config();
+    app.push_active_event(format!("set {key} = {value}"));
+}
+
+/// `/network list|add|remove` - manage persisted network definitions.
+fn handle_network(app: &mut App, arg: &str) {
+    let mut it = arg.splitn(2, ' ');
+    let sub = it.next().unwrap_or("").to_ascii_lowercase();
+    let rest = it.next().unwrap_or("").trim();
+    match sub.as_str() {
+        "list" | "" => {
+            let mut lines = vec!["networks:".to_string()];
+            if app.definitions.is_empty() {
+                lines.push("  (none defined)".to_string());
+            }
+            for net in &app.definitions {
+                let sasl = net
+                    .sasl_account
+                    .as_deref()
+                    .map(|a| format!(" sasl={a}/{:?}", net.sasl_mech).to_lowercase())
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "  {}  {}:{}{}{}",
+                    net.name,
+                    net.host,
+                    net.port,
+                    if net.tls { "" } else { " (no tls)" },
+                    sasl
+                ));
+            }
+            for line in lines {
+                app.push_console(line);
+            }
+            app.switch_to_console();
+        }
+        "add" => match parse_network_add(rest) {
+            Ok(net) => {
+                let name = net.name.clone();
+                if let Some(slot) = app
+                    .definitions
+                    .iter_mut()
+                    .find(|n| n.name.eq_ignore_ascii_case(&name))
+                {
+                    *slot = net;
+                    app.save_config();
+                    app.push_active_event(format!("updated network '{name}'"));
+                } else {
+                    app.definitions.push(net);
+                    app.save_config();
+                    app.push_active_event(format!("added network '{name}' (/connect to dial it)"));
+                }
+            }
+            Err(msg) => app.push_active_event(msg),
+        },
+        "remove" | "rm" | "del" => {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            let before = app.definitions.len();
+            app.definitions
+                .retain(|n| !n.name.eq_ignore_ascii_case(name));
+            if app.definitions.len() == before {
+                app.push_active_event(format!("no network named '{name}'"));
+            } else {
+                app.save_config();
+                app.push_active_event(format!("removed network '{name}'"));
+            }
+        }
+        other => app.push_active_event(format!("usage: /network list|add|remove (got '{other}')")),
+    }
+}
+
+/// Parse `on|off|true|false|yes|no|1|0` into a bool.
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Some(true),
+        "off" | "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Split a command argument string into tokens, honoring double quotes so a
+/// value like `password_command="pass irc/libera"` stays one token.
+fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut has_token = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                has_token = true;
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if has_token {
+                    out.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        out.push(cur);
+    }
+    out
+}
+
+/// Parse a `/network add` argument list into a `NetworkConfig`. Passwords are
+/// never accepted inline; only `password_command` (a shell command).
+fn parse_network_add(arg: &str) -> Result<crate::config::NetworkConfig, String> {
+    use crate::config::SaslMech;
+    const USAGE: &str = "usage: /network add <name> host=<server> nick=<you> \
+[port=] [tls=on|off] [user=] [realname=] [sasl_account=] [sasl_mech=plain|scram] \
+[password_command=\"...\"] [join=#a,#b]";
+
+    let tokens = split_args(arg);
+    let mut tokens = tokens.into_iter();
+    let name = tokens.next().filter(|n| !n.contains('=')).ok_or(USAGE)?;
+
+    let (mut host, mut nick) = (None, None);
+    let (mut port, mut tls) = (6697u16, true);
+    let (mut user, mut realname, mut sasl_account, mut password_command) = (None, None, None, None);
+    let mut sasl_mech = SaslMech::Plain;
+    let mut auto_join = Vec::new();
+
+    for token in tokens {
+        let (key, value) = token
+            .split_once('=')
+            .ok_or_else(|| format!("expected key=value, got '{token}'"))?;
+        match key {
+            "host" => host = Some(value.to_string()),
+            "nick" => nick = Some(value.to_string()),
+            "port" => port = value.parse().map_err(|_| format!("bad port '{value}'"))?,
+            "tls" => tls = parse_bool(value).ok_or_else(|| format!("bad tls '{value}'"))?,
+            "user" => user = Some(value.to_string()),
+            "realname" => realname = Some(value.to_string()),
+            "sasl_account" => sasl_account = Some(value.to_string()),
+            "sasl_mech" => {
+                sasl_mech = match value.to_ascii_lowercase().as_str() {
+                    "plain" => SaslMech::Plain,
+                    "scram" => SaslMech::Scram,
+                    other => return Err(format!("bad sasl_mech '{other}' (plain|scram)")),
+                }
+            }
+            "password_command" => password_command = Some(value.to_string()),
+            "join" => auto_join = value.split(',').map(str::to_string).collect(),
+            "password" | "pass" => {
+                return Err(
+                    "passwords are never stored; use password_command or NORN_PASSWORD".into(),
+                )
+            }
+            other => return Err(format!("unknown key '{other}'")),
+        }
+    }
+
+    Ok(crate::config::NetworkConfig {
+        name,
+        host: host.ok_or("host= is required")?,
+        port,
+        tls,
+        nick: nick.ok_or("nick= is required")?,
+        user,
+        realname,
+        sasl_account,
+        sasl_mech,
+        password_command,
+        auto_join,
+    })
 }
 
 fn complete(app: &mut App) {
@@ -325,9 +563,9 @@ fn move_right(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientConfig;
     use crate::session::ConnState;
-    use crate::tui::state::{App, NetworkMeta};
-    use ratatui::style::Color;
+    use crate::tui::state::{App, BufferKind, NetworkMeta};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -339,7 +577,7 @@ mod tests {
             my_nick: "me".into(),
             state: ConnState::Connecting,
         }];
-        let mut app = App::new(nets, true, Color::Reset);
+        let mut app = App::new(nets, ClientConfig::default(), Vec::new(), None);
         app.apply(crate::session::UiEvent {
             net: 0,
             kind: crate::session::UiEventKind::Engine(irc_engine::Event::NamesLoaded {
@@ -469,13 +707,86 @@ mod tests {
 
     #[test]
     fn clicking_sidebar_switches_buffer() {
-        // Sidebar rows: 0=network header (server buffer), 1=#rust.
+        // Sidebar rows: 0=console, 1=network header (server buffer), 2=#rust.
         let mut app = app_with_channel();
         let click = MouseEventKind::Down(MouseButton::Left);
         handle_mouse(&mut app, mouse(click, 5, 0), 100, 24);
-        assert_eq!(app.active_buffer().kind, BufferKind::Server);
+        assert_eq!(app.active_buffer().kind, BufferKind::Status);
         handle_mouse(&mut app, mouse(click, 5, 1), 100, 24);
+        assert_eq!(app.active_buffer().kind, BufferKind::Server);
+        handle_mouse(&mut app, mouse(click, 5, 2), 100, 24);
         assert_eq!(app.active_buffer().name, "#rust");
+    }
+
+    /// Type `text` into `app` and press Enter, returning the produced commands.
+    fn run_line(app: &mut App, text: &str) -> Vec<NetCommand> {
+        for c in text.chars() {
+            handle_key(app, key(KeyCode::Char(c)));
+        }
+        handle_key(app, key(KeyCode::Enter))
+    }
+
+    #[test]
+    fn set_theme_updates_accent_and_client() {
+        let mut app = app_with_channel();
+        assert_eq!(app.client.theme, "teal");
+        let out = run_line(&mut app, "/set theme amber");
+        assert!(out.is_empty(), "no server traffic for /set");
+        assert_eq!(app.client.theme, "amber");
+        assert_eq!(app.accent, crate::tui::theme::accent_for("amber"));
+    }
+
+    #[test]
+    fn set_timestamps_toggles_live_state() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/set timestamps off");
+        assert!(!app.timestamps);
+        assert!(!app.client.timestamps);
+        run_line(&mut app, "/set timestamps on");
+        assert!(app.timestamps);
+    }
+
+    #[test]
+    fn set_rejects_unknown_theme() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/set theme chartreuse");
+        assert_eq!(app.client.theme, "teal", "invalid theme is not applied");
+    }
+
+    #[test]
+    fn network_add_defines_and_lists() {
+        let mut app = app_with_channel();
+        run_line(
+            &mut app,
+            "/network add libera host=irc.libera.chat nick=svan sasl_account=svan sasl_mech=scram join=#rust,#ratatui",
+        );
+        assert_eq!(app.definitions.len(), 1);
+        let net = &app.definitions[0];
+        assert_eq!(net.name, "libera");
+        assert_eq!(net.host, "irc.libera.chat");
+        assert_eq!(net.sasl_mech, crate::config::SaslMech::Scram);
+        assert_eq!(net.auto_join, vec!["#rust", "#ratatui"]);
+        // remove drops it.
+        run_line(&mut app, "/network remove libera");
+        assert!(app.definitions.is_empty());
+    }
+
+    #[test]
+    fn network_add_rejects_inline_password_and_missing_host() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/network add x nick=n password=secret");
+        assert!(app.definitions.is_empty(), "inline password refused");
+        run_line(&mut app, "/network add y nick=n");
+        assert!(app.definitions.is_empty(), "host is required");
+    }
+
+    #[test]
+    fn split_args_honors_quotes() {
+        let parts = split_args(r#"a host=irc.x password_command="pass irc/x""#);
+        assert_eq!(
+            parts,
+            vec!["a", "host=irc.x", "password_command=pass irc/x"]
+        );
     }
 
     #[test]
