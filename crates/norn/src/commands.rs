@@ -22,6 +22,8 @@ pub enum ArgKind {
     Command,
     /// A user alias name (for `/unalias`).
     Alias,
+    /// An addon script (plugin) name.
+    Plugin,
     /// A repeatable `key=value` option; the key completes with a trailing `=`.
     OptionKey,
     /// Freeform text (message bodies, reasons, modes) - no completion.
@@ -200,20 +202,34 @@ add a #channel filter). Templates use $nick, $chan, $msg, $me, chain with ;, and
     },
 ];
 
-const ADDONS_SUBS: &[SubDoc] = &[
+const PLUGINS_SUBS: &[SubDoc] = &[
     SubDoc {
         name: "ls",
-        usage: "/addons ls",
-        desc: "List loaded addon scripts and any load errors.",
+        usage: "/plugins ls",
+        desc: "List addon scripts with their status and version.",
         params: &[],
-        examples: &["/addons ls"],
+        examples: &["/plugins ls"],
     },
     SubDoc {
         name: "reload",
-        usage: "/addons reload",
-        desc: "Recompile the addon scripts and rebuild the live addon host.",
+        usage: "/plugins reload",
+        desc: "Recompile the addon scripts and rebuild the live host.",
         params: &[],
-        examples: &["/addons reload"],
+        examples: &["/plugins reload"],
+    },
+    SubDoc {
+        name: "enable",
+        usage: "/plugins enable <name>",
+        desc: "Enable (load) a disabled script.",
+        params: &[req("name", ArgKind::Plugin, "the script to enable")],
+        examples: &["/plugins enable urlgrab"],
+    },
+    SubDoc {
+        name: "disable",
+        usage: "/plugins disable <name>",
+        desc: "Disable (unload) a script; it stays installed.",
+        params: &[req("name", ArgKind::Plugin, "the script to disable")],
+        examples: &["/plugins disable urlgrab"],
     },
 ];
 
@@ -562,18 +578,19 @@ applied live. See `/trigger add` for the event and template grammar.",
         examples: &["/trigger ls", "/trigger add highlight = notify $nick: $msg"],
     },
     CommandDoc {
-        name: "addons",
+        name: "plugins",
         category: "Client",
-        usage: "/addons ls|reload",
-        summary: "List or reload addon scripts",
-        description: "List loaded Rhai addon scripts (and any load errors), or \
-reload them after editing. Scripts live in the `addons` folder next to the config \
-file and define event hooks (on_message, on_join, ...) that call reply/send/\
-notify/nick.",
+        usage: "/plugins [ls|reload|enable|disable]",
+        summary: "Open or manage the plugins",
+        description: "Open the plugins manager (bare /plugins), or manage Rhai \
+addon scripts from the input line: list them with status/version, reload after \
+editing, or enable/disable one. Scripts live in the `addons` folder next to the \
+config file and define event hooks (on_message, on_join, ...) that call reply/\
+send/notify/nick.",
         aliases: &[],
         params: &[],
-        subcommands: ADDONS_SUBS,
-        examples: &["/addons ls", "/addons reload"],
+        subcommands: PLUGINS_SUBS,
+        examples: &["/plugins", "/plugins ls", "/plugins disable urlgrab"],
     },
     CommandDoc {
         name: "unalias",

@@ -217,6 +217,9 @@ pub struct Config {
     /// Declarative addon triggers (TOML `[[trigger]]`).
     #[serde(default, alias = "trigger", skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<TriggerConfig>,
+    /// Addon script filenames that are installed but disabled (not loaded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_plugins: Vec<String>,
 }
 
 /// Header prepended to a saved config (auto-save rewrites the file, so any
@@ -388,6 +391,8 @@ pub struct Startup {
     pub aliases: BTreeMap<String, String>,
     /// Declarative addon triggers.
     pub triggers: Vec<TriggerConfig>,
+    /// Disabled addon script filenames.
+    pub disabled_plugins: Vec<String>,
     /// The config file to auto-save to (`None` if no config dir is available).
     pub path: Option<PathBuf>,
 }
@@ -402,6 +407,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
     let mut aliases = BTreeMap::new();
     let mut definitions: Vec<NetworkConfig> = Vec::new();
     let mut triggers: Vec<TriggerConfig> = Vec::new();
+    let mut disabled_plugins: Vec<String> = Vec::new();
 
     if let Some(path) = &path {
         if path.exists() {
@@ -412,6 +418,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
             aliases = config.aliases;
             definitions = config.networks;
             triggers = config.triggers;
+            disabled_plugins = config.disabled_plugins;
         }
     }
 
@@ -436,6 +443,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
         client,
         aliases,
         triggers,
+        disabled_plugins,
         path,
     })
 }
@@ -476,6 +484,7 @@ mod tests {
                 run: "notify $nick: $msg".into(),
                 enabled: true,
             }],
+            disabled_plugins: vec!["weather.rhai".into()],
         };
         let text = toml::to_string_pretty(&config).unwrap();
         // Never leak a resolved password (there is no password field to leak),
@@ -493,6 +502,7 @@ mod tests {
         assert_eq!(back.triggers.len(), 1);
         assert_eq!(back.triggers[0].on, "highlight");
         assert_eq!(back.triggers[0].run, "notify $nick: $msg");
+        assert_eq!(back.disabled_plugins, vec!["weather.rhai"]);
     }
 
     #[test]

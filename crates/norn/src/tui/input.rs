@@ -107,6 +107,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
         handle_networks(app, key);
         return Vec::new();
     }
+    if app.mode == Mode::Plugins {
+        handle_plugins_screen(app, key);
+        return Vec::new();
+    }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -119,6 +123,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
         }
         KeyCode::F(2) => app.open_settings(),
         KeyCode::F(3) => app.open_networks(),
+        KeyCode::F(4) => app.open_plugins(),
         KeyCode::F(9) => app.nicklist_visible = !app.nicklist_visible,
         KeyCode::Left if alt => switch_relative(app, -1),
         KeyCode::Right if alt => switch_relative(app, 1),
@@ -598,7 +603,7 @@ const STRUCTURAL: &[&str] = &[
     "alias",
     "unalias",
     "trigger",
-    "addons",
+    "plugins",
 ];
 
 /// Max alias-expansion recursion depth (guards cyclic aliases).
@@ -698,8 +703,8 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
                 handle_trigger(app, arg);
                 return Vec::new();
             }
-            "addons" => {
-                handle_addons(app, arg);
+            "plugins" => {
+                handle_plugins(app, arg);
                 return Vec::new();
             }
             "help" | "h" => {
@@ -866,21 +871,53 @@ fn handle_trigger(app: &mut App, arg: &str) {
     }
 }
 
-/// `/addons` - list loaded addon scripts (and load errors), or reload them.
-fn handle_addons(app: &mut App, arg: &str) {
-    let sub = arg
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+/// Keys for the `/plugins` manager: arrows move the selection; Space/Enter
+/// loads/unloads the selected script; Esc closes.
+fn handle_plugins_screen(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Up => app.plugins_ui.sel = app.plugins_ui.sel.saturating_sub(1),
+        KeyCode::Down => {
+            app.plugins_ui.sel = (app.plugins_ui.sel + 1).min(app.plugins.len().saturating_sub(1));
+        }
+        KeyCode::Char(' ') | KeyCode::Enter => {
+            let idx = app.plugins_ui.sel;
+            app.toggle_plugin(idx);
+        }
+        _ => {}
+    }
+}
+
+/// `/plugins` - list addon scripts and their status, reload them, or
+/// enable/disable one. (Bare `/plugins` opens the manager screen.)
+fn handle_plugins(app: &mut App, arg: &str) {
+    use crate::addons::PluginStatus;
+    let mut it = arg.splitn(2, ' ');
+    let sub = it.next().unwrap_or("").to_ascii_lowercase();
+    let rest = it.next().unwrap_or("").trim();
     match sub.as_str() {
-        "" | "ls" | "list" => {
-            let mut lines = vec!["addons:".to_string()];
-            if app.addon_loaded.is_empty() && app.addon_errors.is_empty() {
+        "" => app.open_plugins(),
+        "ls" | "list" => {
+            let mut lines = vec!["plugins:".to_string()];
+            if app.plugins.is_empty() {
                 lines.push("  (no scripts; put *.rhai in the addons dir)".to_string());
             }
-            lines.extend(app.addon_loaded.iter().map(|l| format!("  {l}")));
-            lines.extend(app.addon_errors.iter().map(|e| format!("  error: {e}")));
+            for p in &app.plugins {
+                let status = match &p.status {
+                    PluginStatus::Loaded => "on".to_string(),
+                    PluginStatus::Disabled => "off".to_string(),
+                    PluginStatus::Failed(err) => format!("failed: {err}"),
+                };
+                let version = if p.version.is_empty() {
+                    String::new()
+                } else {
+                    format!(" v{}", p.version)
+                };
+                lines.push(format!(
+                    "  [{status}] {}{version}  {}",
+                    p.name, p.description
+                ));
+            }
             for line in lines {
                 app.push_console(line);
             }
@@ -888,9 +925,26 @@ fn handle_addons(app: &mut App, arg: &str) {
         }
         "reload" => {
             app.actions.push(AppAction::ReloadAddons);
-            app.push_active_event("reloading addons...".to_string());
+            app.push_active_event("reloading plugins...".to_string());
         }
-        other => app.push_active_event(format!("usage: /addons ls|reload (got '{other}')")),
+        "enable" | "disable" => {
+            let enable = sub == "enable";
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if name.is_empty() {
+                app.push_active_event(format!("usage: /plugins {sub} <name>"));
+                return;
+            }
+            match app.set_plugin_enabled(name, enable) {
+                Ok(file) => app.push_active_event(format!(
+                    "{} {file}",
+                    if enable { "enabled" } else { "disabled" }
+                )),
+                Err(err) => app.push_active_event(err),
+            }
+        }
+        other => app.push_active_event(format!(
+            "usage: /plugins ls|reload|enable|disable (got '{other}')"
+        )),
     }
 }
 
@@ -1379,6 +1433,7 @@ fn kind_candidates(app: &App, kind: crate::commands::ArgKind) -> Vec<String> {
             .map(|c| c.name.to_string())
             .collect(),
         ArgKind::Alias => app.aliases.keys().cloned().collect(),
+        ArgKind::Plugin => app.plugins.iter().map(|p| p.name.clone()).collect(),
         ArgKind::OptionKey => Vec::new(), // handled at the subcommand level
         ArgKind::Free => nick_names(app), // freeform: offer nicks for mentions
     }
@@ -2167,26 +2222,66 @@ mod tests {
         assert!(app.triggers.is_empty());
     }
 
+    fn plugin(
+        name: &str,
+        file: &str,
+        status: crate::addons::PluginStatus,
+    ) -> crate::addons::PluginInfo {
+        crate::addons::PluginInfo {
+            name: name.into(),
+            file: file.into(),
+            description: "does things".into(),
+            version: "1.0".into(),
+            status,
+        }
+    }
+
     #[test]
-    fn addons_reload_queues_reload_and_ls_lists() {
+    fn plugins_reload_and_enable_disable() {
+        use crate::addons::PluginStatus;
         let mut app = app_with_channel();
-        run_line(&mut app, "/addons reload");
+        run_line(&mut app, "/plugins reload");
         assert!(app.actions.contains(&AppAction::ReloadAddons));
-        // ls with nothing loaded shows a hint in the console.
-        app.addon_loaded = vec!["greet.rhai (on_message)".to_string()];
-        run_line(&mut app, "/addons ls");
-        assert_eq!(app.active_buffer().kind, BufferKind::Status);
-        let text: String = app
-            .active_buffer()
-            .lines
-            .iter()
-            .filter_map(|l| match l {
-                crate::tui::state::Line::Event { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("greet.rhai"));
+        app.actions.clear();
+        // A loaded plugin can be disabled by name; a reload is queued and saved.
+        app.plugins = vec![plugin("urlgrab", "urlgrab.rhai", PluginStatus::Loaded)];
+        run_line(&mut app, "/plugins disable urlgrab");
+        assert!(app.disabled_plugins.iter().any(|f| f == "urlgrab.rhai"));
+        assert!(app.actions.contains(&AppAction::ReloadAddons));
+        // And re-enabled.
+        run_line(&mut app, "/plugins enable urlgrab");
+        assert!(app.disabled_plugins.is_empty());
+        // An unknown plugin is rejected.
+        run_line(&mut app, "/plugins disable nope");
+        assert!(app.disabled_plugins.is_empty());
+    }
+
+    #[test]
+    fn plugins_screen_space_toggles_selected() {
+        use crate::addons::PluginStatus;
+        use crate::tui::state::Mode;
+        let mut app = app_with_channel();
+        app.plugins = vec![
+            plugin("nickcolor", "nickcolor.rhai", PluginStatus::Loaded),
+            plugin("urlgrab", "urlgrab.rhai", PluginStatus::Loaded),
+        ];
+        run_line(&mut app, "/plugins"); // bare opens the screen
+        assert_eq!(app.mode, Mode::Plugins);
+        // Move to the second plugin and unload it with Space.
+        handle_key(&mut app, key(KeyCode::Down));
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(app.disabled_plugins.iter().any(|f| f == "urlgrab.rhai"));
+        assert!(app.actions.contains(&AppAction::ReloadAddons));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn f4_opens_plugins() {
+        use crate::tui::state::Mode;
+        let mut app = app_with_channel();
+        handle_key(&mut app, key(KeyCode::F(4)));
+        assert_eq!(app.mode, Mode::Plugins);
     }
 
     #[test]

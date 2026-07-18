@@ -15,10 +15,10 @@ use rhai::{Dynamic, Engine, ImmutableString, Map, Scope, AST};
 
 use crate::session::NetworkId;
 
-use super::{event_reply_target, AddonCtx, AddonEvent, AddonEventKind, AddonHost, Reaction};
-
-/// The event hooks a script may define.
-const HOOKS: &[&str] = &["on_message", "on_join", "on_part", "on_quit", "on_nick"];
+use super::{
+    event_reply_target, AddonCtx, AddonEvent, AddonEventKind, AddonHost, PluginInfo, PluginStatus,
+    Reaction,
+};
 
 /// Per-invocation state the host API reads/writes while a hook runs. Shared with
 /// the registered API closures via `Rc<RefCell<...>>` (single-threaded UI task).
@@ -42,16 +42,15 @@ pub struct RhaiHost {
     engine: Engine,
     scripts: Vec<Script>,
     state: Rc<RefCell<HostState>>,
-    loaded: Vec<String>,
-    errors: Vec<String>,
+    plugins: Vec<PluginInfo>,
 }
 
 impl RhaiHost {
-    /// Load and compile every `*.rhai` file under `dir` (sorted for determinism).
-    /// Missing dir is fine; read/compile errors are collected, not fatal.
-    pub fn load(dir: &Path) -> RhaiHost {
-        let mut entries: Vec<(String, String)> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
+    /// Load every `*.rhai` file under `dir` (sorted). Each is compiled to detect
+    /// failures and read metadata; only enabled (not `disabled`) ones that
+    /// compile get their hooks registered. Missing dir is fine.
+    pub fn load(dir: &Path, disabled: &HashSet<String>) -> RhaiHost {
+        let mut entries: Vec<(String, Result<String, String>)> = Vec::new();
         if dir.is_dir() {
             let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
                 Ok(rd) => rd
@@ -59,79 +58,142 @@ impl RhaiHost {
                     .filter(|p| p.extension().is_some_and(|x| x == "rhai"))
                     .collect(),
                 Err(e) => {
-                    errors.push(format!("addons dir: {e}"));
+                    entries.push(("addons".to_string(), Err(e.to_string())));
                     Vec::new()
                 }
             };
             files.sort();
             for path in files {
-                let label = path
+                let file = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("?")
                     .to_string();
-                match std::fs::read_to_string(&path) {
-                    Ok(src) => entries.push((label, src)),
-                    Err(e) => errors.push(format!("{label}: {e}")),
-                }
+                entries.push((
+                    file,
+                    std::fs::read_to_string(&path).map_err(|e| e.to_string()),
+                ));
             }
         }
-        RhaiHost::build(entries, errors)
+        RhaiHost::build(entries, disabled)
     }
 
-    /// Build from in-memory `(label, source)` scripts (for tests).
+    /// Build from in-memory `(file, source)` scripts (for tests).
     #[cfg(test)]
-    pub fn from_sources(sources: &[(&str, &str)]) -> RhaiHost {
+    pub fn from_sources(sources: &[(&str, &str)], disabled: &[&str]) -> RhaiHost {
         let entries = sources
             .iter()
-            .map(|(l, s)| (l.to_string(), s.to_string()))
+            .map(|(f, s)| (f.to_string(), Ok(s.to_string())))
             .collect();
-        RhaiHost::build(entries, Vec::new())
+        let disabled: HashSet<String> = disabled.iter().map(|s| s.to_string()).collect();
+        RhaiHost::build(entries, &disabled)
     }
 
-    fn build(entries: Vec<(String, String)>, mut errors: Vec<String>) -> RhaiHost {
+    fn build(
+        entries: Vec<(String, Result<String, String>)>,
+        disabled: &HashSet<String>,
+    ) -> RhaiHost {
         let state = Rc::new(RefCell::new(HostState::default()));
         let engine = build_engine(state.clone());
         let mut scripts = Vec::new();
-        let mut loaded = Vec::new();
-        for (label, src) in entries {
+        let mut plugins = Vec::new();
+        for (file, source) in entries {
+            let src = match source {
+                Ok(src) => src,
+                Err(err) => {
+                    plugins.push(failed_plugin(&file, err));
+                    continue;
+                }
+            };
             match engine.compile(&src) {
                 Ok(ast) => {
-                    let hooks: HashSet<String> =
-                        ast.iter_functions().map(|f| f.name.to_string()).collect();
-                    let active: Vec<&str> = HOOKS
-                        .iter()
-                        .copied()
-                        .filter(|h| hooks.contains(*h))
-                        .collect();
-                    loaded.push(if active.is_empty() {
-                        format!("{label} (no hooks)")
-                    } else {
-                        format!("{label} ({})", active.join(", "))
+                    let (name, description, version) = read_metadata(&ast, &file);
+                    let off = disabled.contains(&file);
+                    if !off {
+                        let hooks: HashSet<String> =
+                            ast.iter_functions().map(|f| f.name.to_string()).collect();
+                        scripts.push(Script {
+                            label: file.clone(),
+                            ast,
+                            hooks,
+                        });
+                    }
+                    plugins.push(PluginInfo {
+                        name,
+                        file,
+                        description,
+                        version,
+                        status: if off {
+                            PluginStatus::Disabled
+                        } else {
+                            PluginStatus::Loaded
+                        },
                     });
-                    scripts.push(Script { label, ast, hooks });
                 }
-                Err(err) => errors.push(format!("{label}: {err}")),
+                Err(err) => plugins.push(failed_plugin(&file, err.to_string())),
             }
         }
+        // Order for display: loaded, then disabled, then failed; name within.
+        let group = |p: &PluginInfo| match p.status {
+            PluginStatus::Loaded => 0u8,
+            PluginStatus::Disabled => 1,
+            PluginStatus::Failed(_) => 2,
+        };
+        plugins.sort_by(|a, b| {
+            group(a)
+                .cmp(&group(b))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
         RhaiHost {
             engine,
             scripts,
             state,
-            loaded,
-            errors,
+            plugins,
         }
     }
 
-    /// Summary lines for successfully loaded scripts (`label (hooks)`).
-    pub fn loaded(&self) -> &[String] {
-        &self.loaded
+    /// The discovered plugins with their status and metadata.
+    pub fn plugins(&self) -> &[PluginInfo] {
+        &self.plugins
     }
+}
 
-    /// Compile/load error lines.
-    pub fn errors(&self) -> &[String] {
-        &self.errors
+/// A `PluginInfo` for a script that failed to load.
+fn failed_plugin(file: &str, err: String) -> PluginInfo {
+    PluginInfo {
+        name: stem(file),
+        file: file.to_string(),
+        description: String::new(),
+        version: String::new(),
+        status: PluginStatus::Failed(err),
     }
+}
+
+/// The filename without the `.rhai` extension.
+fn stem(file: &str) -> String {
+    file.strip_suffix(".rhai").unwrap_or(file).to_string()
+}
+
+/// Read `NAME`/`DESCRIPTION`/`VERSION` from a script's top-level consts (without
+/// running it). `name` falls back to the filename stem.
+fn read_metadata(ast: &AST, file: &str) -> (String, String, String) {
+    let (mut name, mut description, mut version) = (String::new(), String::new(), String::new());
+    for (key, _is_const, value) in ast.iter_literal_variables(true, false) {
+        let text = value
+            .clone()
+            .into_string()
+            .unwrap_or_else(|_| value.to_string());
+        match key {
+            "NAME" => name = text,
+            "DESCRIPTION" => description = text,
+            "VERSION" => version = text,
+            _ => {}
+        }
+    }
+    if name.is_empty() {
+        name = stem(file);
+    }
+    (name, description, version)
 }
 
 impl AddonHost for RhaiHost {
@@ -339,12 +401,15 @@ mod tests {
 
     #[test]
     fn on_message_hook_replies() {
-        let mut h = RhaiHost::from_sources(&[(
-            "greet.rhai",
-            r#"fn on_message(m) { reply("hi " + m.nick); }"#,
-        )]);
-        assert!(h.errors().is_empty());
-        assert_eq!(h.loaded().len(), 1);
+        let mut h = RhaiHost::from_sources(
+            &[(
+                "greet.rhai",
+                r#"fn on_message(m) { reply("hi " + m.nick); }"#,
+            )],
+            &[],
+        );
+        assert_eq!(h.plugins().len(), 1);
+        assert!(matches!(h.plugins()[0].status, PluginStatus::Loaded));
         let out = h.on_event(&message("#c", "bob", "hey"), &ctx("me"));
         assert!(matches!(&out[0], Reaction::Send { net: 3, lines }
             if lines == &["PRIVMSG #c :hi bob"]));
@@ -352,10 +417,13 @@ mod tests {
 
     #[test]
     fn nick_and_conditional_reply() {
-        let mut h = RhaiHost::from_sources(&[(
-            "t.rhai",
-            r#"fn on_message(m) { if m.text.contains(nick()) { reply("you rang?"); } }"#,
-        )]);
+        let mut h = RhaiHost::from_sources(
+            &[(
+                "t.rhai",
+                r#"fn on_message(m) { if m.text.contains(nick()) { reply("you rang?"); } }"#,
+            )],
+            &[],
+        );
         // Mentions "me" -> replies.
         let out = h.on_event(&message("#c", "bob", "hey me"), &ctx("me"));
         assert_eq!(out.len(), 1);
@@ -366,7 +434,38 @@ mod tests {
 
     #[test]
     fn missing_hook_is_skipped() {
-        let mut h = RhaiHost::from_sources(&[("t.rhai", r#"fn on_join(m) { notify("j"); }"#)]);
+        let mut h = RhaiHost::from_sources(&[("t.rhai", r#"fn on_join(m) { notify("j"); }"#)], &[]);
+        assert!(h
+            .on_event(&message("#c", "bob", "hi"), &ctx("me"))
+            .is_empty());
+    }
+
+    #[test]
+    fn reads_metadata_from_consts() {
+        let h = RhaiHost::from_sources(
+            &[(
+                "nc.rhai",
+                r#"const NAME = "nickcolor";
+                   const DESCRIPTION = "deterministic nick colors";
+                   const VERSION = "1.4";
+                   fn on_message(m) {}"#,
+            )],
+            &[],
+        );
+        let p = &h.plugins()[0];
+        assert_eq!(p.name, "nickcolor");
+        assert_eq!(p.description, "deterministic nick colors");
+        assert_eq!(p.version, "1.4");
+        assert!(matches!(p.status, PluginStatus::Loaded));
+    }
+
+    #[test]
+    fn disabled_script_is_listed_but_not_run() {
+        let mut h = RhaiHost::from_sources(
+            &[("greet.rhai", r#"fn on_message(m) { reply("hi"); }"#)],
+            &["greet.rhai"],
+        );
+        assert!(matches!(h.plugins()[0].status, PluginStatus::Disabled));
         assert!(h
             .on_event(&message("#c", "bob", "hi"), &ctx("me"))
             .is_empty());
@@ -374,15 +473,18 @@ mod tests {
 
     #[test]
     fn compile_error_is_captured_not_panic() {
-        let h = RhaiHost::from_sources(&[("bad.rhai", "fn on_message(m) { this is )( invalid")]);
-        assert!(h.loaded().is_empty());
-        assert_eq!(h.errors().len(), 1);
-        assert!(h.errors()[0].starts_with("bad.rhai:"));
+        let h = RhaiHost::from_sources(
+            &[("bad.rhai", "fn on_message(m) { this is )( invalid")],
+            &[],
+        );
+        assert_eq!(h.plugins().len(), 1);
+        assert!(matches!(h.plugins()[0].status, PluginStatus::Failed(_)));
     }
 
     #[test]
     fn runtime_error_becomes_a_notify() {
-        let mut h = RhaiHost::from_sources(&[("t.rhai", "fn on_message(m) { no_such_fn(); }")]);
+        let mut h =
+            RhaiHost::from_sources(&[("t.rhai", "fn on_message(m) { no_such_fn(); }")], &[]);
         let out = h.on_event(&message("#c", "bob", "hi"), &ctx("me"));
         assert!(matches!(&out[0], Reaction::Notify { text, .. }
             if text.contains("addon t.rhai")));
@@ -392,7 +494,7 @@ mod tests {
     fn infinite_loop_is_bounded_by_the_op_limit() {
         // Without the operation cap this would hang; with it the hook aborts and
         // the error surfaces as a notification.
-        let mut h = RhaiHost::from_sources(&[("t.rhai", "fn on_message(m) { loop { } }")]);
+        let mut h = RhaiHost::from_sources(&[("t.rhai", "fn on_message(m) { loop { } }")], &[]);
         let out = h.on_event(&message("#c", "bob", "hi"), &ctx("me"));
         assert!(matches!(&out[0], Reaction::Notify { .. }));
     }

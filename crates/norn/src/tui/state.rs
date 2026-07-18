@@ -8,6 +8,7 @@ use irc_engine::{Event, LeaveReason, Member, MessageKind, TopicChange, WhoisInfo
 use irc_proto::Source;
 use ratatui::style::Color;
 
+use crate::addons::PluginInfo;
 use crate::config::{ClientConfig, Config, NetworkConfig, SaslMech, TriggerConfig};
 use crate::session::{ConnState, NetCommand, NetworkId, UiEvent, UiEventKind};
 use crate::tui::theme;
@@ -217,6 +218,8 @@ pub enum Mode {
     Settings,
     /// The `/networks` manager is open.
     Networks,
+    /// The `/plugins` manager is open.
+    Plugins,
 }
 
 /// Which pane of the `/help` panel has focus.
@@ -241,6 +244,13 @@ pub struct HelpState {
     pub focus: HelpFocus,
     /// First visible line of the detail pane.
     pub detail_scroll: usize,
+}
+
+/// State of the `/plugins` manager: which plugin row is selected.
+#[derive(Debug, Clone, Default)]
+pub struct PluginsState {
+    /// Index of the highlighted plugin (into `App.plugins`).
+    pub sel: usize,
 }
 
 /// State of the `/settings` panel: a live filter, the selected row, an optional
@@ -422,6 +432,8 @@ pub struct App {
     pub settings: SettingsState,
     /// Networks-manager state.
     pub networks_ui: NetworksState,
+    /// Plugins-manager state.
+    pub plugins_ui: PluginsState,
     /// Tab-completion state.
     pub completion: Option<Completion>,
     /// Whether the nicklist is shown.
@@ -439,10 +451,10 @@ pub struct App {
     /// Declarative addon triggers (persisted; the live host is rebuilt from these
     /// when they change).
     pub triggers: Vec<TriggerConfig>,
-    /// Loaded addon-script summaries for `/addons` (runtime only).
-    pub addon_loaded: Vec<String>,
-    /// Addon-script load/compile errors for `/addons` (runtime only).
-    pub addon_errors: Vec<String>,
+    /// Disabled addon-script filenames (persisted).
+    pub disabled_plugins: Vec<String>,
+    /// Discovered addon scripts with status/metadata for `/plugins` (runtime).
+    pub plugins: Vec<PluginInfo>,
     /// Where to auto-save config (`None` if no config dir is available).
     pub config_path: Option<PathBuf>,
     /// Pending control-plane actions for the supervisor to execute.
@@ -498,6 +510,7 @@ impl App {
             help: HelpState::default(),
             settings: SettingsState::default(),
             networks_ui: NetworksState::default(),
+            plugins_ui: PluginsState::default(),
             completion: None,
             nicklist_visible: client.nicklist,
             timestamps: client.timestamps,
@@ -506,8 +519,8 @@ impl App {
             definitions,
             aliases,
             triggers: Vec::new(),
-            addon_loaded: Vec::new(),
-            addon_errors: Vec::new(),
+            disabled_plugins: Vec::new(),
+            plugins: Vec::new(),
             config_path,
             actions: Vec::new(),
             history: Vec::new(),
@@ -1089,10 +1102,68 @@ impl App {
             aliases: self.aliases.clone(),
             networks: self.definitions.clone(),
             triggers: self.triggers.clone(),
+            disabled_plugins: self.disabled_plugins.clone(),
         };
         if let Err(err) = config.save(&path) {
             self.push_active_event(format!("save failed: {err}"));
         }
+    }
+
+    /// Open the `/plugins` manager, clamping the selection into range.
+    pub fn open_plugins(&mut self) {
+        self.mode = Mode::Plugins;
+        self.plugins_ui.sel = self
+            .plugins_ui
+            .sel
+            .min(self.plugins.len().saturating_sub(1));
+        self.dirty = true;
+    }
+
+    /// Toggle the enabled state of the plugin at `idx` (saves + reloads).
+    pub fn toggle_plugin(&mut self, idx: usize) {
+        let Some(plugin) = self.plugins.get(idx) else {
+            return;
+        };
+        let (file, enabled) = (plugin.file.clone(), self.plugin_enabled(&plugin.file));
+        self.set_plugin_file_enabled(&file, !enabled);
+    }
+
+    /// Whether a plugin (by filename) is currently enabled.
+    pub fn plugin_enabled(&self, file: &str) -> bool {
+        !self
+            .disabled_plugins
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(file))
+    }
+
+    /// Enable or disable a plugin by name (its display name or filename), saving
+    /// and queuing a live reload. Returns the resolved filename, or an error if
+    /// no such plugin.
+    pub fn set_plugin_enabled(&mut self, name: &str, enabled: bool) -> Result<String, String> {
+        let file = self
+            .plugins
+            .iter()
+            .find(|p| {
+                p.name.eq_ignore_ascii_case(name)
+                    || p.file.eq_ignore_ascii_case(name)
+                    || p.file.eq_ignore_ascii_case(&format!("{name}.rhai"))
+            })
+            .map(|p| p.file.clone())
+            .ok_or_else(|| format!("no plugin '{name}'"))?;
+        self.set_plugin_file_enabled(&file, enabled);
+        Ok(file)
+    }
+
+    /// Enable/disable a plugin by exact filename, then save and reload.
+    pub fn set_plugin_file_enabled(&mut self, file: &str, enabled: bool) {
+        if enabled {
+            self.disabled_plugins
+                .retain(|f| !f.eq_ignore_ascii_case(file));
+        } else if self.plugin_enabled(file) {
+            self.disabled_plugins.push(file.to_string());
+        }
+        self.save_config();
+        self.actions.push(AppAction::ReloadAddons);
     }
 
     /// Connect a network by name: revive an existing idle one, or spawn a new

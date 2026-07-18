@@ -9,6 +9,7 @@ pub mod state;
 pub mod theme;
 pub mod view;
 
+use std::collections::HashSet;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +26,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use crate::addons::{build_addon_host, AddonCtx, AddonEvent, AddonHost, Reaction};
+use crate::addons::{
+    build_addon_host, AddonCtx, AddonEvent, AddonHost, PluginInfo, PluginStatus, Reaction,
+};
 use crate::config::{ClientConfig, NetworkConfig, TriggerConfig};
 use crate::session::{NetCommand, UiEvent, UiEventKind};
 use state::{App, AppAction, NetworkMeta};
@@ -90,6 +93,7 @@ pub async fn run(
     client: ClientConfig,
     aliases: std::collections::BTreeMap<String, String>,
     triggers: Vec<TriggerConfig>,
+    disabled_plugins: Vec<String>,
     config_path: Option<PathBuf>,
     quit: Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -106,14 +110,12 @@ pub async fn run(
         .and_then(Path::parent)
         .map(|d| d.join("addons"));
     // The addon host reacts to engine events: declarative triggers plus scripts.
-    let report = build_addon_host(&triggers, addons_dir.as_deref());
-    let mut host = report.host;
     app.triggers = triggers;
-    for err in &report.errors {
-        app.push_console(format!("addon error: {err}"));
-    }
-    app.addon_loaded = report.loaded;
-    app.addon_errors = report.errors;
+    app.disabled_plugins = disabled_plugins;
+    let disabled: HashSet<String> = app.disabled_plugins.iter().cloned().collect();
+    let report = build_addon_host(&app.triggers, addons_dir.as_deref(), &disabled);
+    let mut host = report.host;
+    report_addon_load(&mut app, report.plugins);
     let mut term_events = EventStream::new();
 
     loop {
@@ -203,6 +205,17 @@ fn process_ui_event(
     app.apply(event);
 }
 
+/// Store the discovered plugins on the app and report any load failures to the
+/// console.
+fn report_addon_load(app: &mut App, plugins: Vec<PluginInfo>) {
+    for plugin in &plugins {
+        if let PluginStatus::Failed(err) = &plugin.status {
+            app.push_console(format!("addon error: {}: {err}", plugin.file));
+        }
+    }
+    app.plugins = plugins;
+}
+
 /// Ask the addon host for reactions to an engine event (nothing for non-engine
 /// events or unknown networks).
 fn addon_reactions(app: &App, host: &mut dyn AddonHost, event: &UiEvent) -> Vec<Reaction> {
@@ -236,13 +249,10 @@ fn drain_actions(
     for action in std::mem::take(&mut app.actions) {
         match action {
             AppAction::ReloadAddons => {
-                let report = build_addon_host(&app.triggers, addons_dir);
+                let disabled: HashSet<String> = app.disabled_plugins.iter().cloned().collect();
+                let report = build_addon_host(&app.triggers, addons_dir, &disabled);
                 *host = report.host;
-                for err in &report.errors {
-                    app.push_console(format!("addon error: {err}"));
-                }
-                app.addon_loaded = report.loaded;
-                app.addon_errors = report.errors;
+                report_addon_load(app, report.plugins);
             }
             AppAction::AddNetwork { id, config } => match config.resolve() {
                 Ok(settings) => {

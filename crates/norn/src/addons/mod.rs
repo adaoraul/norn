@@ -8,6 +8,7 @@
 mod script;
 mod triggers;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use irc_engine::{Event, LeaveReason, MessageKind};
@@ -197,34 +198,61 @@ impl AddonHost for CompositeHost {
     }
 }
 
-/// The result of assembling the addon host: the host plus a human-readable load
-/// summary (loaded scripts and any errors) for `/addons` and the console.
+/// The load status of an addon script (a "plugin").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginStatus {
+    /// Enabled, compiled, and active.
+    Loaded,
+    /// Installed but turned off (not loaded).
+    Disabled,
+    /// Failed to compile, with the error.
+    Failed(String),
+}
+
+/// A discovered addon script and its metadata, for `/plugins`.
+#[derive(Debug, Clone)]
+pub struct PluginInfo {
+    /// Display name (`NAME` const, else the filename stem).
+    pub name: String,
+    /// The filename (the key in the disabled list).
+    pub file: String,
+    /// One-line description (`DESCRIPTION` const), or empty.
+    pub description: String,
+    /// Version string (`VERSION` const), or empty.
+    pub version: String,
+    /// Load status.
+    pub status: PluginStatus,
+}
+
+/// The result of assembling the addon host: the host plus the discovered plugin
+/// list (with status/metadata) for `/plugins` and startup error reporting.
 pub struct AddonReport {
     /// The composite host to drive.
     pub host: Box<dyn AddonHost>,
-    /// One line per successfully loaded script (label + hooks).
-    pub loaded: Vec<String>,
-    /// One line per load/compile error.
-    pub errors: Vec<String>,
+    /// Every discovered addon script.
+    pub plugins: Vec<PluginInfo>,
 }
 
-/// Assemble the addon host: declarative triggers plus any Rhai scripts under
-/// `addons_dir`. Used at startup and rebuilt on reload.
-pub fn build_addon_host(triggers: &[TriggerConfig], addons_dir: Option<&Path>) -> AddonReport {
+/// Assemble the addon host: declarative triggers plus the Rhai scripts under
+/// `addons_dir` (skipping `disabled` filenames). Used at startup and on reload.
+pub fn build_addon_host(
+    triggers: &[TriggerConfig],
+    addons_dir: Option<&Path>,
+    disabled: &HashSet<String>,
+) -> AddonReport {
     let mut hosts: Vec<Box<dyn AddonHost>> = vec![Box::new(Triggers::from_configs(triggers))];
-    let (loaded, errors) = match addons_dir {
+    let plugins = match addons_dir {
         Some(dir) => {
-            let host = RhaiHost::load(dir);
-            let report = (host.loaded().to_vec(), host.errors().to_vec());
+            let host = RhaiHost::load(dir, disabled);
+            let plugins = host.plugins().to_vec();
             hosts.push(Box::new(host));
-            report
+            plugins
         }
-        None => (Vec::new(), Vec::new()),
+        None => Vec::new(),
     };
     AddonReport {
         host: Box::new(CompositeHost(hosts)),
-        loaded,
-        errors,
+        plugins,
     }
 }
 

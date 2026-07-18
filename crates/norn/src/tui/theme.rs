@@ -49,6 +49,8 @@ pub fn accent_for(name: &str) -> Color {
 pub const THEME_NAMES: &[&str] = &["teal", "amber", "green", "blue", "purple", "pink"];
 /// Op (`@`) color, also the >2 unread badge and highlight text.
 pub const GOLD: Color = Color::Rgb(0xe0, 0xc0, 0x60);
+/// Error / failure color (muted red).
+pub const RED: Color = Color::Rgb(0xd0, 0x6b, 0x6b);
 /// Highlight background for own-nick mentions.
 pub const HL_BG: Color = Color::Rgb(0x3a, 0x33, 0x20);
 

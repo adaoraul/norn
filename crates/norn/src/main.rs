@@ -35,6 +35,7 @@ async fn main() -> std::io::Result<()> {
         client,
         aliases,
         triggers,
+        disabled_plugins,
         path,
     } = match config::resolve_startup(&cli) {
         Ok(startup) => startup,
@@ -79,6 +80,7 @@ async fn main() -> std::io::Result<()> {
             client,
             aliases,
             triggers,
+            disabled_plugins,
             path,
             quit,
         )

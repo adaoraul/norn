@@ -12,6 +12,7 @@ use super::state::{
     SettingsRow, NETWORK_FIELDS,
 };
 use super::theme;
+use crate::addons::PluginStatus;
 use crate::session::ConnState;
 
 const NICK_COL: usize = 9;
@@ -79,6 +80,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_settings(f, area, app);
     } else if app.mode == Mode::Networks {
         draw_networks(f, area, app);
+    } else if app.mode == Mode::Plugins {
+        draw_plugins(f, area, app);
     } else if let Some(completion) = &app.completion {
         draw_completion(f, center[4], completion);
     }
@@ -1094,6 +1097,164 @@ fn draw_networks_form(f: &mut Frame, area: Rect, app: &App, focused: bool) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// The `/plugins` manager: a floating list of addon scripts grouped LOADED /
+/// AVAILABLE, with a status dot, name, description, and version. `Space`
+/// loads/unloads the selected one.
+fn draw_plugins(f: &mut Frame, area: Rect, app: &App) {
+    let w = 96.min(area.width.saturating_sub(2));
+    let h = 30.min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::BORDER_BRIGHT))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 4 || inner.width < 24 {
+        return;
+    }
+
+    let width = inner.width as usize;
+    // Header: title + hint on the left, install count on the right.
+    let left = "plugins";
+    let hint = "  Space load/unload · Esc closes";
+    let right = format!("{} installed", app.plugins.len());
+    let pad = width.saturating_sub(left.width() + hint.width() + right.width());
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(left, Style::default().fg(theme::BRIGHT)),
+            Span::styled(hint, Style::default().fg(theme::DIM2)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(right, Style::default().fg(theme::DIM2)),
+        ])),
+        Rect { height: 1, ..inner },
+    );
+    draw_rule(
+        f,
+        Rect {
+            y: inner.y + 1,
+            height: 1,
+            ..inner
+        },
+    );
+    let body = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    draw_plugins_body(f, body, app);
+}
+
+/// The `/plugins` row list: LOADED then AVAILABLE sections, selection centered.
+fn draw_plugins_body(f: &mut Frame, area: Rect, app: &App) {
+    let width = area.width as usize;
+    let list_h = area.height as usize;
+    if app.plugins.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " no plugins installed (put *.rhai in the addons folder)",
+                Style::default().fg(theme::DIM2),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let sel = app.plugins_ui.sel.min(app.plugins.len() - 1);
+    let mut body: Vec<Line> = Vec::new();
+    let mut sel_line = 0usize;
+    let (mut shown_loaded, mut shown_available) = (false, false);
+    for (i, plugin) in app.plugins.iter().enumerate() {
+        let loaded = matches!(plugin.status, PluginStatus::Loaded);
+        if loaded && !shown_loaded {
+            body.push(section_header("LOADED"));
+            shown_loaded = true;
+        } else if !loaded && !shown_available {
+            body.push(section_header("AVAILABLE"));
+            shown_available = true;
+        }
+        if i == sel {
+            sel_line = body.len();
+        }
+        body.push(plugin_row_line(app, plugin, i == sel, width));
+    }
+    let scroll = if body.len() <= list_h {
+        0
+    } else {
+        sel_line.saturating_sub(list_h / 2).min(body.len() - list_h)
+    };
+    let shown: Vec<Line> = body.into_iter().skip(scroll).take(list_h).collect();
+    f.render_widget(Paragraph::new(shown), area);
+}
+
+/// A GOLD uppercase section header line.
+fn section_header(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" {text}"),
+        Style::default().fg(theme::GOLD),
+    ))
+}
+
+/// One plugin row: `▎ ● name  description … vX.Y`, colored by status.
+fn plugin_row_line(
+    app: &App,
+    plugin: &crate::addons::PluginInfo,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let bg = if selected {
+        theme::ACTIVE_BG
+    } else {
+        theme::PANEL
+    };
+    let bar = if selected { "▎" } else { " " };
+    let (dot, dot_fg) = match &plugin.status {
+        PluginStatus::Loaded => ("●", app.accent),
+        PluginStatus::Disabled => ("○", theme::DIM2),
+        PluginStatus::Failed(_) => ("×", theme::RED),
+    };
+    let name_fg = if selected {
+        theme::BRIGHT
+    } else {
+        theme::BRIGHT2
+    };
+    let (desc, desc_fg) = match &plugin.status {
+        PluginStatus::Failed(err) => (format!("failed to load: {err}"), theme::RED),
+        _ => (plugin.description.clone(), theme::DIM),
+    };
+    let version = if plugin.version.is_empty() {
+        String::new()
+    } else {
+        format!("v{}", plugin.version)
+    };
+
+    // Fixed left: bar(1) + sp(1) + dot(1) + sp(1) + name(14) + gap(2) = 20.
+    let name = truncate(&plugin.name, 14);
+    let name_pad = " ".repeat(14usize.saturating_sub(name.width()));
+    let left_w = 4 + 14 + 2;
+    let desc_room = width.saturating_sub(left_w + version.width() + 1);
+    let desc = truncate(&desc, desc_room);
+    let gap = width.saturating_sub(left_w + desc.width() + version.width() + 1);
+    Line::from(vec![
+        Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
+        Span::styled(format!(" {dot} "), Style::default().fg(dot_fg).bg(bg)),
+        Span::styled(
+            format!("{name}{name_pad}  "),
+            Style::default().fg(name_fg).bg(bg),
+        ),
+        Span::styled(desc, Style::default().fg(desc_fg).bg(bg)),
+        Span::styled(" ".repeat(gap), Style::default().bg(bg)),
+        Span::styled(version, Style::default().fg(theme::DIM2).bg(bg)),
+        Span::styled(" ", Style::default().bg(bg)),
+    ])
+}
+
 /// The `/help` panel: a master-detail command reference. The left pane is a
 /// searchable, categorized command list; the right pane shows the selected
 /// command's full documentation. `→` focuses the detail to scroll it.
@@ -1526,6 +1687,40 @@ mod tests {
         assert!(text.contains("theme"));
         assert!(text.contains("scrollback_lines"));
         assert!(text.contains("filter:"));
+    }
+
+    #[test]
+    fn plugins_panel_renders() {
+        use crate::addons::{PluginInfo, PluginStatus};
+        let mut app = one_net_app();
+        app.plugins = vec![
+            PluginInfo {
+                name: "nickcolor".into(),
+                file: "nickcolor.rhai".into(),
+                description: "deterministic nick colors".into(),
+                version: "1.4".into(),
+                status: PluginStatus::Loaded,
+            },
+            PluginInfo {
+                name: "weather".into(),
+                file: "weather.rhai".into(),
+                description: String::new(),
+                version: "0.2".into(),
+                status: PluginStatus::Failed("missing dep".into()),
+            },
+        ];
+        app.open_plugins();
+        let mut terminal = Terminal::new(TestBackend::new(90, 28)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("plugins"));
+        assert!(text.contains("2 installed"));
+        assert!(text.contains("LOADED"));
+        assert!(text.contains("AVAILABLE"));
+        assert!(text.contains("nickcolor"));
+        assert!(text.contains("deterministic nick colors"));
+        assert!(text.contains("v1.4"));
+        assert!(text.contains("failed to load: missing dep"));
     }
 
     #[test]
