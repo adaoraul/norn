@@ -763,27 +763,23 @@ fn complete(app: &mut App) {
         apply_completion(app, idx);
         return;
     }
-    let start = word_start(&app.input, app.cursor);
-    // Completing the command name: cursor is in the first token of a `/command`.
-    if app.input.starts_with('/') && start == 0 {
-        if let Some(completion) = command_completion(app) {
+    // Slash-commands: complete the command name or an argument by position.
+    if app.input.starts_with('/') {
+        if let Some(completion) = slash_completion(app) {
             app.completion = Some(completion);
             apply_completion(app, 0);
         }
         return;
     }
-    // Otherwise complete a nick from the channel roster.
+    // Plain text: complete a nick from the channel roster.
+    let start = word_start(&app.input, app.cursor);
     let stem = app.input[start..app.cursor].to_lowercase();
     if stem.is_empty() {
         return;
     }
-    let my_nick = app.my_nick().to_lowercase();
-    let matches: Vec<String> = app
-        .active_buffer()
-        .members
-        .iter()
-        .map(|m| m.nick.clone())
-        .filter(|n| n.to_lowercase().starts_with(&stem) && n.to_lowercase() != my_nick)
+    let matches: Vec<String> = nick_names(app)
+        .into_iter()
+        .filter(|n| n.to_lowercase().starts_with(&stem))
         .collect();
     if matches.is_empty() {
         return;
@@ -797,32 +793,213 @@ fn complete(app: &mut App) {
     apply_completion(app, 0);
 }
 
-/// Build a command-name completion from the stem after the leading `/`:
-/// built-in `COMMANDS` plus the user's alias names, prefix-filtered.
-fn command_completion(app: &App) -> Option<Completion> {
-    let stem = app.input[1..app.cursor].to_lowercase();
-    let mut matches: Vec<String> = crate::input::COMMAND_INFO
-        .iter()
-        .filter(|c| c.name.starts_with(&stem))
-        .map(|c| c.name.to_string())
-        .chain(
-            app.aliases
-                .keys()
-                .filter(|name| name.starts_with(&stem))
-                .cloned(),
-        )
-        .collect();
-    matches.sort();
-    matches.dedup();
-    if matches.is_empty() {
+/// Complete a slash-command's name (first token) or its current argument. The
+/// candidate set depends on the command and argument position; aliases are
+/// resolved to their underlying command so their parameters complete too.
+fn slash_completion(app: &App) -> Option<Completion> {
+    let ws = word_start(&app.input, app.cursor);
+    // The command token starts just after '/'; argument tokens at their word start.
+    let (start, stem) = if ws == 0 {
+        (1, app.input.get(1..app.cursor).unwrap_or("").to_string())
+    } else {
+        (ws, app.input[ws..app.cursor].to_string())
+    };
+    let stem = stem.to_lowercase();
+
+    let before: Vec<&str> = app.input[..ws].split_whitespace().collect();
+    let token_idx = before.len(); // 0 = the command name itself
+    let (mut candidates, suffix): (Vec<String>, &'static str) = if token_idx == 0 {
+        (command_names(app), " ")
+    } else {
+        let cmd = before[0].trim_start_matches('/').to_ascii_lowercase();
+        arg_candidates(app, &cmd, token_idx, &before)
+    };
+
+    candidates.retain(|c| c.to_lowercase().starts_with(&stem));
+    candidates.sort();
+    candidates.dedup();
+    if candidates.is_empty() {
         return None;
     }
     Some(Completion {
-        matches,
+        matches: candidates,
         idx: 0,
-        start: 1, // just after the leading '/'
-        suffix: " ",
+        start,
+        suffix,
     })
+}
+
+/// All completable command names: built-ins plus the user's alias names.
+fn command_names(app: &App) -> Vec<String> {
+    crate::input::COMMAND_INFO
+        .iter()
+        .map(|c| c.name.to_string())
+        .chain(app.aliases.keys().cloned())
+        .collect()
+}
+
+/// Candidates for the `token_idx`-th token of `cmd` (1 = first argument).
+/// `tokens` are the already-typed tokens (token 0 is the command).
+fn arg_candidates(
+    app: &App,
+    cmd: &str,
+    token_idx: usize,
+    tokens: &[&str],
+) -> (Vec<String>, &'static str) {
+    // Resolve a user alias to its underlying command (its first word), so e.g.
+    // an alias `j = join $1` completes channels for `/j`.
+    let effective = match app.aliases.get(cmd) {
+        Some(template) => template
+            .split_whitespace()
+            .next()
+            .unwrap_or(cmd)
+            .trim_start_matches('/')
+            .to_ascii_lowercase(),
+        None => cmd.to_string(),
+    };
+    match effective.as_str() {
+        "network" | "net" => network_args(app, token_idx, tokens),
+        "connect" | "server" => (
+            if token_idx == 1 {
+                network_names(app)
+            } else {
+                Vec::new()
+            },
+            " ",
+        ),
+        "set" => set_args(token_idx, tokens),
+        "alias" | "unalias" => (
+            if token_idx == 1 {
+                app.aliases.keys().cloned().collect()
+            } else {
+                Vec::new()
+            },
+            " ",
+        ),
+        "help" | "h" => (
+            if token_idx == 1 {
+                crate::input::COMMAND_INFO
+                    .iter()
+                    .map(|c| c.name.to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            " ",
+        ),
+        "join" | "j" | "part" => (
+            if token_idx == 1 {
+                channel_names(app)
+            } else {
+                nick_names(app)
+            },
+            " ",
+        ),
+        "msg" | "m" | "query" | "q" | "notice" | "whois" | "kick" | "invite" | "mode" | "me" => {
+            (nick_names(app), " ")
+        }
+        // Unknown command or freeform argument: offer nicks (mentions).
+        _ => (nick_names(app), " "),
+    }
+}
+
+/// `/network` argument candidates: the subcommand, then names or `add` keys.
+fn network_args(app: &App, token_idx: usize, tokens: &[&str]) -> (Vec<String>, &'static str) {
+    if token_idx == 1 {
+        return (
+            ["ls", "add", "rm", "show"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            " ",
+        );
+    }
+    let sub = tokens
+        .get(1)
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match sub.as_str() {
+        "rm" | "remove" | "del" | "show" if token_idx == 2 => (network_names(app), " "),
+        "add" => (
+            [
+                "host",
+                "port",
+                "tls",
+                "nick",
+                "user",
+                "realname",
+                "sasl_account",
+                "sasl_mech",
+                "password_command",
+                "join",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            "=",
+        ),
+        _ => (Vec::new(), " "),
+    }
+}
+
+/// `/set` argument candidates: the key, then its allowed values.
+fn set_args(token_idx: usize, tokens: &[&str]) -> (Vec<String>, &'static str) {
+    if token_idx == 1 {
+        return (
+            ["timestamps", "nicklist", "theme"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            " ",
+        );
+    }
+    if token_idx == 2 {
+        let key = tokens
+            .get(1)
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        return match key.as_str() {
+            "timestamps" | "nicklist" => (vec!["on".to_string(), "off".to_string()], " "),
+            "theme" => (
+                crate::tui::theme::THEME_NAMES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                " ",
+            ),
+            _ => (Vec::new(), " "),
+        };
+    }
+    (Vec::new(), " ")
+}
+
+/// Defined and connected network names (for `/connect`, `/network rm|show`).
+fn network_names(app: &App) -> Vec<String> {
+    app.definitions
+        .iter()
+        .map(|n| n.name.clone())
+        .chain(app.networks.iter().map(|m| m.name.clone()))
+        .collect()
+}
+
+/// Nicks in the active channel (excluding our own).
+fn nick_names(app: &App) -> Vec<String> {
+    let my = app.my_nick().to_lowercase();
+    app.active_buffer()
+        .members
+        .iter()
+        .map(|m| m.nick.clone())
+        .filter(|n| n.to_lowercase() != my)
+        .collect()
+}
+
+/// Names of open channel buffers.
+fn channel_names(app: &App) -> Vec<String> {
+    app.buffers
+        .iter()
+        .filter(|b| b.kind == BufferKind::Channel)
+        .map(|b| b.name.clone())
+        .collect()
 }
 
 fn apply_completion(app: &mut App, idx: usize) {
@@ -965,6 +1142,64 @@ mod tests {
         }
         handle_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.input, "/whois ");
+    }
+
+    /// Type `text` into a cleared input (no Enter) and press Tab, returning the
+    /// resulting input.
+    fn tab_after(app: &mut App, text: &str) -> String {
+        app.input.clear();
+        app.cursor = 0;
+        app.completion = None;
+        for c in text.chars() {
+            handle_key(app, key(KeyCode::Char(c)));
+        }
+        handle_key(app, key(KeyCode::Tab));
+        app.input.clone()
+    }
+
+    #[test]
+    fn tab_completes_network_subcommand() {
+        let mut app = app_with_channel();
+        assert_eq!(tab_after(&mut app, "/network a"), "/network add ");
+    }
+
+    #[test]
+    fn tab_completes_network_name_argument() {
+        let mut app = app_with_channel();
+        run_line(
+            &mut app,
+            "/network add libera host=irc.libera.chat nick=svan",
+        );
+        assert_eq!(tab_after(&mut app, "/connect li"), "/connect libera ");
+        assert_eq!(
+            tab_after(&mut app, "/network show li"),
+            "/network show libera "
+        );
+    }
+
+    #[test]
+    fn tab_completes_set_keys_and_values() {
+        let mut app = app_with_channel();
+        assert_eq!(tab_after(&mut app, "/set time"), "/set timestamps ");
+        assert_eq!(
+            tab_after(&mut app, "/set timestamps o"),
+            "/set timestamps off "
+        );
+        assert_eq!(tab_after(&mut app, "/set theme am"), "/set theme amber ");
+    }
+
+    #[test]
+    fn tab_completes_network_add_keys_with_equals() {
+        let mut app = app_with_channel();
+        assert_eq!(tab_after(&mut app, "/network add ho"), "/network add host=");
+    }
+
+    #[test]
+    fn tab_completes_alias_parameters_via_underlying_command() {
+        let mut app = app_with_channel(); // has a #rust channel buffer
+        run_line(&mut app, "/alias j join $1");
+        // The alias resolves to /join, so its first arg completes channels.
+        assert_eq!(tab_after(&mut app, "/j #ru"), "/j #rust ");
     }
 
     #[test]
