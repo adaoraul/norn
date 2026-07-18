@@ -240,6 +240,11 @@ pub enum Reaction {
 pub trait AddonHost {
     /// React to one normalized event.
     fn on_event(&mut self, event: &AddonEvent, ctx: &AddonCtx) -> Vec<Reaction>;
+
+    /// Flush any buffered persistent state to disk. Called periodically and on
+    /// shutdown so hosts can debounce writes rather than persist on every change.
+    /// Default: nothing to flush.
+    fn flush(&mut self) {}
 }
 
 /// Several hosts driven as one: reactions are concatenated in order.
@@ -252,6 +257,12 @@ impl AddonHost for CompositeHost {
             out.extend(host.on_event(event, ctx));
         }
         out
+    }
+
+    fn flush(&mut self) {
+        for host in &mut self.0 {
+            host.flush();
+        }
     }
 }
 

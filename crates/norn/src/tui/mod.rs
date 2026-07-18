@@ -170,6 +170,8 @@ pub async fn run(
                 }
             }
             _ = idle_tick.tick() => {
+                // Persist any buffered plugin state (debounced to this ~5s cadence).
+                host.flush();
                 let idle_secs = app.client.idle_secs as u64;
                 if !is_idle && idle_secs > 0 {
                     let elapsed = last_activity.elapsed().as_secs();
@@ -208,6 +210,8 @@ pub async fn run(
         }
     }
 
+    // Persist any buffered plugin state before exiting (covers every break path).
+    host.flush();
     Ok(())
 }
 

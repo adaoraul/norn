@@ -37,6 +37,8 @@ struct HostState {
     store: HashMap<String, HashMap<String, String>>,
     /// Where the store is persisted; `None` for in-memory (tests).
     store_path: Option<PathBuf>,
+    /// Whether the store changed since the last flush (debounces disk writes).
+    store_dirty: bool,
     /// Our presence on the event's network (for the read-only accessors).
     presence: Presence,
     /// Effective per-plugin config (defaults merged with user overrides): plugin
@@ -332,6 +334,16 @@ impl AddonHost for RhaiHost {
         }
         std::mem::take(&mut self.state.borrow_mut().reactions)
     }
+
+    /// Persist the KV store if it changed since the last flush (write-behind, so a
+    /// hot `store.set` loop does not rewrite the file on every call).
+    fn flush(&mut self) {
+        let mut s = self.state.borrow_mut();
+        if s.store_dirty {
+            persist_store(&s);
+            s.store_dirty = false;
+        }
+    }
 }
 
 /// The hook name for an event kind.
@@ -594,7 +606,7 @@ fn build_engine(state: Rc<RefCell<HostState>>) -> Engine {
                 .into()
         },
     );
-    // store.set(key, value): store a value and persist.
+    // store.set(key, value): store a value (persisted on the next flush).
     let st = state.clone();
     engine.register_fn(
         "set",
@@ -605,10 +617,10 @@ fn build_engine(state: Rc<RefCell<HostState>>) -> Engine {
                 .entry(ns)
                 .or_default()
                 .insert(key.to_string(), val.to_string());
-            persist_store(&s);
+            s.store_dirty = true;
         },
     );
-    // store.del(key): remove a key and persist.
+    // store.del(key): remove a key (persisted on the next flush).
     let st = state.clone();
     engine.register_fn("del", move |_s: &mut Store, key: ImmutableString| {
         let mut s = st.borrow_mut();
@@ -616,7 +628,7 @@ fn build_engine(state: Rc<RefCell<HostState>>) -> Engine {
         if let Some(m) = s.store.get_mut(&ns) {
             m.remove(key.as_str());
         }
-        persist_store(&s);
+        s.store_dirty = true;
     });
     // store.has(key) -> bool.
     let st = state.clone();
@@ -803,6 +815,38 @@ mod tests {
                 "PRIVMSG #c :[]",
             ]
         );
+    }
+
+    #[test]
+    fn store_writes_are_debounced_until_flush() {
+        let dir = std::env::temp_dir().join("norn-store-flush-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Reply with the current value, then set it (buffered).
+        std::fs::write(
+            dir.join("c.rhai"),
+            r#"fn on_message(m) { reply(store.get("k")); store.set("k", "v"); }"#,
+        )
+        .unwrap();
+        let store_file = dir.join("store.toml");
+
+        let mut host = RhaiHost::load(&dir, &HashSet::new(), &BTreeMap::new());
+        // First event: the store is empty -> reply is blank; the set is buffered.
+        let out = host.on_event(&message("#c", "bob", "hi"), &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["PRIVMSG #c :"]));
+        assert!(
+            !store_file.exists(),
+            "write should be debounced, not on disk"
+        );
+        // Flush persists it.
+        host.flush();
+        assert!(store_file.exists(), "flush should write the store");
+        // A fresh host loading the same dir sees the flushed value on its next event.
+        let mut host2 = RhaiHost::load(&dir, &HashSet::new(), &BTreeMap::new());
+        let out = host2.on_event(&message("#c", "bob", "hi"), &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["PRIVMSG #c :v"]));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
