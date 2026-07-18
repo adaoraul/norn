@@ -48,7 +48,10 @@ pub enum SaslError {
 /// Given a decoded server challenge, it yields the next raw response payload
 /// (before base64 and chunking). Single-message mechanisms (PLAIN, EXTERNAL)
 /// respond once to the initial empty challenge.
-pub trait Mechanism {
+///
+/// `Send` is required so a boxed mechanism can move into a per-connection task
+/// on a multi-threaded runtime.
+pub trait Mechanism: Send {
     /// The mechanism name as sent in `AUTHENTICATE <name>`.
     fn name(&self) -> &str;
 

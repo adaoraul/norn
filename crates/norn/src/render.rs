@@ -1,40 +1,44 @@
-//! Render engine events as plain lines on stdout.
+//! Format engine events as plain text lines.
 //!
-//! A deliberately simple text view for now: enough to watch a live session. The
-//! ratatui UI will later consume the same `Event`s instead of printing.
+//! Used by the `--plain` renderer. Each event maps to zero or more lines; the
+//! caller prefixes them with the network name and prints them. The TUI consumes
+//! the same `Event`s directly instead.
 
 use irc_engine::{ChatMessage, Event, LeaveReason, MessageKind};
 use irc_proto::Source;
 
-/// Print one event.
-pub fn render(event: &Event) {
+/// Format one event as zero or more display lines.
+pub fn render(event: &Event) -> Vec<String> {
     match event {
-        Event::Registered { nick } => println!("-- registered as {nick}"),
+        Event::Registered { nick } => vec![format!("-- registered as {nick}")],
         Event::CapabilitiesChanged { enabled, .. } => {
-            println!("-- capabilities: {} enabled", enabled.len());
+            vec![format!("-- capabilities: {} enabled", enabled.len())]
         }
-        Event::AuthResult(Ok(account)) => println!("-- authenticated as {account}"),
-        Event::AuthResult(Err(err)) => println!("-- authentication failed: {err}"),
-        Event::MessageReceived(msg) => print_chat(msg),
+        Event::AuthResult(Ok(account)) => vec![format!("-- authenticated as {account}")],
+        Event::AuthResult(Err(err)) => vec![format!("-- authentication failed: {err}")],
+        Event::MessageReceived(msg) => vec![chat_line(msg)],
         Event::HistoryLoaded {
             target,
             messages,
             complete,
         } => {
-            println!(
+            let mut lines = vec![format!(
                 "-- history for {target}: {} message(s){}",
                 messages.len(),
                 if *complete { "" } else { " (more available)" }
-            );
-            for msg in messages {
-                print_chat(msg);
-            }
+            )];
+            lines.extend(messages.iter().map(chat_line));
+            lines
         }
         Event::BatchCollapsed(batch) => {
-            println!("-- {} batch ({} items)", batch.batch_type, batch.len());
+            vec![format!(
+                "-- {} batch ({} items)",
+                batch.batch_type,
+                batch.len()
+            )]
         }
         Event::NamesLoaded { target, members } => {
-            println!("-- {} has {} member(s)", target, members.len());
+            vec![format!("-- {} has {} member(s)", target, members.len())]
         }
         Event::TopicChanged {
             target,
@@ -42,60 +46,60 @@ pub fn render(event: &Event) {
             set_by,
             ..
         } => match (topic, set_by) {
-            (Some(topic), _) => println!("-- topic for {target}: {topic}"),
-            (None, Some(by)) => println!("-- topic for {target} set by {by}"),
-            (None, None) => println!("-- {target} has no topic"),
+            (Some(topic), _) => vec![format!("-- topic for {target}: {topic}")],
+            (None, Some(by)) => vec![format!("-- topic for {target} set by {by}")],
+            (None, None) => vec![format!("-- {target} has no topic")],
         },
         Event::MemberJoined {
             target,
             who,
             account,
         } => match account {
-            Some(account) => println!("-- {} ({account}) joined {target}", who.nick),
-            None => println!("-- {} joined {target}", who.nick),
+            Some(account) => vec![format!("-- {} ({account}) joined {target}", who.nick)],
+            None => vec![format!("-- {} joined {target}", who.nick)],
         },
         Event::MemberLeft {
             target,
             who,
             reason,
         } => match reason {
-            LeaveReason::Part(reason) => println!("-- {} left {target} ({reason})", who.nick),
-            LeaveReason::Quit(reason) => println!("-- {} quit ({reason})", who.nick),
+            LeaveReason::Part(reason) => vec![format!("-- {} left {target} ({reason})", who.nick)],
+            LeaveReason::Quit(reason) => vec![format!("-- {} quit ({reason})", who.nick)],
             LeaveReason::Kicked { by, reason } => {
-                println!(
+                vec![format!(
                     "-- {} was kicked from {target} by {by} ({reason})",
                     who.nick
-                )
+                )]
             }
         },
-        Event::NickChanged { old, new } => println!("-- {old} is now known as {new}"),
+        Event::NickChanged { old, new } => vec![format!("-- {old} is now known as {new}")],
         Event::AccountChanged { nick, account } => match account {
-            Some(account) => println!("-- {nick} logged in as {account}"),
-            None => println!("-- {nick} logged out"),
+            Some(account) => vec![format!("-- {nick} logged in as {account}")],
+            None => vec![format!("-- {nick} logged out")],
         },
         Event::HostChanged { nick, user, host } => {
-            println!("-- {nick} changed host to {user}@{host}")
+            vec![format!("-- {nick} changed host to {user}@{host}")]
         }
         Event::AwayChanged { nick, message } => match message {
-            Some(message) => println!("-- {nick} is away ({message})"),
-            None => println!("-- {nick} is back"),
+            Some(message) => vec![format!("-- {nick} is away ({message})")],
+            None => vec![format!("-- {nick} is back")],
         },
         Event::RealnameChanged { nick, realname } => {
-            println!("-- {nick} set realname to {realname}")
+            vec![format!("-- {nick} set realname to {realname}")]
         }
-        Event::StandardReply(reply) => println!(
+        Event::StandardReply(reply) => vec![format!(
             "-- {:?} {} {}: {}",
             reply.kind, reply.command, reply.code, reply.description
-        ),
-        Event::Disconnected(reason) => println!("-- disconnected: {reason:?}"),
+        )],
+        Event::Disconnected(reason) => vec![format!("-- disconnected: {reason:?}")],
     }
 }
 
-fn print_chat(msg: &ChatMessage) {
+fn chat_line(msg: &ChatMessage) -> String {
     let who = msg.sender.as_ref().map(source_nick).unwrap_or("?");
     match msg.kind {
-        MessageKind::Privmsg => println!("[{}] <{}> {}", msg.target, who, msg.text),
-        MessageKind::Notice => println!("[{}] -{}- {}", msg.target, who, msg.text),
+        MessageKind::Privmsg => format!("[{}] <{}> {}", msg.target, who, msg.text),
+        MessageKind::Notice => format!("[{}] -{}- {}", msg.target, who, msg.text),
     }
 }
 

@@ -1,45 +1,12 @@
-//! Read user input from stdin and translate it into outgoing IRC lines.
+//! Translate user input lines into outgoing IRC lines.
 //!
 //! Plain text is sent as a message to the current target (the last channel
-//! joined or set with `/msg`). Lines starting with `/` are commands. Each
-//! produced line is forwarded (without CRLF) to the connection's outgoing
-//! channel; the connection only sends them once registered.
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc::UnboundedSender;
-
-/// Read stdin to end, translating each line and forwarding outgoing IRC lines.
-/// Runs for the whole program (across reconnects). On `/quit` it sets `quit` so
-/// the main loop stops reconnecting. Returns when stdin closes (EOF), the
-/// receiver is gone, or the user quits.
-pub async fn run(tx: UnboundedSender<String>, quit: Arc<AtomicBool>) {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut current: Option<String> = None;
-
-    loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            _ => break, // EOF or read error
-        };
-        let (out, is_quit) = translate(&line, &mut current);
-        for msg in out {
-            if tx.send(msg).is_err() {
-                return; // connection gone
-            }
-        }
-        if is_quit {
-            quit.store(true, Ordering::SeqCst);
-            break;
-        }
-    }
-}
+//! joined or set with `/msg`). Lines starting with `/` are commands. Used by the
+//! `--plain` renderer; the TUI has its own key handling.
 
 /// Translate one input line into zero or more IRC lines, plus whether the user
 /// asked to quit.
-fn translate(input: &str, current: &mut Option<String>) -> (Vec<String>, bool) {
+pub fn translate(input: &str, current: &mut Option<String>) -> (Vec<String>, bool) {
     let input = input.trim();
     if input.is_empty() {
         return (Vec::new(), false);
