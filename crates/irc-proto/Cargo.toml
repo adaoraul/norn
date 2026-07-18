@@ -2,6 +2,8 @@
 name = "irc-proto"
 version = "0.1.0"
 edition = "2021"
+authors = ["Adao Raul <adao.raul@gmail.com>"]
+license = "MIT OR Apache-2.0"
 description = "Pure, synchronous IRCv3 protocol core: codec, cap parsing, SASL math. No I/O, no async."
 
 [dependencies]
