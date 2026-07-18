@@ -1158,7 +1158,7 @@ fn draw_plugins_body(f: &mut Frame, area: Rect, app: &App) {
     if app.plugins.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " no plugins installed (put *.rhai in the addons folder)",
+                " no plugins installed (put *.rhai in the plugins folder)",
                 Style::default().fg(theme::DIM2),
             ))),
             area,

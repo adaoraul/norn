@@ -58,7 +58,7 @@ impl RhaiHost {
                     .filter(|p| p.extension().is_some_and(|x| x == "rhai"))
                     .collect(),
                 Err(e) => {
-                    entries.push(("addons".to_string(), Err(e.to_string())));
+                    entries.push(("plugins".to_string(), Err(e.to_string())));
                     Vec::new()
                 }
             };
@@ -225,7 +225,7 @@ impl AddonHost for RhaiHost {
                 let net = s.net;
                 s.reactions.push(Reaction::Notify {
                     net,
-                    text: format!("addon {}: {err}", script.label),
+                    text: format!("plugin {}: {err}", script.label),
                 });
             }
         }
@@ -487,7 +487,7 @@ mod tests {
             RhaiHost::from_sources(&[("t.rhai", "fn on_message(m) { no_such_fn(); }")], &[]);
         let out = h.on_event(&message("#c", "bob", "hi"), &ctx("me"));
         assert!(matches!(&out[0], Reaction::Notify { text, .. }
-            if text.contains("addon t.rhai")));
+            if text.contains("plugin t.rhai")));
     }
 
     #[test]

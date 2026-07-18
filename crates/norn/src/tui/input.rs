@@ -900,7 +900,7 @@ fn handle_plugins(app: &mut App, arg: &str) {
         "ls" | "list" => {
             let mut lines = vec!["plugins:".to_string()];
             if app.plugins.is_empty() {
-                lines.push("  (no scripts; put *.rhai in the addons dir)".to_string());
+                lines.push("  (no scripts; put *.rhai in the plugins dir)".to_string());
             }
             for p in &app.plugins {
                 let status = match &p.status {

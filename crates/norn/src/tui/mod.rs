@@ -103,17 +103,17 @@ pub async fn run(
     let mut cmd_txs = cmd_txs;
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new(networks, client, definitions, aliases, config_path);
-    // Addon scripts live next to the config file (`<config-dir>/addons`).
-    let addons_dir: Option<PathBuf> = app
+    // Plugin scripts live next to the config file (`<config-dir>/plugins`).
+    let plugins_dir: Option<PathBuf> = app
         .config_path
         .as_deref()
         .and_then(Path::parent)
-        .map(|d| d.join("addons"));
+        .map(|d| d.join("plugins"));
     // The addon host reacts to engine events: declarative triggers plus scripts.
     app.triggers = triggers;
     app.disabled_plugins = disabled_plugins;
     let disabled: HashSet<String> = app.disabled_plugins.iter().cloned().collect();
-    let report = build_addon_host(&app.triggers, addons_dir.as_deref(), &disabled);
+    let report = build_addon_host(&app.triggers, plugins_dir.as_deref(), &disabled);
     let mut host = report.host;
     report_addon_load(&mut app, report.plugins);
     let mut term_events = EventStream::new();
@@ -158,7 +158,7 @@ pub async fn run(
             &mut app,
             &mut cmd_txs,
             &mut host,
-            addons_dir.as_deref(),
+            plugins_dir.as_deref(),
             &ui_tx,
             &quit,
         );
@@ -210,7 +210,7 @@ fn process_ui_event(
 fn report_addon_load(app: &mut App, plugins: Vec<PluginInfo>) {
     for plugin in &plugins {
         if let PluginStatus::Failed(err) = &plugin.status {
-            app.push_console(format!("addon error: {}: {err}", plugin.file));
+            app.push_console(format!("plugin error: {}: {err}", plugin.file));
         }
     }
     app.plugins = plugins;
@@ -242,7 +242,7 @@ fn drain_actions(
     app: &mut App,
     cmd_txs: &mut Vec<mpsc::UnboundedSender<NetCommand>>,
     host: &mut Box<dyn AddonHost>,
-    addons_dir: Option<&Path>,
+    plugins_dir: Option<&Path>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     quit: &Arc<AtomicBool>,
 ) {
@@ -250,7 +250,7 @@ fn drain_actions(
         match action {
             AppAction::ReloadAddons => {
                 let disabled: HashSet<String> = app.disabled_plugins.iter().cloned().collect();
-                let report = build_addon_host(&app.triggers, addons_dir, &disabled);
+                let report = build_addon_host(&app.triggers, plugins_dir, &disabled);
                 *host = report.host;
                 report_addon_load(app, report.plugins);
             }

@@ -233,15 +233,15 @@ pub struct AddonReport {
     pub plugins: Vec<PluginInfo>,
 }
 
-/// Assemble the addon host: declarative triggers plus the Rhai scripts under
-/// `addons_dir` (skipping `disabled` filenames). Used at startup and on reload.
+/// Assemble the addon host: declarative triggers plus the Rhai plugin scripts
+/// under `plugins_dir` (skipping `disabled` filenames). Used at startup/reload.
 pub fn build_addon_host(
     triggers: &[TriggerConfig],
-    addons_dir: Option<&Path>,
+    plugins_dir: Option<&Path>,
     disabled: &HashSet<String>,
 ) -> AddonReport {
     let mut hosts: Vec<Box<dyn AddonHost>> = vec![Box::new(Triggers::from_configs(triggers))];
-    let plugins = match addons_dir {
+    let plugins = match plugins_dir {
         Some(dir) => {
             let host = RhaiHost::load(dir, disabled);
             let plugins = host.plugins().to_vec();

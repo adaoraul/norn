@@ -206,14 +206,14 @@ const PLUGINS_SUBS: &[SubDoc] = &[
     SubDoc {
         name: "ls",
         usage: "/plugins ls",
-        desc: "List addon scripts with their status and version.",
+        desc: "List plugin scripts with their status and version.",
         params: &[],
         examples: &["/plugins ls"],
     },
     SubDoc {
         name: "reload",
         usage: "/plugins reload",
-        desc: "Recompile the addon scripts and rebuild the live host.",
+        desc: "Recompile the plugin scripts and rebuild the live host.",
         params: &[],
         examples: &["/plugins reload"],
     },
@@ -568,7 +568,7 @@ its trailing args appended when it contains no placeholder.",
         name: "trigger",
         category: "Client",
         usage: "/trigger ls|add|rm",
-        summary: "Manage addon event triggers",
+        summary: "Manage automatic event triggers",
         description: "List, define, and remove declarative triggers: run a command \
 when an event fires (highlight -> notify, join -> greet, ...). Edits are saved and \
 applied live. See `/trigger add` for the event and template grammar.",
@@ -583,8 +583,8 @@ applied live. See `/trigger add` for the event and template grammar.",
         usage: "/plugins [ls|reload|enable|disable]",
         summary: "Open or manage the plugins",
         description: "Open the plugins manager (bare /plugins), or manage Rhai \
-addon scripts from the input line: list them with status/version, reload after \
-editing, or enable/disable one. Scripts live in the `addons` folder next to the \
+plugin scripts from the input line: list them with status/version, reload after \
+editing, or enable/disable one. Scripts live in the `plugins` folder next to the \
 config file and define event hooks (on_message, on_join, ...) that call reply/\
 send/notify/nick.",
         aliases: &[],
