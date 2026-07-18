@@ -10,8 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use irc_engine::{BringupMachine, ChatHistoryRequest, Connection, Engine, Event, Selector};
-use irc_proto::{Command, Message};
+use irc_engine::{
+    BringupMachine, ChatHistoryRequest, ChatMessage, Connection, Engine, Event, MessageKind,
+    Selector,
+};
+use irc_proto::{Command, Message, Source};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -189,14 +192,20 @@ async fn run_once(
     let mut machine = BringupMachine::new(settings.bringup());
     let mut engine = Engine::new();
     let mut my_nick = settings.nick().to_string();
+    // Whether SASL logged us in; if so, NickServ auto-identify stays dormant.
+    let mut authenticated = false;
 
     for event in conn.run_bringup(&mut machine).await? {
-        if let Event::Registered { nick } = &event {
-            my_nick = nick.clone();
-            let _ = ui_tx.send(UiEvent {
-                net: id,
-                kind: UiEventKind::ConnState(ConnState::Registered { nick: nick.clone() }),
-            });
+        match &event {
+            Event::Registered { nick } => {
+                my_nick = nick.clone();
+                let _ = ui_tx.send(UiEvent {
+                    net: id,
+                    kind: UiEventKind::ConnState(ConnState::Registered { nick: nick.clone() }),
+                });
+            }
+            Event::AuthResult(Ok(_)) => authenticated = true,
+            _ => {}
         }
         let _ = ui_tx.send(UiEvent {
             net: id,
@@ -211,11 +220,20 @@ async fn run_once(
         conn.send(&format!("JOIN {channel}")).await?;
     }
 
+    // Auto-identify is a one-shot fallback per connection.
+    let mut identified = false;
+
     loop {
         tokio::select! {
             incoming = conn.recv() => {
                 match incoming? {
-                    Some(msg) => on_message(id, msg, &mut engine, &mut conn, &my_nick, ui_tx).await?,
+                    Some(msg) => {
+                        on_message(
+                            id, msg, &mut engine, &mut conn, &my_nick, settings,
+                            authenticated, &mut identified, ui_tx,
+                        )
+                        .await?
+                    }
                     None => return Ok(RunOutcome::Dropped), // server closed
                 }
             }
@@ -246,13 +264,18 @@ async fn run_once(
 }
 
 /// Handle one server message: PING keepalive, feed the engine, forward events,
-/// and request history when we ourselves join a channel.
+/// request history when we ourselves join a channel, and auto-identify to
+/// NickServ once if configured and not already SASL-authenticated.
+#[allow(clippy::too_many_arguments)]
 async fn on_message<S>(
     id: NetworkId,
     msg: Message,
     engine: &mut Engine,
     conn: &mut Connection<S>,
     my_nick: &str,
+    settings: &NetworkSettings,
+    authenticated: bool,
+    identified: &mut bool,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> std::io::Result<()>
 where
@@ -274,10 +297,85 @@ where
                 conn.send(&format!("WHO {target}")).await?;
             }
         }
+        // NickServ auto-identify fallback: fire once on the identify prompt when
+        // SASL did not already log us in. `identify_line` returns `None` unless
+        // auto-identify is on and a password is available; the password is built
+        // inside it and never reaches here as a value.
+        if !*identified && !authenticated {
+            if let Event::MessageReceived(chat) = &event {
+                if is_identify_prompt(chat) {
+                    if let Some(line) = settings.identify_line() {
+                        conn.send(&line).await?;
+                        *identified = true;
+                        let _ = ui_tx.send(UiEvent {
+                            net: id,
+                            kind: UiEventKind::Info("identified with services".to_string()),
+                        });
+                    }
+                }
+            }
+        }
         let _ = ui_tx.send(UiEvent {
             net: id,
             kind: UiEventKind::Engine(event),
         });
     }
     Ok(())
+}
+
+/// Whether a message is a NickServ NOTICE asking us to identify.
+fn is_identify_prompt(chat: &ChatMessage) -> bool {
+    if chat.kind != MessageKind::Notice {
+        return false;
+    }
+    let from_nickserv = matches!(
+        chat.sender.as_ref(),
+        Some(Source::User { nick, .. }) if nick.eq_ignore_ascii_case("NickServ")
+    );
+    from_nickserv && chat.text.to_lowercase().contains("identify")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notice(nick: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            time: None,
+            msgid: None,
+            account: None,
+            sender: Some(Source::User {
+                nick: nick.into(),
+                user: None,
+                host: None,
+            }),
+            target: "me".into(),
+            text: text.into(),
+            kind: MessageKind::Notice,
+        }
+    }
+
+    #[test]
+    fn identify_prompt_detection() {
+        // A NickServ NOTICE mentioning identify (any case) is a prompt.
+        assert!(is_identify_prompt(&notice(
+            "NickServ",
+            "This nickname is registered. Please IDENTIFY."
+        )));
+        assert!(is_identify_prompt(&notice(
+            "nickserv",
+            "type /msg NickServ identify <password>"
+        )));
+        // A non-NickServ sender is not.
+        assert!(!is_identify_prompt(&notice("someone", "please identify")));
+        // A PRIVMSG (not NOTICE) is not.
+        let mut pm = notice("NickServ", "identify");
+        pm.kind = MessageKind::Privmsg;
+        assert!(!is_identify_prompt(&pm));
+        // An unrelated NickServ notice is not.
+        assert!(!is_identify_prompt(&notice(
+            "NickServ",
+            "you are now logged in"
+        )));
+    }
 }

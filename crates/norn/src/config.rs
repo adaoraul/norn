@@ -143,6 +143,15 @@ pub struct NetworkConfig {
     /// stays defined but idle until `/connect` (or the networks manager).
     #[serde(default = "default_true")]
     pub auto_connect: bool,
+    /// Whether to auto-identify to NickServ when prompted, using the same
+    /// resolved password as SASL. A fallback: dormant when SASL already logged in.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub identify: bool,
+}
+
+/// serde `skip_serializing_if` helper for a `false` bool.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Client-wide UI preferences (the TOML `[client]` table). The interactive
@@ -269,12 +278,28 @@ pub struct NetworkSettings {
     sasl_account: Option<String>,
     sasl_mech: SaslMech,
     password: Option<String>,
+    identify: bool,
 }
 
 impl NetworkSettings {
     /// The nick this network registers with.
     pub fn nick(&self) -> &str {
         &self.nick
+    }
+
+    /// The NickServ IDENTIFY line to send when prompted, or `None` when
+    /// auto-identify is off or no password is available. The password is used to
+    /// build the line but is never returned above this type (so it never reaches
+    /// scripts or the UI).
+    pub fn identify_line(&self) -> Option<String> {
+        if !self.identify {
+            return None;
+        }
+        let password = self.password.as_ref()?;
+        Some(match &self.sasl_account {
+            Some(account) => format!("PRIVMSG NickServ :IDENTIFY {account} {password}"),
+            None => format!("PRIVMSG NickServ :IDENTIFY {password}"),
+        })
     }
 
     /// Build a fresh `BringupConfig` for a connection attempt (new SCRAM nonce
@@ -308,7 +333,8 @@ impl NetworkConfig {
     /// Resolve into connect-ready settings, running the password command (or
     /// reading NORN_PASSWORD) once now.
     pub fn resolve(&self) -> io::Result<NetworkSettings> {
-        let password = if self.sasl_account.is_some() {
+        // Resolve the password for SASL and/or NickServ auto-identify.
+        let password = if self.sasl_account.is_some() || self.identify {
             resolve_password(self.password_command.as_deref())
         } else {
             None
@@ -327,6 +353,7 @@ impl NetworkConfig {
             sasl_account: self.sasl_account.clone(),
             sasl_mech: self.sasl_mech,
             password,
+            identify: self.identify,
         })
     }
 }
@@ -372,6 +399,7 @@ impl Cli {
             password_command: None,
             auto_join: self.join.clone(),
             auto_connect: true,
+            identify: false,
         })
     }
 }
@@ -478,6 +506,7 @@ mod tests {
                 password_command: Some("pass irc/libera".into()),
                 auto_join: vec!["#rust".into()],
                 auto_connect: true,
+                identify: true,
             }],
             triggers: vec![TriggerConfig {
                 on: "highlight".into(),
@@ -499,6 +528,7 @@ mod tests {
         assert_eq!(back.networks.len(), 1);
         assert_eq!(back.networks[0].sasl_mech, SaslMech::Scram);
         assert_eq!(back.networks[0].auto_join, vec!["#rust"]);
+        assert!(back.networks[0].identify);
         assert_eq!(back.triggers.len(), 1);
         assert_eq!(back.triggers[0].on, "highlight");
         assert_eq!(back.triggers[0].run, "notify $nick: $msg");
@@ -612,6 +642,7 @@ mod tests {
             password_command: None,
             auto_join: vec![],
             auto_connect: true,
+            identify: false,
         };
         let settings = net.resolve().unwrap();
         assert_eq!(settings.nick(), "nick");
@@ -633,9 +664,48 @@ mod tests {
             password_command: Some("printf 'sekret'".into()),
             auto_join: vec![],
             auto_connect: true,
+            identify: false,
         };
         let settings = net.resolve().unwrap();
         assert_eq!(settings.password.as_deref(), Some("sekret"));
         assert_eq!(settings.bringup().sasl.len(), 1);
+    }
+
+    #[test]
+    fn identify_line_uses_password_only_when_enabled() {
+        let base = NetworkConfig {
+            name: "n".into(),
+            host: "h".into(),
+            port: 6697,
+            tls: true,
+            nick: "nick".into(),
+            user: None,
+            realname: None,
+            sasl_account: Some("acct".into()),
+            sasl_mech: SaslMech::Plain,
+            password_command: Some("printf sekret".into()),
+            auto_join: vec![],
+            auto_connect: true,
+            identify: true,
+        };
+        assert_eq!(
+            base.resolve().unwrap().identify_line().as_deref(),
+            Some("PRIVMSG NickServ :IDENTIFY acct sekret")
+        );
+        // No account -> identify the current nick.
+        let no_account = NetworkConfig {
+            sasl_account: None,
+            ..base.clone()
+        };
+        assert_eq!(
+            no_account.resolve().unwrap().identify_line().as_deref(),
+            Some("PRIVMSG NickServ :IDENTIFY sekret")
+        );
+        // identify off -> no line even though a password exists.
+        let off = NetworkConfig {
+            identify: false,
+            ..base.clone()
+        };
+        assert!(off.resolve().unwrap().identify_line().is_none());
     }
 }

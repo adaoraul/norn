@@ -1739,6 +1739,7 @@ mod tests {
             password_command: None,
             auto_join: vec![],
             auto_connect: true,
+            identify: false,
         });
         app.open_networks();
         let mut terminal = Terminal::new(TestBackend::new(90, 28)).unwrap();

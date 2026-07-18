@@ -131,6 +131,11 @@ const NETWORK_ADD_OPTS: &[ParamDoc] = &[
         ArgKind::OptionKey,
         "on|off, dial on launch (default on)",
     ),
+    opt(
+        "identify",
+        ArgKind::OptionKey,
+        "on|off, auto-identify to NickServ (fallback when SASL is off)",
+    ),
 ];
 
 const NETWORK_SUBS: &[SubDoc] = &[

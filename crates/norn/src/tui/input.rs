@@ -1118,6 +1118,7 @@ fn handle_network(app: &mut App, arg: &str) {
                 format!("  host         = {}:{}", net.host, net.port),
                 format!("  tls          = {}", net.tls),
                 format!("  auto_connect = {}", net.auto_connect),
+                format!("  identify     = {}", net.identify),
                 format!("  nick         = {}", net.nick),
             ];
             if let Some(user) = &net.user {
@@ -1201,7 +1202,7 @@ fn parse_network_add(arg: &str) -> Result<crate::config::NetworkConfig, String> 
     use crate::config::SaslMech;
     const USAGE: &str = "usage: /network add <name> host=<server> nick=<you> \
 [port=] [tls=on|off] [user=] [realname=] [sasl_account=] [sasl_mech=plain|scram] \
-[password_command=\"...\"] [join=#a,#b] [auto_connect=on|off]";
+[password_command=\"...\"] [join=#a,#b] [auto_connect=on|off] [identify=on|off]";
 
     let tokens = split_args(arg);
     let mut tokens = tokens.into_iter();
@@ -1213,6 +1214,7 @@ fn parse_network_add(arg: &str) -> Result<crate::config::NetworkConfig, String> 
     let mut sasl_mech = SaslMech::Plain;
     let mut auto_join = Vec::new();
     let mut auto_connect = true;
+    let mut identify = false;
 
     for token in tokens {
         let (key, value) = token
@@ -1239,6 +1241,9 @@ fn parse_network_add(arg: &str) -> Result<crate::config::NetworkConfig, String> 
                 auto_connect =
                     parse_bool(value).ok_or_else(|| format!("bad auto_connect '{value}'"))?
             }
+            "identify" => {
+                identify = parse_bool(value).ok_or_else(|| format!("bad identify '{value}'"))?
+            }
             "password" | "pass" => {
                 return Err(
                     "passwords are never stored; use password_command or NORN_PASSWORD".into(),
@@ -1261,6 +1266,7 @@ fn parse_network_add(arg: &str) -> Result<crate::config::NetworkConfig, String> 
         password_command,
         auto_join,
         auto_connect,
+        identify,
     })
 }
 

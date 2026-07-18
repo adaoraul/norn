@@ -358,6 +358,10 @@ pub const NETWORK_FIELDS: &[NetField] = &[
         kind: NetFieldKind::Toggle,
     },
     NetField {
+        name: "identify",
+        kind: NetFieldKind::Toggle,
+    },
+    NetField {
         name: "nick",
         kind: NetFieldKind::Text,
     },
@@ -1277,6 +1281,7 @@ impl App {
             password_command: None,
             auto_join: Vec::new(),
             auto_connect: true,
+            identify: false,
         });
         self.save_config();
         self.networks_ui.sel = self.definitions.len() - 1;
@@ -1346,6 +1351,10 @@ impl App {
             }
             Some("auto_connect") => {
                 cfg.auto_connect =
+                    parse_bool(raw).ok_or_else(|| format!("expected on/off, got '{raw}'"))?
+            }
+            Some("identify") => {
+                cfg.identify =
                     parse_bool(raw).ok_or_else(|| format!("expected on/off, got '{raw}'"))?
             }
             Some("nick") => {
@@ -1495,6 +1504,7 @@ pub fn network_field_value(cfg: &NetworkConfig, field: usize) -> String {
         Some("port") => cfg.port.to_string(),
         Some("tls") => if cfg.tls { "on" } else { "off" }.to_string(),
         Some("auto_connect") => if cfg.auto_connect { "on" } else { "off" }.to_string(),
+        Some("identify") => if cfg.identify { "on" } else { "off" }.to_string(),
         Some("nick") => cfg.nick.clone(),
         Some("user") => cfg.user.clone().unwrap_or_default(),
         Some("realname") => cfg.realname.clone().unwrap_or_default(),
@@ -1946,6 +1956,7 @@ mod tests {
             password_command: None,
             auto_join: vec![],
             auto_connect: true,
+            identify: false,
         });
         let idx = |name: &str| NETWORK_FIELDS.iter().position(|f| f.name == name).unwrap();
         // port: rejects non-numeric, accepts a number.
@@ -1985,6 +1996,7 @@ mod tests {
                 password_command: None,
                 auto_join: vec![],
                 auto_connect: true,
+                identify: false,
             });
         }
         a.networks_ui.sel = 2; // the add row
