@@ -167,4 +167,105 @@ mod tests {
         let out = host.on_event(&active, &ctx);
         assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["AWAY"]));
     }
+
+    // The following three tests drive a real hook that reads a top-level const, so
+    // they double as regression guards for the "consts invisible inside call_fn"
+    // bug (fixed in a57dbe5): if consts stopped reaching hooks they would fail.
+
+    #[test]
+    fn autoop_ops_trusted_nick_in_trusted_channel() {
+        let src = find("autoop").unwrap().source;
+        let mut host = RhaiHost::from_sources(&[("autoop.rhai", src)], &[]);
+        let ctx = AddonCtx {
+            my_nick: "me",
+            network: "libera",
+            presence: &EMPTY_PRESENCE,
+        };
+        let join = |channel: &str, nick: &str| AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Join {
+                channel: channel.into(),
+                nick: nick.into(),
+            },
+        };
+        // Trusted nick (alice) in a trusted channel (#norn) -> op.
+        let out = host.on_event(&join("#norn", "alice"), &ctx);
+        assert!(matches!(&out[0], Reaction::Send { lines, .. }
+            if lines == &["MODE #norn +o alice"]));
+        // Untrusted nick -> nothing.
+        assert!(host.on_event(&join("#norn", "carol"), &ctx).is_empty());
+        // Trusted nick in an untrusted channel -> nothing.
+        assert!(host.on_event(&join("#other", "alice"), &ctx).is_empty());
+    }
+
+    #[test]
+    fn keepnick_reclaims_the_wanted_nick() {
+        let src = find("keepnick").unwrap().source;
+        let mut host = RhaiHost::from_sources(&[("keepnick.rhai", src)], &[]);
+        // nick() is "me", which differs from the shipped WANT ("yournick").
+        let ctx = AddonCtx {
+            my_nick: "me",
+            network: "libera",
+            presence: &EMPTY_PRESENCE,
+        };
+        // The wanted nick quit -> reclaim it.
+        let quit = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Quit {
+                nick: "yournick".into(),
+                reason: String::new(),
+            },
+        };
+        let out = host.on_event(&quit, &ctx);
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["NICK yournick"]));
+        // A vacated (old) nick from a NICK change is also a chance to grab it.
+        let renamed = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::NickChange {
+                old: "yournick".into(),
+                new: "somebody".into(),
+            },
+        };
+        let out = host.on_event(&renamed, &ctx);
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["NICK yournick"]));
+        // Someone else quitting does nothing.
+        let other = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Quit {
+                nick: "bob".into(),
+                reason: String::new(),
+            },
+        };
+        assert!(host.on_event(&other, &ctx).is_empty());
+    }
+
+    #[test]
+    fn responder_replies_to_a_trigger_phrase() {
+        let src = find("responder").unwrap().source;
+        let mut host = RhaiHost::from_sources(&[("responder.rhai", src)], &[]);
+        let ctx = AddonCtx {
+            my_nick: "me",
+            network: "libera",
+            presence: &EMPTY_PRESENCE,
+        };
+        let msg = |from_self: bool, text: &str| AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Message {
+                target: "#norn".into(),
+                nick: "bob".into(),
+                text: text.into(),
+                notice: false,
+                highlight: false,
+                from_self,
+            },
+        };
+        // A matching phrase (case-insensitive) gets the mapped reply.
+        let out = host.on_event(&msg(false, "hey !HELLO everyone"), &ctx);
+        assert!(matches!(&out[0], Reaction::Send { lines, .. }
+            if lines == &["PRIVMSG #norn :hi there!"]));
+        // Non-matching text -> nothing.
+        assert!(host.on_event(&msg(false, "just chatting"), &ctx).is_empty());
+        // Our own messages are ignored (no feedback loops).
+        assert!(host.on_event(&msg(true, "!hello"), &ctx).is_empty());
+    }
 }

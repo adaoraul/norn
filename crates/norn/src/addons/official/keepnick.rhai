@@ -7,12 +7,14 @@ const VERSION = "1.0";
 
 const WANT = "yournick";
 
-// Grab WANT if the freed nick is it and we are not already using it.
-fn grab(freed) {
-    if freed == WANT && nick() != WANT {
-        raw(`NICK ${WANT}`);
+// Grab `want` if the freed nick is it and we are not already using it.
+// Note: a top-level `const` is readable inside hook functions, but NOT inside
+// helper functions they call, so the hook reads WANT and passes it in.
+fn grab(freed, want) {
+    if freed == want && nick() != want {
+        raw(`NICK ${want}`);
     }
 }
 
-fn on_quit(m) { grab(m.nick); }       // someone quit
-fn on_nick(m) { grab(m.nick); }       // m.nick is the vacated (old) nick
+fn on_quit(m) { grab(m.nick, WANT); }       // someone quit
+fn on_nick(m) { grab(m.nick, WANT); }       // m.nick is the vacated (old) nick

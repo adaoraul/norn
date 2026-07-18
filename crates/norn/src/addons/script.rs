@@ -309,6 +309,11 @@ impl AddonHost for RhaiHost {
             // Namespace the KV store to the plugin about to run.
             self.state.borrow_mut().current_script = stem(&script.label);
             let mut scope = Scope::new();
+            // Push the script's top-level consts (and the `store` handle) so the
+            // hook can read them. NOTE: Rhai scope constants reach only the entry
+            // hook, not helper functions it calls (nested script fns get a fresh
+            // frame). So a plugin must read a `const` in its hook and pass the
+            // value into any helper as an argument (see keepnick.rhai).
             for (name, value) in &script.consts {
                 scope.push_constant(name.as_str(), value.clone());
             }
