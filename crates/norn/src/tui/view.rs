@@ -648,14 +648,13 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let rows = crate::input::help_rows(&app.help.query);
     // search line + rule + list + footer.
     let list_h = (inner.height as usize).saturating_sub(3);
-    let scroll = app.help.scroll.min(rows.len().saturating_sub(1));
 
     let query = if app.help.query.is_empty() {
         Span::styled("(type to filter)", Style::default().fg(theme::DIM2))
     } else {
         Span::styled(app.help.query.clone(), Style::default().fg(theme::BRIGHT))
     };
-    let mut lines = vec![
+    let mut header = vec![
         Line::from(vec![
             Span::styled("search: ", Style::default().fg(theme::DIM2)),
             query,
@@ -666,34 +665,64 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         )),
     ];
 
-    // Align descriptions into a second column after the usage sketch.
+    // Render every row into `body`, tracking which body line the selected
+    // command lands on so the window can center on it.
     const USAGE_COL: usize = 26;
-    if rows.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  no commands match",
-            Style::default().fg(theme::DIM2),
-        )));
-    }
-    for row in rows.iter().skip(scroll).take(list_h) {
+    let mut body: Vec<Line> = Vec::new();
+    let mut cmd_ordinal = 0usize;
+    let mut sel_line = 0usize;
+    for row in &rows {
         match row {
-            HelpRow::Header(category) => lines.push(Line::from(Span::styled(
-                category.to_uppercase(),
+            HelpRow::Header(category) => body.push(Line::from(Span::styled(
+                format!(" {}", category.to_uppercase()),
                 Style::default().fg(theme::GOLD),
             ))),
             HelpRow::Command(info) => {
+                let selected = cmd_ordinal == app.help.sel;
+                if selected {
+                    sel_line = body.len();
+                }
+                cmd_ordinal += 1;
                 let usage = truncate(info.usage, USAGE_COL);
                 let pad = " ".repeat(USAGE_COL.saturating_sub(usage.width()));
-                let help = truncate(info.help, width.saturating_sub(USAGE_COL + 2));
-                lines.push(Line::from(vec![
+                let help = truncate(info.help, width.saturating_sub(USAGE_COL + 3));
+                let bg = if selected {
+                    theme::ACTIVE_BG
+                } else {
+                    theme::PANEL
+                };
+                let bar = if selected { "▎" } else { " " };
+                let name_fg = if selected {
+                    theme::BRIGHT
+                } else {
+                    theme::BRIGHT2
+                };
+                body.push(Line::from(vec![
+                    Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
                     Span::styled(
-                        format!("  {usage}{pad}"),
-                        Style::default().fg(theme::BRIGHT2),
+                        format!(" {usage}{pad}"),
+                        Style::default().fg(name_fg).bg(bg),
                     ),
-                    Span::styled(help, Style::default().fg(theme::DIM)),
+                    Span::styled(help, Style::default().fg(theme::DIM).bg(bg)),
                 ]));
             }
         }
     }
+    if body.is_empty() {
+        body.push(Line::from(Span::styled(
+            "  no commands match",
+            Style::default().fg(theme::DIM2),
+        )));
+    }
+
+    // Scroll so the selected line stays centered-ish and in view.
+    let scroll = if body.len() <= list_h {
+        0
+    } else {
+        sel_line.saturating_sub(list_h / 2).min(body.len() - list_h)
+    };
+    let mut lines = std::mem::take(&mut header);
+    lines.extend(body.iter().skip(scroll).take(list_h).cloned());
     f.render_widget(Paragraph::new(lines), inner);
 
     // Footer hint pinned to the last inner row.
@@ -703,11 +732,11 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         width: inner.width,
         height: 1,
     };
-    let remaining = rows.len().saturating_sub(scroll + list_h);
+    let remaining = body.len().saturating_sub(scroll + list_h);
     let hint = if remaining > 0 {
-        format!("↑↓ scroll · {remaining} more below · Esc to close")
+        format!("↑↓ select · Enter inserts · {remaining} more · Esc closes")
     } else {
-        "↑↓ scroll · Esc to close".to_string()
+        "↑↓ select · Enter inserts · Esc closes".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -867,7 +896,7 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("norn help"));
         assert!(text.contains("/join"));
-        assert!(text.contains("Esc to close"));
+        assert!(text.contains("Enter inserts"));
     }
 
     fn chat(target: &str, from: &str, text: &str) -> irc_engine::ChatMessage {

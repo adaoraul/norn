@@ -200,13 +200,14 @@ pub enum Mode {
     Help,
 }
 
-/// State of the `/help` panel overlay: a live filter and a scroll offset.
+/// State of the `/help` picker overlay: a live filter and the selected command
+/// index (into the filtered command list).
 #[derive(Debug, Clone, Default)]
 pub struct HelpState {
     /// The filter query (matched against name/usage/description).
     pub query: String,
-    /// First visible row.
-    pub scroll: usize,
+    /// Index of the highlighted command among the current matches.
+    pub sel: usize,
 }
 
 /// Buffer-switcher overlay state.
@@ -682,12 +683,12 @@ impl App {
         self.switch_to(idx);
     }
 
-    /// Open the `/help` panel, optionally pre-filtered by `query`.
+    /// Open the `/help` picker, optionally pre-filtered by `query`.
     pub fn open_help(&mut self, query: &str) {
         self.mode = Mode::Help;
         self.help = HelpState {
             query: query.trim().to_string(),
-            scroll: 0,
+            sel: 0,
         };
         self.dirty = true;
     }

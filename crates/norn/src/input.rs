@@ -115,6 +115,18 @@ pub fn help_rows(query: &str) -> Vec<HelpRow> {
     rows
 }
 
+/// The commands matching `query`, flat (no headers), in display order. This is
+/// the selectable list for the `/help` picker.
+pub fn help_commands(query: &str) -> Vec<&'static CommandInfo> {
+    help_rows(query)
+        .into_iter()
+        .filter_map(|row| match row {
+            HelpRow::Command(info) => Some(info),
+            HelpRow::Header(_) => None,
+        })
+        .collect()
+}
+
 /// Translate one input line for the given current target.
 pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
     let input = input.trim();

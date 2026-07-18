@@ -167,28 +167,35 @@ fn handle_switcher(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Keys for the `/help` panel: type to filter, arrows/page to scroll, Esc/Enter
-/// to close.
+/// Keys for the `/help` picker: type to filter, arrows/page to move the
+/// selection, Enter to insert the selected command into the input, Esc to close.
 fn handle_help(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Enter => app.mode = Mode::Normal,
-        KeyCode::Up => app.help.scroll = app.help.scroll.saturating_sub(1),
-        KeyCode::Down => app.help.scroll += 1,
-        KeyCode::PageUp => app.help.scroll = app.help.scroll.saturating_sub(10),
-        KeyCode::PageDown => app.help.scroll += 10,
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Enter => {
+            if let Some(info) = crate::input::help_commands(&app.help.query).get(app.help.sel) {
+                app.input = format!("/{} ", info.name);
+                app.cursor = app.input.len();
+            }
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Up => app.help.sel = app.help.sel.saturating_sub(1),
+        KeyCode::Down => app.help.sel += 1,
+        KeyCode::PageUp => app.help.sel = app.help.sel.saturating_sub(10),
+        KeyCode::PageDown => app.help.sel += 10,
         KeyCode::Backspace => {
             app.help.query.pop();
-            app.help.scroll = 0;
+            app.help.sel = 0;
         }
         KeyCode::Char(c) => {
             app.help.query.push(c);
-            app.help.scroll = 0;
+            app.help.sel = 0;
         }
         _ => {}
     }
-    // Clamp scroll so it can never run past the last row.
-    let rows = crate::input::help_rows(&app.help.query).len();
-    app.help.scroll = app.help.scroll.min(rows.saturating_sub(1));
+    // Clamp the selection to the current match count.
+    let n = crate::input::help_commands(&app.help.query).len();
+    app.help.sel = app.help.sel.min(n.saturating_sub(1));
 }
 
 /// Buffer indices matching the switcher query.
@@ -1270,22 +1277,36 @@ mod tests {
     fn help_opens_filters_and_closes() {
         use crate::tui::state::Mode;
         let mut app = app_with_channel();
-        // /help with an argument opens the panel pre-filtered.
+        // /help with an argument opens the picker pre-filtered.
         run_line(&mut app, "/help net");
         assert_eq!(app.mode, Mode::Help);
         assert_eq!(app.help.query, "net");
-        // Typing extends the filter and resets scroll.
+        // Typing extends the filter and resets the selection.
         handle_key(&mut app, key(KeyCode::Char('w')));
         assert_eq!(app.help.query, "netw");
-        // Down scrolls; clamped so it never runs past the last row.
+        // Down moves the selection; clamped so it never exceeds the matches.
         for _ in 0..100 {
             handle_key(&mut app, key(KeyCode::Down));
         }
-        let rows = crate::input::help_rows(&app.help.query).len();
-        assert!(app.help.scroll < rows.max(1));
-        // Esc closes.
+        let n = crate::input::help_commands(&app.help.query).len();
+        assert!(app.help.sel < n.max(1));
+        // Esc closes without inserting.
         handle_key(&mut app, key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Normal);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn help_picker_enter_inserts_selected_command() {
+        use crate::tui::state::Mode;
+        let mut app = app_with_channel();
+        // Filter to a single command, then Enter inserts it into the input.
+        run_line(&mut app, "/help whois");
+        assert_eq!(crate::input::help_commands(&app.help.query).len(), 1);
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.input, "/whois ");
+        assert_eq!(app.cursor, app.input.len());
     }
 
     #[test]
