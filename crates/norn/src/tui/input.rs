@@ -42,6 +42,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<String> {
         KeyCode::Right => move_right(app),
         KeyCode::Home => app.cursor = 0,
         KeyCode::End => app.cursor = app.input.len(),
+        KeyCode::Up => app.history_prev(),
+        KeyCode::Down => app.history_next(),
         KeyCode::PageUp => scroll(app, 1),
         KeyCode::PageDown => scroll(app, -1),
         KeyCode::Char(c) if !ctrl && !alt => {
@@ -124,6 +126,33 @@ fn submit(app: &mut App) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
     }
+    app.remember_input(&text);
+
+    // TUI-local commands that open/close buffers.
+    if let Some(rest) = text.strip_prefix('/') {
+        let mut it = rest.splitn(2, ' ');
+        let cmd = it.next().unwrap_or("").to_ascii_lowercase();
+        let arg = it.next().unwrap_or("").trim();
+        match cmd.as_str() {
+            "query" | "q" => {
+                match arg.split_whitespace().next() {
+                    Some(nick) => {
+                        let net = app.active_buffer().net;
+                        app.open_query(net, nick);
+                    }
+                    None => app.push_active_event("usage: /query <nick>".to_string()),
+                }
+                return Vec::new();
+            }
+            "close" | "wc" => {
+                return match app.close_active() {
+                    Some(channel) => vec![format!("PART {channel}")],
+                    None => Vec::new(),
+                };
+            }
+            _ => {}
+        }
+    }
 
     let buffer = app.active_buffer();
     let target = match buffer.kind {
@@ -132,15 +161,20 @@ fn submit(app: &mut App) -> Vec<String> {
     };
     // Plain text needs a target; a server buffer only takes commands.
     if target.is_none() && !text.starts_with('/') {
+        app.push_active_event("no target here; join a channel or /query <nick>".to_string());
         return Vec::new();
     }
+
     let mut current = target;
-    let (lines, is_quit) = crate::input::translate(&text, &mut current);
-    if is_quit {
+    let result = crate::input::translate(&text, &mut current);
+    if let Some(feedback) = result.feedback {
+        app.push_active_event(feedback);
+    }
+    if result.quit {
         app.should_quit = true;
         return Vec::new();
     }
-    lines
+    result.lines
 }
 
 fn complete(app: &mut App) {
@@ -313,5 +347,47 @@ mod tests {
         assert!(app.nicklist_visible);
         handle_key(&mut app, key(KeyCode::F(9)));
         assert!(!app.nicklist_visible);
+    }
+
+    #[test]
+    fn unknown_command_shows_feedback_in_buffer_and_sends_nothing() {
+        let mut app = app_with_channel();
+        for c in "/nope".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        let out = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(out.is_empty(), "nothing is sent to the server");
+        let has_feedback = app.active_buffer().lines.iter().any(
+            |l| matches!(l, crate::tui::state::Line::Event(t) if t.contains("unknown command")),
+        );
+        assert!(has_feedback, "feedback shows in the active buffer");
+    }
+
+    #[test]
+    fn up_arrow_recalls_history() {
+        let mut app = app_with_channel();
+        for c in "hello".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.input.is_empty());
+        handle_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.input, "hello");
+        handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.input, ""); // back to the (empty) draft
+    }
+
+    #[test]
+    fn query_command_opens_a_query_buffer() {
+        let mut app = app_with_channel();
+        for c in "/query bob".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.active_buffer().name, "bob");
+        assert_eq!(
+            app.active_buffer().kind,
+            crate::tui::state::BufferKind::Query
+        );
     }
 }

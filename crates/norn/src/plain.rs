@@ -35,8 +35,11 @@ pub async fn run(
             line = stdin.next_line(), if stdin_open => {
                 match line {
                     Ok(Some(line)) => {
-                        let (lines, is_quit) = crate::input::translate(&line, &mut current_target);
-                        if is_quit {
+                        let result = crate::input::translate(&line, &mut current_target);
+                        if let Some(feedback) = result.feedback {
+                            println!("-- {feedback}");
+                        }
+                        if result.quit {
                             quit.store(true, Ordering::SeqCst);
                             for tx in &cmd_txs {
                                 let _ = tx.send(NetCommand::Quit(Some("norn".to_string())));
@@ -44,7 +47,7 @@ pub async fn run(
                             break;
                         }
                         if let Some(tx) = cmd_txs.first() {
-                            for line in lines {
+                            for line in result.lines {
                                 let _ = tx.send(NetCommand::Raw(line));
                             }
                         }

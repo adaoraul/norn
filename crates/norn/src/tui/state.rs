@@ -151,6 +151,12 @@ pub struct App {
     pub timestamps: bool,
     /// Accent color.
     pub accent: Color,
+    /// Previously submitted input lines (for recall).
+    pub history: Vec<String>,
+    /// Position while navigating history (`None` = at the live draft).
+    pub history_pos: Option<usize>,
+    /// The in-progress input saved when navigating history.
+    pub draft: String,
     /// Set when a redraw is needed.
     pub dirty: bool,
     /// Set when the app should exit.
@@ -177,6 +183,9 @@ impl App {
             nicklist_visible: true,
             timestamps,
             accent,
+            history: Vec::new(),
+            history_pos: None,
+            draft: String::new(),
             dirty: true,
             should_quit: false,
         }
@@ -410,6 +419,79 @@ impl App {
             self.buffers[index].scroll = 0;
             self.dirty = true;
         }
+    }
+
+    /// Push a local feedback/status line into the active buffer.
+    pub fn push_active_event(&mut self, text: String) {
+        let idx = self.active;
+        self.buffers[idx].push(Line::Event(text));
+        self.dirty = true;
+    }
+
+    /// Open (or focus) a query buffer with `nick` on `net`.
+    pub fn open_query(&mut self, net: NetworkId, nick: &str) {
+        let idx = self.ensure_buffer(net, nick, BufferKind::Query);
+        self.switch_to(idx);
+    }
+
+    /// Close the active buffer (unless it is a server buffer). Returns the
+    /// channel name if a channel was closed (so the caller can PART it).
+    pub fn close_active(&mut self) -> Option<String> {
+        if self.active_buffer().kind == BufferKind::Server {
+            return None;
+        }
+        let buffer = self.buffers.remove(self.active);
+        if self.active >= self.buffers.len() {
+            self.active = self.buffers.len().saturating_sub(1);
+        }
+        self.dirty = true;
+        (buffer.kind == BufferKind::Channel).then_some(buffer.name)
+    }
+
+    /// Record a submitted input line for history recall.
+    pub fn remember_input(&mut self, line: &str) {
+        self.history_pos = None;
+        if line.is_empty() {
+            return;
+        }
+        if self.history.last().map(String::as_str) != Some(line) {
+            self.history.push(line.to_string());
+        }
+    }
+
+    /// Recall the previous history entry into the input.
+    pub fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let pos = match self.history_pos {
+            None => {
+                self.draft = self.input.clone();
+                self.history.len() - 1
+            }
+            Some(p) => p.saturating_sub(1),
+        };
+        self.history_pos = Some(pos);
+        self.input = self.history[pos].clone();
+        self.cursor = self.input.len();
+        self.dirty = true;
+    }
+
+    /// Recall the next history entry (or restore the draft) into the input.
+    pub fn history_next(&mut self) {
+        match self.history_pos {
+            Some(p) if p + 1 < self.history.len() => {
+                self.history_pos = Some(p + 1);
+                self.input = self.history[p + 1].clone();
+            }
+            Some(_) => {
+                self.history_pos = None;
+                self.input = std::mem::take(&mut self.draft);
+            }
+            None => return,
+        }
+        self.cursor = self.input.len();
+        self.dirty = true;
     }
 }
 
