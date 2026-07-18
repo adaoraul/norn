@@ -598,6 +598,7 @@ const STRUCTURAL: &[&str] = &[
     "alias",
     "unalias",
     "trigger",
+    "addons",
 ];
 
 /// Max alias-expansion recursion depth (guards cyclic aliases).
@@ -695,6 +696,10 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
             }
             "trigger" => {
                 handle_trigger(app, arg);
+                return Vec::new();
+            }
+            "addons" => {
+                handle_addons(app, arg);
                 return Vec::new();
             }
             "help" | "h" => {
@@ -858,6 +863,34 @@ fn handle_trigger(app: &mut App, arg: &str) {
             ));
         }
         other => app.push_active_event(format!("usage: /trigger ls|add|rm (got '{other}')")),
+    }
+}
+
+/// `/addons` - list loaded addon scripts (and load errors), or reload them.
+fn handle_addons(app: &mut App, arg: &str) {
+    let sub = arg
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match sub.as_str() {
+        "" | "ls" | "list" => {
+            let mut lines = vec!["addons:".to_string()];
+            if app.addon_loaded.is_empty() && app.addon_errors.is_empty() {
+                lines.push("  (no scripts; put *.rhai in the addons dir)".to_string());
+            }
+            lines.extend(app.addon_loaded.iter().map(|l| format!("  {l}")));
+            lines.extend(app.addon_errors.iter().map(|e| format!("  error: {e}")));
+            for line in lines {
+                app.push_console(line);
+            }
+            app.switch_to_console();
+        }
+        "reload" => {
+            app.actions.push(AppAction::ReloadAddons);
+            app.push_active_event("reloading addons...".to_string());
+        }
+        other => app.push_active_event(format!("usage: /addons ls|reload (got '{other}')")),
     }
 }
 
@@ -2132,6 +2165,28 @@ mod tests {
         // Out-of-range removal is a no-op with feedback.
         run_line(&mut app, "/trigger rm 5");
         assert!(app.triggers.is_empty());
+    }
+
+    #[test]
+    fn addons_reload_queues_reload_and_ls_lists() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/addons reload");
+        assert!(app.actions.contains(&AppAction::ReloadAddons));
+        // ls with nothing loaded shows a hint in the console.
+        app.addon_loaded = vec!["greet.rhai (on_message)".to_string()];
+        run_line(&mut app, "/addons ls");
+        assert_eq!(app.active_buffer().kind, BufferKind::Status);
+        let text: String = app
+            .active_buffer()
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                crate::tui::state::Line::Event { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("greet.rhai"));
     }
 
     #[test]

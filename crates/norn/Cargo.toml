@@ -16,6 +16,7 @@ rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "5"
+rhai = "1.24"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 unicode-width = "0.2"

@@ -200,6 +200,23 @@ add a #channel filter). Templates use $nick, $chan, $msg, $me, chain with ;, and
     },
 ];
 
+const ADDONS_SUBS: &[SubDoc] = &[
+    SubDoc {
+        name: "ls",
+        usage: "/addons ls",
+        desc: "List loaded addon scripts and any load errors.",
+        params: &[],
+        examples: &["/addons ls"],
+    },
+    SubDoc {
+        name: "reload",
+        usage: "/addons reload",
+        desc: "Recompile the addon scripts and rebuild the live addon host.",
+        params: &[],
+        examples: &["/addons reload"],
+    },
+];
+
 const SET_SUBS: &[SubDoc] = &[
     SubDoc {
         name: "timestamps",
@@ -543,6 +560,20 @@ applied live. See `/trigger add` for the event and template grammar.",
         params: &[],
         subcommands: TRIGGER_SUBS,
         examples: &["/trigger ls", "/trigger add highlight = notify $nick: $msg"],
+    },
+    CommandDoc {
+        name: "addons",
+        category: "Client",
+        usage: "/addons ls|reload",
+        summary: "List or reload addon scripts",
+        description: "List loaded Rhai addon scripts (and any load errors), or \
+reload them after editing. Scripts live in the `addons` folder next to the config \
+file and define event hooks (on_message, on_join, ...) that call reply/send/\
+notify/nick.",
+        aliases: &[],
+        params: &[],
+        subcommands: ADDONS_SUBS,
+        examples: &["/addons ls", "/addons reload"],
     },
     CommandDoc {
         name: "unalias",

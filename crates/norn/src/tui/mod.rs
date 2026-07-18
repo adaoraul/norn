@@ -10,7 +10,7 @@ pub mod theme;
 pub mod view;
 
 use std::io::{self, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use crate::addons::{AddonCtx, AddonEvent, AddonHost, Reaction, Triggers};
+use crate::addons::{build_addon_host, AddonCtx, AddonEvent, AddonHost, Reaction};
 use crate::config::{ClientConfig, NetworkConfig, TriggerConfig};
 use crate::session::{NetCommand, UiEvent, UiEventKind};
 use state::{App, AppAction, NetworkMeta};
@@ -99,9 +99,21 @@ pub async fn run(
     let mut cmd_txs = cmd_txs;
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new(networks, client, definitions, aliases, config_path);
-    // The addon host reacts to engine events; triggers are its first backend.
-    let mut host: Box<dyn AddonHost> = Box::new(Triggers::from_configs(&triggers));
+    // Addon scripts live next to the config file (`<config-dir>/addons`).
+    let addons_dir: Option<PathBuf> = app
+        .config_path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|d| d.join("addons"));
+    // The addon host reacts to engine events: declarative triggers plus scripts.
+    let report = build_addon_host(&triggers, addons_dir.as_deref());
+    let mut host = report.host;
     app.triggers = triggers;
+    for err in &report.errors {
+        app.push_console(format!("addon error: {err}"));
+    }
+    app.addon_loaded = report.loaded;
+    app.addon_errors = report.errors;
     let mut term_events = EventStream::new();
 
     loop {
@@ -140,7 +152,14 @@ pub async fn run(
         }
 
         // Execute any control-plane actions the input handlers queued.
-        drain_actions(&mut app, &mut cmd_txs, &mut host, &ui_tx, &quit);
+        drain_actions(
+            &mut app,
+            &mut cmd_txs,
+            &mut host,
+            addons_dir.as_deref(),
+            &ui_tx,
+            &quit,
+        );
 
         // Ring the terminal bell if a highlight arrived and beeping is enabled.
         if app.bell {
@@ -210,13 +229,20 @@ fn drain_actions(
     app: &mut App,
     cmd_txs: &mut Vec<mpsc::UnboundedSender<NetCommand>>,
     host: &mut Box<dyn AddonHost>,
+    addons_dir: Option<&Path>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     quit: &Arc<AtomicBool>,
 ) {
     for action in std::mem::take(&mut app.actions) {
         match action {
             AppAction::ReloadAddons => {
-                *host = Box::new(Triggers::from_configs(&app.triggers));
+                let report = build_addon_host(&app.triggers, addons_dir);
+                *host = report.host;
+                for err in &report.errors {
+                    app.push_console(format!("addon error: {err}"));
+                }
+                app.addon_loaded = report.loaded;
+                app.addon_errors = report.errors;
             }
             AppAction::AddNetwork { id, config } => match config.resolve() {
                 Ok(settings) => {

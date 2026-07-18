@@ -1,164 +1,10 @@
-//! Addons: react to engine events with commands.
-//!
-//! Phase 1 is declarative triggers loaded from config (`[[trigger]]`). Everything
-//! is expressed through the [`AddonHost`] trait so a scripting backend (Rhai) can
-//! later plug in behind the same boundary. Backends are pure: they map an
-//! [`AddonEvent`] to [`Reaction`]s and the supervisor enacts them, which keeps
-//! them unit-testable with no I/O.
-
-use irc_engine::{Event, LeaveReason, MessageKind};
+//! The declarative-trigger addon backend: config `[[trigger]]` rules that map an
+//! event match spec to a command template. Pure and unit-testable.
 
 use crate::config::TriggerConfig;
 use crate::session::NetworkId;
-use crate::tui::state::{ctcp_action, mentions, source_nick};
 
-/// A normalized, engine-decoupled view of an event addons can react to.
-pub struct AddonEvent {
-    /// The network the event came from.
-    pub net: NetworkId,
-    /// What happened.
-    pub kind: AddonEventKind,
-}
-
-/// The kinds of event a trigger (or later, a script hook) can match.
-pub enum AddonEventKind {
-    /// A channel or private message.
-    Message {
-        /// The message target (a channel, or our nick for a private message).
-        target: String,
-        /// The sender.
-        nick: String,
-        /// The message text (CTCP ACTION unwrapped).
-        text: String,
-        /// Whether it was a NOTICE.
-        notice: bool,
-        /// Whether it mentions our nick (and is not from us).
-        highlight: bool,
-        /// Whether we sent it (guards feedback loops).
-        from_self: bool,
-    },
-    /// Someone joined a channel.
-    Join {
-        /// The channel.
-        channel: String,
-        /// Who joined.
-        nick: String,
-    },
-    /// Someone parted a channel.
-    Part {
-        /// The channel.
-        channel: String,
-        /// Who left.
-        nick: String,
-        /// The part reason.
-        reason: String,
-    },
-    /// Someone quit the network.
-    Quit {
-        /// Who quit.
-        nick: String,
-        /// The quit reason.
-        reason: String,
-    },
-    /// Someone changed nick.
-    NickChange {
-        /// Previous nick.
-        old: String,
-        /// New nick.
-        new: String,
-    },
-}
-
-impl AddonEvent {
-    /// Normalize an engine [`Event`] into an [`AddonEvent`], or `None` for events
-    /// addons do not react to. `my_nick` is used to fill `highlight`/`from_self`.
-    pub fn from_engine(event: &Event, net: NetworkId, my_nick: &str) -> Option<AddonEvent> {
-        let kind = match event {
-            Event::MessageReceived(msg) => {
-                let nick = msg
-                    .sender
-                    .as_ref()
-                    .map(source_nick)
-                    .unwrap_or("")
-                    .to_string();
-                // Unwrap a CTCP ACTION to its inner text (the `/me` flag itself is
-                // not yet matched on).
-                let text = ctcp_action(&msg.text)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| msg.text.clone());
-                let from_self = nick.eq_ignore_ascii_case(my_nick);
-                AddonEventKind::Message {
-                    target: msg.target.clone(),
-                    highlight: !from_self && mentions(&text, my_nick),
-                    nick,
-                    text,
-                    notice: msg.kind == MessageKind::Notice,
-                    from_self,
-                }
-            }
-            Event::MemberJoined { target, who, .. } => AddonEventKind::Join {
-                channel: target.clone(),
-                nick: who.nick.clone(),
-            },
-            Event::MemberLeft {
-                target,
-                who,
-                reason,
-            } => match reason {
-                LeaveReason::Part(r) => AddonEventKind::Part {
-                    channel: target.clone(),
-                    nick: who.nick.clone(),
-                    reason: r.clone(),
-                },
-                LeaveReason::Quit(r) => AddonEventKind::Quit {
-                    nick: who.nick.clone(),
-                    reason: r.clone(),
-                },
-                // A kick is not a trigger kind for now.
-                LeaveReason::Kicked { .. } => return None,
-            },
-            Event::NickChanged { old, new } => AddonEventKind::NickChange {
-                old: old.clone(),
-                new: new.clone(),
-            },
-            _ => return None,
-        };
-        Some(AddonEvent { net, kind })
-    }
-}
-
-/// Read-only context passed to a host with each event.
-pub struct AddonCtx<'a> {
-    /// Our nick on the event's network.
-    pub my_nick: &'a str,
-    /// The event's network name.
-    pub network: &'a str,
-}
-
-/// What a host asks the supervisor to enact.
-pub enum Reaction {
-    /// Send raw IRC lines to a network.
-    Send {
-        /// The network to send on.
-        net: NetworkId,
-        /// The lines to send.
-        lines: Vec<String>,
-    },
-    /// Show a local notification (a console line plus the terminal bell).
-    Notify {
-        /// The originating network.
-        net: NetworkId,
-        /// The text to show.
-        text: String,
-    },
-}
-
-/// A source of reactions to engine events. Implemented by [`Triggers`] now and by
-/// a scripting backend later, behind this one boundary.
-pub trait AddonHost {
-    /// React to one normalized event.
-    fn on_event(&mut self, event: &AddonEvent, ctx: &AddonCtx) -> Vec<Reaction>;
-}
+use super::{AddonCtx, AddonEvent, AddonEventKind, AddonHost, Reaction};
 
 /// Which kind of event a trigger matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,6 +304,7 @@ fn substitute(seg: &str, vars: &[(&'static str, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::state::mentions;
 
     fn cfg(on: &str, run: &str) -> TriggerConfig {
         TriggerConfig {
@@ -482,7 +329,7 @@ mod tests {
         }
     }
 
-    fn ctx<'a>(my_nick: &'a str) -> AddonCtx<'a> {
+    fn ctx(my_nick: &str) -> AddonCtx<'_> {
         AddonCtx {
             my_nick,
             network: "libera",

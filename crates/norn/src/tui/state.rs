@@ -439,6 +439,10 @@ pub struct App {
     /// Declarative addon triggers (persisted; the live host is rebuilt from these
     /// when they change).
     pub triggers: Vec<TriggerConfig>,
+    /// Loaded addon-script summaries for `/addons` (runtime only).
+    pub addon_loaded: Vec<String>,
+    /// Addon-script load/compile errors for `/addons` (runtime only).
+    pub addon_errors: Vec<String>,
     /// Where to auto-save config (`None` if no config dir is available).
     pub config_path: Option<PathBuf>,
     /// Pending control-plane actions for the supervisor to execute.
@@ -502,6 +506,8 @@ impl App {
             definitions,
             aliases,
             triggers: Vec::new(),
+            addon_loaded: Vec::new(),
+            addon_errors: Vec::new(),
             config_path,
             actions: Vec::new(),
             history: Vec::new(),
