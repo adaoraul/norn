@@ -191,13 +191,7 @@ fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
         area,
     );
     let buffer = app.active_buffer();
-    let mut members = buffer.members.clone();
-    members.sort_by(|a, b| {
-        let ra = a.highest().map(|p| p.rank()).unwrap_or(u8::MAX);
-        let rb = b.highest().map(|p| p.rank()).unwrap_or(u8::MAX);
-        ra.cmp(&rb)
-            .then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
-    });
+    let members = buffer.sorted_members();
     let mut lines = vec![Line::from(Span::styled(
         format!("{} nicks", members.len()),
         Style::default().fg(theme::DIM2),

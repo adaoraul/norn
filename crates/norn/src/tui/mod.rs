@@ -13,7 +13,9 @@ use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -35,7 +37,7 @@ impl TerminalGuard {
     fn new() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        crossterm::execute!(stdout, EnterAlternateScreen)?;
+        crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(TerminalGuard { terminal })
     }
@@ -44,7 +46,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -54,7 +60,7 @@ fn install_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = io::stdout().flush();
         hook(info);
     }));
@@ -99,6 +105,10 @@ pub async fn run(
                         for line in lines {
                             let _ = cmd_txs[net].send(NetCommand::Raw(line));
                         }
+                    }
+                    Some(Ok(CrosstermEvent::Mouse(mouse))) => {
+                        let size = guard.terminal.size().unwrap_or_default();
+                        input::handle_mouse(&mut app, mouse, size.width, size.height);
                     }
                     Some(Ok(CrosstermEvent::Resize(_, _))) => app.dirty = true,
                     Some(Ok(_)) => {}

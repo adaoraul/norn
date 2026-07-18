@@ -1,8 +1,80 @@
 //! Key handling for the TUI: input editing, commands, completion, switcher.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::state::{App, BufferKind, Completion, Mode, Switcher};
+
+/// Width of the sidebar column.
+const SIDEBAR_W: u16 = 24;
+/// Width of the nicklist column.
+const NICKLIST_W: u16 = 18;
+
+/// Handle a mouse event: click the sidebar to switch buffers, click a nick to
+/// open a query, or scroll the message view.
+pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, height: u16) {
+    let main_h = height.saturating_sub(2); // activity + input rows
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if event.row >= main_h {
+                return;
+            }
+            if event.column < SIDEBAR_W {
+                if let Some(idx) = sidebar_buffer_at(app, event.row) {
+                    app.switch_to(idx);
+                }
+            } else if app.nicklist_visible
+                && app.active_buffer().kind == BufferKind::Channel
+                && event.column >= width.saturating_sub(NICKLIST_W)
+            {
+                if let Some(nick) = nicklist_nick_at(app, event.row) {
+                    let net = app.active_buffer().net;
+                    app.open_query(net, &nick);
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            scroll(app, 1);
+            app.dirty = true;
+        }
+        MouseEventKind::ScrollDown => {
+            scroll(app, -1);
+            app.dirty = true;
+        }
+        _ => {}
+    }
+}
+
+/// Which buffer index is at sidebar row `y` (matches `view::draw_sidebar`).
+fn sidebar_buffer_at(app: &App, y: u16) -> Option<usize> {
+    let mut row = 0u16;
+    for net_id in 0..app.networks.len() {
+        if row == y {
+            return None; // network header
+        }
+        row += 1;
+        for (idx, buffer) in app.buffers.iter().enumerate() {
+            if buffer.net != net_id {
+                continue;
+            }
+            if row == y {
+                return Some(idx);
+            }
+            row += 1;
+        }
+    }
+    None
+}
+
+/// Which nick is at nicklist row `y` (row 0 is the count header).
+fn nicklist_nick_at(app: &App, y: u16) -> Option<String> {
+    if y == 0 {
+        return None;
+    }
+    app.active_buffer()
+        .sorted_members()
+        .get((y - 1) as usize)
+        .map(|m| m.nick.clone())
+}
 
 /// Handle one key. Mutates `app` and returns raw lines to send to the active
 /// buffer's network (empty for local-only keys). Sets `app.should_quit` on quit.
@@ -389,5 +461,36 @@ mod tests {
             app.active_buffer().kind,
             crate::tui::state::BufferKind::Query
         );
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_sidebar_switches_buffer() {
+        // Sidebar rows: 0=header, 1=status(server), 2=#rust.
+        let mut app = app_with_channel();
+        let click = MouseEventKind::Down(MouseButton::Left);
+        handle_mouse(&mut app, mouse(click, 5, 1), 100, 24);
+        assert_eq!(app.active_buffer().kind, BufferKind::Server);
+        handle_mouse(&mut app, mouse(click, 5, 2), 100, 24);
+        assert_eq!(app.active_buffer().name, "#rust");
+    }
+
+    #[test]
+    fn clicking_a_nick_opens_a_query() {
+        // Nicklist rows: 0=header, 1=albert, 2=alice (sorted). Width 100 -> the
+        // nick column starts at 82.
+        let mut app = app_with_channel();
+        let click = MouseEventKind::Down(MouseButton::Left);
+        handle_mouse(&mut app, mouse(click, 90, 1), 100, 24);
+        assert_eq!(app.active_buffer().name, "albert");
+        assert_eq!(app.active_buffer().kind, BufferKind::Query);
     }
 }

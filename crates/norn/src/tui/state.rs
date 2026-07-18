@@ -96,6 +96,18 @@ impl Buffer {
             self.lines.drain(0..overflow);
         }
     }
+
+    /// Members sorted for display: by prefix rank, then nick.
+    pub fn sorted_members(&self) -> Vec<Member> {
+        let mut members = self.members.clone();
+        members.sort_by(|a, b| {
+            let ra = a.highest().map(|p| p.rank()).unwrap_or(u8::MAX);
+            let rb = b.highest().map(|p| p.rank()).unwrap_or(u8::MAX);
+            ra.cmp(&rb)
+                .then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
+        });
+        members
+    }
 }
 
 /// Current interaction mode.
