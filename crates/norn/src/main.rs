@@ -5,6 +5,7 @@
 //! event stream. The default UI is the ratatui TUI; `--plain` uses the line
 //! renderer instead.
 
+mod commands;
 mod config;
 mod input;
 mod plain;

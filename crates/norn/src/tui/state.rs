@@ -200,14 +200,28 @@ pub enum Mode {
     Help,
 }
 
-/// State of the `/help` picker overlay: a live filter and the selected command
-/// index (into the filtered command list).
+/// Which pane of the `/help` panel has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HelpFocus {
+    /// The command list (filtering and selection).
+    #[default]
+    List,
+    /// The detail pane (scrolling the selected command's docs).
+    Detail,
+}
+
+/// State of the `/help` panel: a filter, the selected command, which pane has
+/// focus, and the detail pane's scroll offset.
 #[derive(Debug, Clone, Default)]
 pub struct HelpState {
-    /// The filter query (matched against name/usage/description).
+    /// The filter query (matched against name/usage/summary).
     pub query: String,
     /// Index of the highlighted command among the current matches.
     pub sel: usize,
+    /// Which pane is focused.
+    pub focus: HelpFocus,
+    /// First visible line of the detail pane.
+    pub detail_scroll: usize,
 }
 
 /// Buffer-switcher overlay state.
@@ -683,12 +697,30 @@ impl App {
         self.switch_to(idx);
     }
 
-    /// Open the `/help` picker, optionally pre-filtered by `query`.
+    /// Open the `/help` panel. If `query` names a command exactly, open straight
+    /// to its detail; otherwise filter the list by `query`.
     pub fn open_help(&mut self, query: &str) {
+        let query = query.trim();
         self.mode = Mode::Help;
-        self.help = HelpState {
-            query: query.trim().to_string(),
-            sel: 0,
+        self.help = match crate::commands::find(query) {
+            Some(doc) => {
+                let sel = crate::commands::help_commands("")
+                    .iter()
+                    .position(|c| c.name == doc.name)
+                    .unwrap_or(0);
+                HelpState {
+                    query: String::new(),
+                    sel,
+                    focus: HelpFocus::Detail,
+                    detail_scroll: 0,
+                }
+            }
+            None => HelpState {
+                query: query.to_string(),
+                sel: 0,
+                focus: HelpFocus::List,
+                detail_scroll: 0,
+            },
         };
         self.dirty = true;
     }

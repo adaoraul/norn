@@ -617,12 +617,14 @@ fn draw_switcher(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inset(rect));
 }
 
-/// The `/help` panel: a bordered, searchable, scrollable command reference.
+/// The `/help` panel: a master-detail command reference. The left pane is a
+/// searchable, categorized command list; the right pane shows the selected
+/// command's full documentation. `→` focuses the detail to scroll it.
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
-    use crate::input::HelpRow;
+    use crate::tui::state::HelpFocus;
 
-    let w = 74.min(area.width.saturating_sub(4));
-    let h = 24.min(area.height.saturating_sub(2));
+    let w = 96.min(area.width.saturating_sub(2));
+    let h = 30.min(area.height.saturating_sub(2));
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
@@ -640,103 +642,54 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(theme::PANEL));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    if inner.height < 4 {
+    if inner.height < 4 || inner.width < 20 {
         return;
     }
-    let width = inner.width as usize;
 
-    let rows = crate::input::help_rows(&app.help.query);
-    // search line + rule + list + footer.
-    let list_h = (inner.height as usize).saturating_sub(3);
-
-    let query = if app.help.query.is_empty() {
-        Span::styled("(type to filter)", Style::default().fg(theme::DIM2))
-    } else {
-        Span::styled(app.help.query.clone(), Style::default().fg(theme::BRIGHT))
+    // Split: list | divider | detail. The detail takes the larger share.
+    let list_w = 28.min(inner.width / 2);
+    let list_rect = Rect {
+        width: list_w,
+        ..inner
     };
-    let mut header = vec![
-        Line::from(vec![
-            Span::styled("search: ", Style::default().fg(theme::DIM2)),
-            query,
-        ]),
-        Line::from(Span::styled(
-            "─".repeat(width),
-            Style::default().fg(theme::BORDER),
-        )),
-    ];
-
-    // Render every row into `body`, tracking which body line the selected
-    // command lands on so the window can center on it.
-    const USAGE_COL: usize = 26;
-    let mut body: Vec<Line> = Vec::new();
-    let mut cmd_ordinal = 0usize;
-    let mut sel_line = 0usize;
-    for row in &rows {
-        match row {
-            HelpRow::Header(category) => body.push(Line::from(Span::styled(
-                format!(" {}", category.to_uppercase()),
-                Style::default().fg(theme::GOLD),
-            ))),
-            HelpRow::Command(info) => {
-                let selected = cmd_ordinal == app.help.sel;
-                if selected {
-                    sel_line = body.len();
-                }
-                cmd_ordinal += 1;
-                let usage = truncate(info.usage, USAGE_COL);
-                let pad = " ".repeat(USAGE_COL.saturating_sub(usage.width()));
-                let help = truncate(info.help, width.saturating_sub(USAGE_COL + 3));
-                let bg = if selected {
-                    theme::ACTIVE_BG
-                } else {
-                    theme::PANEL
-                };
-                let bar = if selected { "▎" } else { " " };
-                let name_fg = if selected {
-                    theme::BRIGHT
-                } else {
-                    theme::BRIGHT2
-                };
-                body.push(Line::from(vec![
-                    Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
-                    Span::styled(
-                        format!(" {usage}{pad}"),
-                        Style::default().fg(name_fg).bg(bg),
-                    ),
-                    Span::styled(help, Style::default().fg(theme::DIM).bg(bg)),
-                ]));
-            }
-        }
-    }
-    if body.is_empty() {
-        body.push(Line::from(Span::styled(
-            "  no commands match",
-            Style::default().fg(theme::DIM2),
-        )));
-    }
-
-    // Scroll so the selected line stays centered-ish and in view.
-    let scroll = if body.len() <= list_h {
-        0
-    } else {
-        sel_line.saturating_sub(list_h / 2).min(body.len() - list_h)
+    let divider_x = inner.x + list_w;
+    let detail_rect = Rect {
+        x: divider_x + 1,
+        width: inner.width - list_w - 1,
+        ..inner
     };
-    let mut lines = std::mem::take(&mut header);
-    lines.extend(body.iter().skip(scroll).take(list_h).cloned());
-    f.render_widget(Paragraph::new(lines), inner);
 
-    // Footer hint pinned to the last inner row.
+    let selected = crate::commands::help_commands(&app.help.query)
+        .get(app.help.sel)
+        .copied();
+    let list_focused = app.help.focus == HelpFocus::List;
+
+    draw_help_list(f, list_rect, app, list_focused);
+    // Vertical divider.
+    for y in inner.y..inner.y + inner.height - 1 {
+        f.render_widget(
+            Paragraph::new(Span::styled("│", Style::default().fg(theme::BORDER))),
+            Rect {
+                x: divider_x,
+                y,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
+    draw_help_detail(f, detail_rect, app, selected, !list_focused);
+
+    // Footer hint spanning the full width.
     let footer = Rect {
         x: inner.x,
         y: inner.y + inner.height - 1,
         width: inner.width,
         height: 1,
     };
-    let remaining = body.len().saturating_sub(scroll + list_h);
-    let hint = if remaining > 0 {
-        format!("↑↓ select · Enter inserts · {remaining} more · Esc closes")
+    let hint = if list_focused {
+        "↓↑ select · → details · Enter inserts · Esc closes"
     } else {
-        "↑↓ select · Enter inserts · Esc closes".to_string()
+        "↓↑ scroll · ← back · Enter inserts · Esc closes"
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -746,6 +699,184 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(theme::PANEL)),
         footer,
     );
+}
+
+/// The left pane of `/help`: a filter line, a rule, and the categorized command
+/// list with the selection centered in view.
+fn draw_help_list(f: &mut Frame, area: Rect, app: &App, focused: bool) {
+    use crate::commands::HelpRow;
+    let width = area.width as usize;
+    let list_h = (area.height as usize).saturating_sub(3); // search + rule + footer
+
+    let query = if app.help.query.is_empty() {
+        Span::styled("filter…", Style::default().fg(theme::DIM2))
+    } else {
+        Span::styled(app.help.query.clone(), Style::default().fg(theme::BRIGHT))
+    };
+    let mut out = vec![
+        Line::from(vec![
+            Span::styled("/", Style::default().fg(theme::DIM2)),
+            query,
+        ]),
+        Line::from(Span::styled(
+            "─".repeat(width),
+            Style::default().fg(theme::BORDER),
+        )),
+    ];
+
+    let mut body: Vec<Line> = Vec::new();
+    let mut ordinal = 0usize;
+    let mut sel_line = 0usize;
+    for row in crate::commands::help_rows(&app.help.query) {
+        match row {
+            HelpRow::Header(category) => body.push(Line::from(Span::styled(
+                format!(" {}", category.to_uppercase()),
+                Style::default().fg(theme::GOLD),
+            ))),
+            HelpRow::Command(doc) => {
+                let is_sel = ordinal == app.help.sel;
+                if is_sel {
+                    sel_line = body.len();
+                }
+                ordinal += 1;
+                let bg = if is_sel && focused {
+                    theme::ACTIVE_BG
+                } else {
+                    theme::PANEL
+                };
+                let bar = if is_sel { "▎" } else { " " };
+                let fg = if is_sel {
+                    theme::BRIGHT
+                } else {
+                    theme::BRIGHT2
+                };
+                let name = truncate(doc.name, width.saturating_sub(2));
+                body.push(Line::from(vec![
+                    Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
+                    Span::styled(format!(" {name}"), Style::default().fg(fg).bg(bg)),
+                ]));
+            }
+        }
+    }
+    if body.is_empty() {
+        body.push(Line::from(Span::styled(
+            " no matches",
+            Style::default().fg(theme::DIM2),
+        )));
+    }
+    let scroll = if body.len() <= list_h {
+        0
+    } else {
+        sel_line.saturating_sub(list_h / 2).min(body.len() - list_h)
+    };
+    out.extend(body.into_iter().skip(scroll).take(list_h));
+    f.render_widget(Paragraph::new(out), area);
+}
+
+/// The right pane of `/help`: the selected command's full documentation,
+/// wrapped and scrolled by `app.help.detail_scroll`.
+fn draw_help_detail(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    doc: Option<&crate::commands::CommandDoc>,
+    focused: bool,
+) {
+    let width = area.width as usize;
+    let avail = (area.height as usize).saturating_sub(1); // leave the footer row
+    let Some(doc) = doc else {
+        return;
+    };
+    let lines = help_detail_lines(doc, width);
+    let max_scroll = lines.len().saturating_sub(avail);
+    let scroll = app.help.detail_scroll.min(max_scroll);
+    let shown: Vec<Line> = lines.into_iter().skip(scroll).take(avail).collect();
+    f.render_widget(Paragraph::new(shown), area);
+
+    // A faint "▸ scroll" affordance while the detail has focus and overflows.
+    if focused && max_scroll > 0 {
+        let tag = Rect {
+            x: area.x + area.width.saturating_sub(3),
+            y: area.y,
+            width: 3,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled("▾", Style::default().fg(theme::ACCENT))),
+            tag,
+        );
+    }
+}
+
+/// Build the wrapped detail lines for one command: usage, description,
+/// subcommands (with their params), options, and examples.
+fn help_detail_lines(doc: &crate::commands::CommandDoc, width: usize) -> Vec<Line<'static>> {
+    use crate::commands::ArgKind;
+    let mut out: Vec<Line> = Vec::new();
+    let plain =
+        |s: String, c: ratatui::style::Color| Line::from(Span::styled(s, Style::default().fg(c)));
+
+    out.push(plain(doc.usage.to_string(), theme::BRIGHT));
+    out.push(Line::from(""));
+    for l in wrap_text(doc.description, width) {
+        out.push(plain(l, theme::TEXT));
+    }
+
+    // A parameter row: `name  desc (required)`, indented and wrapped.
+    let param_lines = |out: &mut Vec<Line>, p: &crate::commands::ParamDoc, indent: usize| {
+        let key = if p.kind == ArgKind::OptionKey {
+            format!("{}=", p.name)
+        } else {
+            p.name.to_string()
+        };
+        let req = if p.required { " (required)" } else { "" };
+        let text = format!("{key}  {}{req}", p.desc);
+        for (i, l) in wrap_text(&text, width.saturating_sub(indent))
+            .into_iter()
+            .enumerate()
+        {
+            let pad = " ".repeat(if i == 0 { indent } else { indent + 2 });
+            out.push(plain(format!("{pad}{l}"), theme::DIM));
+        }
+    };
+
+    if !doc.subcommands.is_empty() {
+        out.push(Line::from(""));
+        out.push(plain("SUBCOMMANDS".to_string(), theme::GOLD));
+        for sub in doc.subcommands {
+            out.push(plain(format!("  {}", sub.usage), theme::BRIGHT2));
+            for l in wrap_text(sub.desc, width.saturating_sub(4)) {
+                out.push(plain(format!("    {l}"), theme::DIM));
+            }
+            for p in sub.params {
+                param_lines(&mut out, p, 6);
+            }
+            for ex in sub.examples {
+                for l in wrap_text(ex, width.saturating_sub(6)) {
+                    out.push(plain(format!("      {l}"), theme::DIM2));
+                }
+            }
+        }
+    }
+
+    if !doc.params.is_empty() {
+        out.push(Line::from(""));
+        out.push(plain("PARAMETERS".to_string(), theme::GOLD));
+        for p in doc.params {
+            param_lines(&mut out, p, 2);
+        }
+    }
+
+    if !doc.examples.is_empty() {
+        out.push(Line::from(""));
+        out.push(plain("EXAMPLES".to_string(), theme::GOLD));
+        for ex in doc.examples {
+            for l in wrap_text(ex, width.saturating_sub(2)) {
+                out.push(plain(format!("  {l}"), theme::ACCENT));
+            }
+        }
+    }
+    out
 }
 
 /// Shrink a rect by a one-cell horizontal inset.
@@ -888,14 +1019,18 @@ mod tests {
     }
 
     #[test]
-    fn help_panel_renders_commands() {
+    fn help_panel_renders_list_and_detail() {
         let mut app = one_net_app();
-        app.open_help("");
+        // Open straight to /network's detail so the pane shows subcommands.
+        app.open_help("network");
         let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("norn help"));
-        assert!(text.contains("/join"));
+        // Left list shows command names; right detail shows the subcommand + option.
+        assert!(text.contains("network"));
+        assert!(text.contains("SUBCOMMANDS"));
+        assert!(text.contains("host"));
         assert!(text.contains("Enter inserts"));
     }
 

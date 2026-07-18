@@ -167,34 +167,53 @@ fn handle_switcher(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Keys for the `/help` picker: type to filter, arrows/page to move the
-/// selection, Enter to insert the selected command into the input, Esc to close.
+/// Keys for the `/help` panel. In the list pane: type to filter, arrows move the
+/// selection, Right focuses the detail. In the detail pane: arrows scroll, Left
+/// returns. Enter inserts the selected command; Esc closes.
 fn handle_help(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Enter => {
-            if let Some(info) = crate::input::help_commands(&app.help.query).get(app.help.sel) {
-                app.input = format!("/{} ", info.name);
-                app.cursor = app.input.len();
+    use crate::tui::state::HelpFocus;
+    let insert_selected = |app: &mut App| {
+        if let Some(doc) = crate::commands::help_commands(&app.help.query).get(app.help.sel) {
+            app.input = format!("/{} ", doc.name);
+            app.cursor = app.input.len();
+        }
+        app.mode = Mode::Normal;
+    };
+    match app.help.focus {
+        HelpFocus::List => match key.code {
+            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Enter => insert_selected(app),
+            KeyCode::Right => {
+                app.help.focus = HelpFocus::Detail;
+                app.help.detail_scroll = 0;
             }
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Up => app.help.sel = app.help.sel.saturating_sub(1),
-        KeyCode::Down => app.help.sel += 1,
-        KeyCode::PageUp => app.help.sel = app.help.sel.saturating_sub(10),
-        KeyCode::PageDown => app.help.sel += 10,
-        KeyCode::Backspace => {
-            app.help.query.pop();
-            app.help.sel = 0;
-        }
-        KeyCode::Char(c) => {
-            app.help.query.push(c);
-            app.help.sel = 0;
-        }
-        _ => {}
+            KeyCode::Up => app.help.sel = app.help.sel.saturating_sub(1),
+            KeyCode::Down => app.help.sel += 1,
+            KeyCode::PageUp => app.help.sel = app.help.sel.saturating_sub(10),
+            KeyCode::PageDown => app.help.sel += 10,
+            KeyCode::Backspace => {
+                app.help.query.pop();
+                app.help.sel = 0;
+            }
+            KeyCode::Char(c) => {
+                app.help.query.push(c);
+                app.help.sel = 0;
+            }
+            _ => {}
+        },
+        HelpFocus::Detail => match key.code {
+            KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Enter => insert_selected(app),
+            KeyCode::Left | KeyCode::Backspace => app.help.focus = HelpFocus::List,
+            KeyCode::Up => app.help.detail_scroll = app.help.detail_scroll.saturating_sub(1),
+            KeyCode::Down => app.help.detail_scroll += 1,
+            KeyCode::PageUp => app.help.detail_scroll = app.help.detail_scroll.saturating_sub(5),
+            KeyCode::PageDown => app.help.detail_scroll += 5,
+            _ => {}
+        },
     }
     // Clamp the selection to the current match count.
-    let n = crate::input::help_commands(&app.help.query).len();
+    let n = crate::commands::help_commands(&app.help.query).len();
     app.help.sel = app.help.sel.min(n.saturating_sub(1));
 }
 
@@ -831,15 +850,17 @@ fn slash_completion(app: &App) -> Option<Completion> {
 
 /// All completable command names: built-ins plus the user's alias names.
 fn command_names(app: &App) -> Vec<String> {
-    crate::input::COMMAND_INFO
+    crate::commands::COMMANDS
         .iter()
         .map(|c| c.name.to_string())
         .chain(app.aliases.keys().cloned())
         .collect()
 }
 
-/// Candidates for the `token_idx`-th token of `cmd` (1 = first argument).
-/// `tokens` are the already-typed tokens (token 0 is the command).
+/// Candidates for the `token_idx`-th token of `cmd` (1 = first argument),
+/// resolved entirely from the command knowledge base. `tokens` are the
+/// already-typed tokens (token 0 is the command). Aliases resolve to their
+/// underlying command so their parameters complete too.
 fn arg_candidates(
     app: &App,
     cmd: &str,
@@ -857,120 +878,77 @@ fn arg_candidates(
             .to_ascii_lowercase(),
         None => cmd.to_string(),
     };
-    match effective.as_str() {
-        "network" | "net" => network_args(app, token_idx, tokens),
-        "connect" | "server" => (
-            if token_idx == 1 {
-                network_names(app)
-            } else {
-                Vec::new()
-            },
-            " ",
-        ),
-        "set" => set_args(token_idx, tokens),
-        "alias" | "unalias" => (
-            if token_idx == 1 {
-                app.aliases.keys().cloned().collect()
-            } else {
-                Vec::new()
-            },
-            " ",
-        ),
-        "help" | "h" => (
-            if token_idx == 1 {
-                crate::input::COMMAND_INFO
-                    .iter()
-                    .map(|c| c.name.to_string())
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            " ",
-        ),
-        "join" | "j" | "part" => (
-            if token_idx == 1 {
-                channel_names(app)
-            } else {
-                nick_names(app)
-            },
-            " ",
-        ),
-        "msg" | "m" | "query" | "q" | "notice" | "whois" | "kick" | "invite" | "mode" | "me" => {
-            (nick_names(app), " ")
+    let Some(doc) = crate::commands::find(&effective) else {
+        // Unknown command: offer nicks (mentions).
+        return (nick_names(app), " ");
+    };
+
+    if !doc.subcommands.is_empty() {
+        if token_idx == 1 {
+            return (
+                doc.subcommands.iter().map(|s| s.name.to_string()).collect(),
+                " ",
+            );
         }
-        // Unknown command or freeform argument: offer nicks (mentions).
-        _ => (nick_names(app), " "),
-    }
-}
-
-/// `/network` argument candidates: the subcommand, then names or `add` keys.
-fn network_args(app: &App, token_idx: usize, tokens: &[&str]) -> (Vec<String>, &'static str) {
-    if token_idx == 1 {
-        return (
-            ["ls", "add", "rm", "show"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            " ",
-        );
-    }
-    let sub = tokens
-        .get(1)
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    match sub.as_str() {
-        "rm" | "remove" | "del" | "show" if token_idx == 2 => (network_names(app), " "),
-        "add" => (
-            [
-                "host",
-                "port",
-                "tls",
-                "nick",
-                "user",
-                "realname",
-                "sasl_account",
-                "sasl_mech",
-                "password_command",
-                "join",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-            "=",
-        ),
-        _ => (Vec::new(), " "),
-    }
-}
-
-/// `/set` argument candidates: the key, then its allowed values.
-fn set_args(token_idx: usize, tokens: &[&str]) -> (Vec<String>, &'static str) {
-    if token_idx == 1 {
-        return (
-            ["timestamps", "nicklist", "theme"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            " ",
-        );
-    }
-    if token_idx == 2 {
-        let key = tokens
+        // Within the chosen subcommand's parameters.
+        let Some(sub) = tokens
             .get(1)
             .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        return match key.as_str() {
-            "timestamps" | "nicklist" => (vec!["on".to_string(), "off".to_string()], " "),
-            "theme" => (
-                crate::tui::theme::THEME_NAMES
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                " ",
-            ),
-            _ => (Vec::new(), " "),
+            .and_then(|name| doc.subcommands.iter().find(|s| s.name == name))
+        else {
+            return (Vec::new(), " ");
         };
+        return sub_param_candidates(app, sub, token_idx - 2);
     }
-    (Vec::new(), " ")
+
+    // No subcommands: positional parameters.
+    match doc.params.get(token_idx - 1) {
+        Some(param) => (kind_candidates(app, param.kind), suffix_for(param.kind)),
+        None => (Vec::new(), " "),
+    }
+}
+
+/// Candidates for the `param_idx`-th parameter of a subcommand. Repeatable
+/// `key=` options are offered at every position; positional params by index.
+fn sub_param_candidates(
+    app: &App,
+    sub: &crate::commands::SubDoc,
+    param_idx: usize,
+) -> (Vec<String>, &'static str) {
+    use crate::commands::ArgKind;
+    if !sub.params.is_empty() && sub.params.iter().all(|p| p.kind == ArgKind::OptionKey) {
+        return (sub.params.iter().map(|p| p.name.to_string()).collect(), "=");
+    }
+    match sub.params.get(param_idx) {
+        Some(param) => (kind_candidates(app, param.kind), suffix_for(param.kind)),
+        None => (Vec::new(), " "),
+    }
+}
+
+/// Resolve an `ArgKind` to its concrete completion candidates.
+fn kind_candidates(app: &App, kind: crate::commands::ArgKind) -> Vec<String> {
+    use crate::commands::ArgKind;
+    match kind {
+        ArgKind::Enum(values) => values.iter().map(|s| s.to_string()).collect(),
+        ArgKind::Nick => nick_names(app),
+        ArgKind::Channel => channel_names(app),
+        ArgKind::Network => network_names(app),
+        ArgKind::Command => crate::commands::COMMANDS
+            .iter()
+            .map(|c| c.name.to_string())
+            .collect(),
+        ArgKind::Alias => app.aliases.keys().cloned().collect(),
+        ArgKind::OptionKey => Vec::new(), // handled at the subcommand level
+        ArgKind::Free => nick_names(app), // freeform: offer nicks for mentions
+    }
+}
+
+/// The completion suffix for a value of this kind (`=` for option keys).
+fn suffix_for(kind: crate::commands::ArgKind) -> &'static str {
+    match kind {
+        crate::commands::ArgKind::OptionKey => "=",
+        _ => " ",
+    }
 }
 
 /// Defined and connected network names (for `/connect`, `/network rm|show`).
@@ -1510,20 +1488,22 @@ mod tests {
 
     #[test]
     fn help_opens_filters_and_closes() {
-        use crate::tui::state::Mode;
+        use crate::tui::state::{HelpFocus, Mode};
         let mut app = app_with_channel();
-        // /help with an argument opens the picker pre-filtered.
-        run_line(&mut app, "/help net");
+        // Bare /help opens the list pane.
+        run_line(&mut app, "/help");
         assert_eq!(app.mode, Mode::Help);
+        assert_eq!(app.help.focus, HelpFocus::List);
+        // Typing filters and resets the selection.
+        for c in "net".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
         assert_eq!(app.help.query, "net");
-        // Typing extends the filter and resets the selection.
-        handle_key(&mut app, key(KeyCode::Char('w')));
-        assert_eq!(app.help.query, "netw");
         // Down moves the selection; clamped so it never exceeds the matches.
         for _ in 0..100 {
             handle_key(&mut app, key(KeyCode::Down));
         }
-        let n = crate::input::help_commands(&app.help.query).len();
+        let n = crate::commands::help_commands(&app.help.query).len();
         assert!(app.help.sel < n.max(1));
         // Esc closes without inserting.
         handle_key(&mut app, key(KeyCode::Esc));
@@ -1532,16 +1512,35 @@ mod tests {
     }
 
     #[test]
-    fn help_picker_enter_inserts_selected_command() {
-        use crate::tui::state::Mode;
+    fn help_names_a_command_opens_its_detail() {
+        use crate::tui::state::{HelpFocus, Mode};
         let mut app = app_with_channel();
-        // Filter to a single command, then Enter inserts it into the input.
+        // /help <command> jumps straight to that command's detail.
         run_line(&mut app, "/help whois");
-        assert_eq!(crate::input::help_commands(&app.help.query).len(), 1);
+        assert_eq!(app.mode, Mode::Help);
+        assert_eq!(app.help.focus, HelpFocus::Detail);
+        let selected = crate::commands::help_commands(&app.help.query)[app.help.sel];
+        assert_eq!(selected.name, "whois");
+        // Enter inserts the selected command from either pane.
         handle_key(&mut app, key(KeyCode::Enter));
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.input, "/whois ");
         assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn help_right_focuses_detail_and_left_returns() {
+        use crate::tui::state::HelpFocus;
+        let mut app = app_with_channel();
+        run_line(&mut app, "/help");
+        assert_eq!(app.help.focus, HelpFocus::List);
+        handle_key(&mut app, key(KeyCode::Right));
+        assert_eq!(app.help.focus, HelpFocus::Detail);
+        // In detail, Down scrolls; Left returns to the list.
+        handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.help.detail_scroll, 1);
+        handle_key(&mut app, key(KeyCode::Left));
+        assert_eq!(app.help.focus, HelpFocus::List);
     }
 
     #[test]
