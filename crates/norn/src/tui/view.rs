@@ -59,6 +59,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if app.mode == Mode::Switcher {
         draw_switcher(f, area, app);
+    } else if app.mode == Mode::Help {
+        draw_help(f, area, app);
     } else if let Some(completion) = &app.completion {
         draw_completion(f, center[4], completion);
     }
@@ -615,6 +617,108 @@ fn draw_switcher(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inset(rect));
 }
 
+/// The `/help` panel: a bordered, searchable, scrollable command reference.
+fn draw_help(f: &mut Frame, area: Rect, app: &App) {
+    use crate::input::HelpRow;
+
+    let w = 74.min(area.width.saturating_sub(4));
+    let h = 24.min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::BORDER_BRIGHT))
+        .title(Span::styled(
+            " norn help ",
+            Style::default().fg(theme::BRIGHT),
+        ))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 4 {
+        return;
+    }
+    let width = inner.width as usize;
+
+    let rows = crate::input::help_rows(&app.help.query);
+    // search line + rule + list + footer.
+    let list_h = (inner.height as usize).saturating_sub(3);
+    let scroll = app.help.scroll.min(rows.len().saturating_sub(1));
+
+    let query = if app.help.query.is_empty() {
+        Span::styled("(type to filter)", Style::default().fg(theme::DIM2))
+    } else {
+        Span::styled(app.help.query.clone(), Style::default().fg(theme::BRIGHT))
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("search: ", Style::default().fg(theme::DIM2)),
+            query,
+        ]),
+        Line::from(Span::styled(
+            "─".repeat(width),
+            Style::default().fg(theme::BORDER),
+        )),
+    ];
+
+    // Align descriptions into a second column after the usage sketch.
+    const USAGE_COL: usize = 26;
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no commands match",
+            Style::default().fg(theme::DIM2),
+        )));
+    }
+    for row in rows.iter().skip(scroll).take(list_h) {
+        match row {
+            HelpRow::Header(category) => lines.push(Line::from(Span::styled(
+                category.to_uppercase(),
+                Style::default().fg(theme::GOLD),
+            ))),
+            HelpRow::Command(info) => {
+                let usage = truncate(info.usage, USAGE_COL);
+                let pad = " ".repeat(USAGE_COL.saturating_sub(usage.width()));
+                let help = truncate(info.help, width.saturating_sub(USAGE_COL + 2));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {usage}{pad}"),
+                        Style::default().fg(theme::BRIGHT2),
+                    ),
+                    Span::styled(help, Style::default().fg(theme::DIM)),
+                ]));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+
+    // Footer hint pinned to the last inner row.
+    let footer = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - 1,
+        width: inner.width,
+        height: 1,
+    };
+    let remaining = rows.len().saturating_sub(scroll + list_h);
+    let hint = if remaining > 0 {
+        format!("↑↓ scroll · {remaining} more below · Esc to close")
+    } else {
+        "↑↓ scroll · Esc to close".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme::DIM2),
+        )))
+        .style(Style::default().bg(theme::PANEL)),
+        footer,
+    );
+}
+
 /// Shrink a rect by a one-cell horizontal inset.
 fn inset(area: Rect) -> Rect {
     Rect {
@@ -752,6 +856,18 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         assert!(buffer_text(terminal.backend().buffer()).contains("go to:"));
+    }
+
+    #[test]
+    fn help_panel_renders_commands() {
+        let mut app = one_net_app();
+        app.open_help("");
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("norn help"));
+        assert!(text.contains("/join"));
+        assert!(text.contains("Esc to close"));
     }
 
     fn chat(target: &str, from: &str, text: &str) -> irc_engine::ChatMessage {

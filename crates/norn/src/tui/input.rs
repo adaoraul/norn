@@ -92,6 +92,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
         handle_switcher(app, key);
         return Vec::new();
     }
+    if app.mode == Mode::Help {
+        handle_help(app, key);
+        return Vec::new();
+    }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -161,6 +165,30 @@ fn handle_switcher(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// Keys for the `/help` panel: type to filter, arrows/page to scroll, Esc/Enter
+/// to close.
+fn handle_help(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => app.mode = Mode::Normal,
+        KeyCode::Up => app.help.scroll = app.help.scroll.saturating_sub(1),
+        KeyCode::Down => app.help.scroll += 1,
+        KeyCode::PageUp => app.help.scroll = app.help.scroll.saturating_sub(10),
+        KeyCode::PageDown => app.help.scroll += 10,
+        KeyCode::Backspace => {
+            app.help.query.pop();
+            app.help.scroll = 0;
+        }
+        KeyCode::Char(c) => {
+            app.help.query.push(c);
+            app.help.scroll = 0;
+        }
+        _ => {}
+    }
+    // Clamp scroll so it can never run past the last row.
+    let rows = crate::input::help_rows(&app.help.query).len();
+    app.help.scroll = app.help.scroll.min(rows.saturating_sub(1));
 }
 
 /// Buffer indices matching the switcher query.
@@ -291,6 +319,10 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
             }
             "unalias" => {
                 handle_unalias(app, arg);
+                return Vec::new();
+            }
+            "help" | "h" => {
+                app.open_help(arg);
                 return Vec::new();
             }
             _ => {}
@@ -762,10 +794,10 @@ fn complete(app: &mut App) {
 /// built-in `COMMANDS` plus the user's alias names, prefix-filtered.
 fn command_completion(app: &App) -> Option<Completion> {
     let stem = app.input[1..app.cursor].to_lowercase();
-    let mut matches: Vec<String> = crate::input::COMMANDS
+    let mut matches: Vec<String> = crate::input::COMMAND_INFO
         .iter()
-        .filter(|c| c.starts_with(&stem))
-        .map(|c| c.to_string())
+        .filter(|c| c.name.starts_with(&stem))
+        .map(|c| c.name.to_string())
         .chain(
             app.aliases
                 .keys()
@@ -1232,6 +1264,28 @@ mod tests {
         let mut app = app_with_channel();
         run_line(&mut app, "/alias set something");
         assert!(!app.aliases.contains_key("set"), "structural name refused");
+    }
+
+    #[test]
+    fn help_opens_filters_and_closes() {
+        use crate::tui::state::Mode;
+        let mut app = app_with_channel();
+        // /help with an argument opens the panel pre-filtered.
+        run_line(&mut app, "/help net");
+        assert_eq!(app.mode, Mode::Help);
+        assert_eq!(app.help.query, "net");
+        // Typing extends the filter and resets scroll.
+        handle_key(&mut app, key(KeyCode::Char('w')));
+        assert_eq!(app.help.query, "netw");
+        // Down scrolls; clamped so it never runs past the last row.
+        for _ in 0..100 {
+            handle_key(&mut app, key(KeyCode::Down));
+        }
+        let rows = crate::input::help_rows(&app.help.query).len();
+        assert!(app.help.scroll < rows.max(1));
+        // Esc closes.
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]

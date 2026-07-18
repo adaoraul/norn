@@ -196,6 +196,17 @@ pub enum Mode {
     Normal,
     /// The Ctrl+K buffer switcher is open.
     Switcher,
+    /// The `/help` panel is open.
+    Help,
+}
+
+/// State of the `/help` panel overlay: a live filter and a scroll offset.
+#[derive(Debug, Clone, Default)]
+pub struct HelpState {
+    /// The filter query (matched against name/usage/description).
+    pub query: String,
+    /// First visible row.
+    pub scroll: usize,
 }
 
 /// Buffer-switcher overlay state.
@@ -237,6 +248,8 @@ pub struct App {
     pub mode: Mode,
     /// Switcher state.
     pub switcher: Switcher,
+    /// Help-panel state.
+    pub help: HelpState,
     /// Tab-completion state.
     pub completion: Option<Completion>,
     /// Whether the nicklist is shown.
@@ -299,6 +312,7 @@ impl App {
             cursor: 0,
             mode: Mode::Normal,
             switcher: Switcher::default(),
+            help: HelpState::default(),
             completion: None,
             nicklist_visible: client.nicklist,
             timestamps: client.timestamps,
@@ -666,6 +680,16 @@ impl App {
     pub fn switch_to_console(&mut self) {
         let idx = self.console();
         self.switch_to(idx);
+    }
+
+    /// Open the `/help` panel, optionally pre-filtered by `query`.
+    pub fn open_help(&mut self, query: &str) {
+        self.mode = Mode::Help;
+        self.help = HelpState {
+            query: query.trim().to_string(),
+            scroll: 0,
+        };
+        self.dirty = true;
     }
 
     /// Persist current client prefs and network definitions to the config file.

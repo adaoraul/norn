@@ -36,37 +36,84 @@ pub const HELP: &str = "commands: /join /part /msg /query /nick /names /me /topi
 /whois /away /kick /mode /notice /invite /raw · client: /set /network ls|add|rm|show \
 /connect /disconnect /reconnect /clear /alias /unalias /help /quit";
 
-/// Canonical command names, the single registry used for Tab-completion. Short
-/// aliases (`j`, `m`, `q`, ...) are intentionally omitted so completion offers
-/// the full names.
-pub const COMMANDS: &[&str] = &[
-    "alias",
-    "away",
-    "clear",
-    "close",
-    "connect",
-    "disconnect",
-    "help",
-    "invite",
-    "join",
-    "kick",
-    "me",
-    "mode",
-    "msg",
-    "names",
-    "network",
-    "nick",
-    "notice",
-    "part",
-    "query",
-    "quit",
-    "raw",
-    "reconnect",
-    "set",
-    "topic",
-    "unalias",
-    "whois",
+/// One command's metadata: the single registry powering the `/help` panel and
+/// Tab-completion. Short aliases (`j`, `m`, `q`, ...) are omitted so completion
+/// and help present the full names. Entries are grouped by `category` and kept
+/// contiguous per category so [`help_rows`] can insert one header each.
+pub struct CommandInfo {
+    /// The command name (no leading slash).
+    pub name: &'static str,
+    /// A usage sketch, e.g. `/msg <target> <text>`.
+    pub usage: &'static str,
+    /// A one-line description.
+    pub help: &'static str,
+    /// The group heading it appears under in `/help`.
+    pub category: &'static str,
+}
+
+/// Every command, grouped by category (contiguous per category).
+#[rustfmt::skip]
+pub const COMMAND_INFO: &[CommandInfo] = &[
+    CommandInfo { name: "msg", usage: "/msg <target> <text>", help: "Send a private message", category: "Chat" },
+    CommandInfo { name: "me", usage: "/me <action>", help: "Send an action (/me waves)", category: "Chat" },
+    CommandInfo { name: "query", usage: "/query <nick>", help: "Open a private chat buffer", category: "Chat" },
+    CommandInfo { name: "notice", usage: "/notice <target> <text>", help: "Send a notice", category: "Chat" },
+    CommandInfo { name: "join", usage: "/join #channel", help: "Join a channel", category: "Channel" },
+    CommandInfo { name: "part", usage: "/part [#channel]", help: "Leave a channel", category: "Channel" },
+    CommandInfo { name: "names", usage: "/names [#channel]", help: "List the members of a channel", category: "Channel" },
+    CommandInfo { name: "topic", usage: "/topic [text]", help: "View or set the channel topic", category: "Channel" },
+    CommandInfo { name: "kick", usage: "/kick <nick> [reason]", help: "Kick a user from the channel", category: "Channel" },
+    CommandInfo { name: "mode", usage: "/mode <args>", help: "Set channel or user modes", category: "Channel" },
+    CommandInfo { name: "invite", usage: "/invite <nick> [#chan]", help: "Invite a user to a channel", category: "Channel" },
+    CommandInfo { name: "close", usage: "/close", help: "Close the active buffer (part if a channel)", category: "Channel" },
+    CommandInfo { name: "nick", usage: "/nick <newnick>", help: "Change your nickname", category: "You" },
+    CommandInfo { name: "away", usage: "/away [message]", help: "Set or clear your away status", category: "You" },
+    CommandInfo { name: "whois", usage: "/whois <nick>", help: "Look up information about a user", category: "You" },
+    CommandInfo { name: "network", usage: "/network ls|add|rm|show", help: "Manage network definitions", category: "Networks" },
+    CommandInfo { name: "connect", usage: "/connect <name>", help: "Connect a defined network", category: "Networks" },
+    CommandInfo { name: "disconnect", usage: "/disconnect [reason]", help: "Disconnect the active network", category: "Networks" },
+    CommandInfo { name: "reconnect", usage: "/reconnect", help: "Reconnect the active network", category: "Networks" },
+    CommandInfo { name: "set", usage: "/set [key value]", help: "View or change settings (timestamps, theme, nicklist)", category: "Client" },
+    CommandInfo { name: "alias", usage: "/alias [name expansion]", help: "List or define command aliases", category: "Client" },
+    CommandInfo { name: "unalias", usage: "/unalias <name>", help: "Remove a command alias", category: "Client" },
+    CommandInfo { name: "clear", usage: "/clear", help: "Clear the active buffer's scrollback", category: "Client" },
+    CommandInfo { name: "raw", usage: "/raw <line>", help: "Send a raw IRC line", category: "Client" },
+    CommandInfo { name: "help", usage: "/help [command]", help: "Open this help panel", category: "Client" },
+    CommandInfo { name: "quit", usage: "/quit [reason]", help: "Quit norn", category: "Client" },
 ];
+
+/// One rendered row of the `/help` panel: a category header or a command.
+pub enum HelpRow {
+    /// A group heading.
+    Header(&'static str),
+    /// A command entry.
+    Command(&'static CommandInfo),
+}
+
+/// The help rows matching `query` (case-insensitive over name/usage/help), with
+/// a header before each category that has any match. Empty query lists all.
+pub fn help_rows(query: &str) -> Vec<HelpRow> {
+    let q = query.trim().to_lowercase();
+    let hit = |c: &CommandInfo| {
+        q.is_empty()
+            || c.name.contains(&q)
+            || c.usage.to_lowercase().contains(&q)
+            || c.help.to_lowercase().contains(&q)
+    };
+    let mut rows = Vec::new();
+    let mut current = "";
+    for info in COMMAND_INFO {
+        if !hit(info) {
+            continue;
+        }
+        if info.category != current {
+            rows.push(HelpRow::Header(info.category));
+            current = info.category;
+        }
+        rows.push(HelpRow::Command(info));
+    }
+    rows
+}
 
 /// Translate one input line for the given current target.
 pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
@@ -218,7 +265,29 @@ pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
 
 #[cfg(test)]
 mod tests {
-    use super::translate;
+    use super::{help_rows, translate, HelpRow};
+
+    #[test]
+    fn help_rows_list_all_then_filter() {
+        // Empty query lists every command plus a header per category.
+        let all = help_rows("");
+        let commands = all
+            .iter()
+            .filter(|r| matches!(r, HelpRow::Command(_)))
+            .count();
+        assert_eq!(commands, super::COMMAND_INFO.len());
+        assert!(all.iter().any(|r| matches!(r, HelpRow::Header(_))));
+
+        // A filter narrows to matching commands (name/usage/help) and keeps only
+        // the headers for categories that still have a match.
+        let net = help_rows("network");
+        assert!(net
+            .iter()
+            .any(|r| matches!(r, HelpRow::Command(c) if c.name == "network")));
+        assert!(net
+            .iter()
+            .all(|r| !matches!(r, HelpRow::Command(c) if c.name == "join")));
+    }
 
     #[test]
     fn plain_text_needs_a_target() {
