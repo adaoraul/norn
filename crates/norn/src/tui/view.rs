@@ -17,13 +17,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
 
-    let rows = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1), // activity bar
-        Constraint::Length(1), // input
-    ])
-    .split(area);
-
+    // Sidebar and nicklist run the full height; the input area lives inside the
+    // center column.
     let nick_w = if app.nicklist_visible && app.active_buffer().kind == BufferKind::Channel {
         18
     } else {
@@ -34,20 +29,29 @@ pub fn draw(f: &mut Frame, app: &App) {
         Constraint::Min(10),
         Constraint::Length(nick_w),
     ])
-    .split(rows[0]);
+    .split(area);
+
+    let center = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Min(1),    // messages
+        Constraint::Length(1), // activity bar
+        Constraint::Length(1), // input
+    ])
+    .split(cols[1]);
 
     draw_sidebar(f, cols[0], app);
-    draw_center(f, cols[1], app);
+    draw_header(f, center[0], app);
+    draw_messages(f, center[1], app);
+    draw_activity(f, center[2], app);
+    draw_input(f, center[3], app);
     if nick_w > 0 {
         draw_nicklist(f, cols[2], app);
     }
-    draw_activity(f, rows[1], app);
-    draw_input(f, rows[2], app);
 
     if app.mode == Mode::Switcher {
         draw_switcher(f, area, app);
     } else if let Some(completion) = &app.completion {
-        draw_completion(f, rows[2], completion);
+        draw_completion(f, center[3], completion);
     }
 }
 
@@ -60,17 +64,31 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
     let inner_w = area.width.saturating_sub(2) as usize;
 
     for (net_id, net) in app.networks.iter().enumerate() {
-        lines.push(Line::from(Span::styled(
-            format!(" {}", net.name.to_uppercase()),
-            Style::default().fg(theme::DIM2),
-        )));
+        // The network name header is the server/status buffer's entry.
+        let server_active = app
+            .buffers
+            .get(app.active)
+            .is_some_and(|b| b.net == net_id && b.kind == BufferKind::Server);
+        let bar = if server_active { "▎" } else { " " };
+        let name = truncate(&net.name.to_uppercase(), inner_w.saturating_sub(1));
+        let pad = " ".repeat(inner_w.saturating_sub(1 + name.width()));
+        let header_style = if server_active {
+            Style::default().fg(theme::BRIGHT).bg(theme::ACTIVE_BG)
+        } else {
+            Style::default().fg(theme::DIM2)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(bar, Style::default().fg(app.accent)),
+            Span::styled(format!("{name}{pad}"), header_style),
+        ]));
+
         for (idx, buffer) in app.buffers.iter().enumerate() {
-            if buffer.net != net_id {
+            if buffer.net != net_id || buffer.kind == BufferKind::Server {
                 continue;
             }
             let active = idx == app.active;
             let label = match buffer.kind {
-                BufferKind::Server => "status".to_string(),
+                BufferKind::Query => format!("@ {}", buffer.name),
                 _ => buffer.name.clone(),
             };
             let badge = if buffer.unread > 0 {
@@ -82,13 +100,19 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
             let name_w = inner_w.saturating_sub(1 + badge.width());
             let name = truncate(&label, name_w);
             let pad = " ".repeat(name_w.saturating_sub(name.width()));
-            let fg = if active { theme::BRIGHT } else { theme::TEXT };
+            let base_fg = if active {
+                theme::BRIGHT
+            } else if buffer.kind == BufferKind::Query {
+                theme::nick_color(&buffer.name)
+            } else {
+                theme::TEXT
+            };
             let badge_fg = if buffer.mentioned || buffer.unread > 2 {
                 theme::GOLD
             } else {
                 theme::DIM2
             };
-            let mut style = Style::default().fg(fg);
+            let mut style = Style::default().fg(base_fg);
             if active {
                 style = style.bg(theme::ACTIVE_BG);
             }
@@ -102,11 +126,8 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inset(area));
 }
 
-fn draw_center(f: &mut Frame, area: Rect, app: &App) {
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let buffer = app.active_buffer();
-
-    // Header: buffer name + topic, right side member count.
     let title = match buffer.kind {
         BufferKind::Server => app.networks[buffer.net].name.clone(),
         _ => buffer.name.clone(),
@@ -116,7 +137,7 @@ fn draw_center(f: &mut Frame, area: Rect, app: &App) {
     } else {
         String::new()
     };
-    let head_w = rows[0].width as usize;
+    let head_w = area.width as usize;
     // Topic gets whatever room is left after the title and the right label.
     let sub_room = head_w.saturating_sub(title.width() + 2 + right.width() + 1);
     let sub = truncate(&buffer.topic.clone().unwrap_or_default(), sub_room);
@@ -130,11 +151,13 @@ fn draw_center(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(right, Style::default().fg(theme::DIM2)),
         ]))
         .style(Style::default().bg(theme::BG)),
-        rows[0],
+        area,
     );
+}
 
-    // Message list, bottom-anchored, honoring scroll.
-    let height = rows[1].height as usize;
+fn draw_messages(f: &mut Frame, area: Rect, app: &App) {
+    let buffer = app.active_buffer();
+    let height = area.height as usize;
     let total = buffer.lines.len();
     let end = total.saturating_sub(buffer.scroll);
     let start = end.saturating_sub(height);
@@ -142,7 +165,7 @@ fn draw_center(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|l| render_buf_line(app, l))
         .collect();
-    f.render_widget(Paragraph::new(lines), rows[1]);
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_buf_line<'a>(app: &App, line: &'a BufLine) -> Line<'a> {
@@ -415,11 +438,30 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
-        let content = buffer_text(terminal.backend().buffer());
+        let backend = terminal.backend();
+        let content = buffer_text(backend.buffer());
         assert!(content.contains("LIBERA"));
         assert!(content.contains("#ratatui"));
         assert!(content.contains("orhun"));
         assert!(content.contains("hello svan"));
+
+        // The input line sits inside the center column: the sidebar area (cols
+        // 0..24) on the last row is blank, and the prompt is to its right.
+        let last = 23u16;
+        let sidebar: String = (0..24)
+            .map(|x| backend.buffer()[(x, last)].symbol())
+            .collect();
+        assert!(
+            sidebar.trim().is_empty(),
+            "sidebar under the input is blank"
+        );
+        let input_row: String = (0..100)
+            .map(|x| backend.buffer()[(x, last)].symbol())
+            .collect();
+        assert!(
+            input_row.contains("#ratatui >"),
+            "prompt renders in the center"
+        );
     }
 
     #[test]

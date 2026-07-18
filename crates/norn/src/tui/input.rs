@@ -11,13 +11,11 @@ const NICKLIST_W: u16 = 18;
 
 /// Handle a mouse event: click the sidebar to switch buffers, click a nick to
 /// open a query, or scroll the message view.
-pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, height: u16) {
-    let main_h = height.saturating_sub(2); // activity + input rows
+pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) {
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if event.row >= main_h {
-                return;
-            }
+            // Sidebar and nicklist span the full height; out-of-range rows map to
+            // None, so no vertical guard is needed.
             if event.column < SIDEBAR_W {
                 if let Some(idx) = sidebar_buffer_at(app, event.row) {
                     app.switch_to(idx);
@@ -45,15 +43,19 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, height: u16) {
 }
 
 /// Which buffer index is at sidebar row `y` (matches `view::draw_sidebar`).
+/// The network header row selects that network's server/status buffer.
 fn sidebar_buffer_at(app: &App, y: u16) -> Option<usize> {
     let mut row = 0u16;
     for net_id in 0..app.networks.len() {
         if row == y {
-            return None; // network header
+            return app
+                .buffers
+                .iter()
+                .position(|b| b.net == net_id && b.kind == BufferKind::Server);
         }
         row += 1;
         for (idx, buffer) in app.buffers.iter().enumerate() {
-            if buffer.net != net_id {
+            if buffer.net != net_id || buffer.kind == BufferKind::Server {
                 continue;
             }
             if row == y {
@@ -474,12 +476,12 @@ mod tests {
 
     #[test]
     fn clicking_sidebar_switches_buffer() {
-        // Sidebar rows: 0=header, 1=status(server), 2=#rust.
+        // Sidebar rows: 0=network header (server buffer), 1=#rust.
         let mut app = app_with_channel();
         let click = MouseEventKind::Down(MouseButton::Left);
-        handle_mouse(&mut app, mouse(click, 5, 1), 100, 24);
+        handle_mouse(&mut app, mouse(click, 5, 0), 100, 24);
         assert_eq!(app.active_buffer().kind, BufferKind::Server);
-        handle_mouse(&mut app, mouse(click, 5, 2), 100, 24);
+        handle_mouse(&mut app, mouse(click, 5, 1), 100, 24);
         assert_eq!(app.active_buffer().name, "#rust");
     }
 
