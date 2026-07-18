@@ -952,23 +952,24 @@ fn handle_network(app: &mut App, arg: &str) {
                 .map(|m| format!("{:?}", m.state).to_lowercase());
             let mut lines = vec![
                 format!("network {}:", net.name),
-                format!("  host     = {}:{}", net.host, net.port),
-                format!("  tls      = {}", net.tls),
-                format!("  nick     = {}", net.nick),
+                format!("  host         = {}:{}", net.host, net.port),
+                format!("  tls          = {}", net.tls),
+                format!("  auto_connect = {}", net.auto_connect),
+                format!("  nick         = {}", net.nick),
             ];
             if let Some(user) = &net.user {
-                lines.push(format!("  user     = {user}"));
+                lines.push(format!("  user         = {user}"));
             }
             if let Some(realname) = &net.realname {
-                lines.push(format!("  realname = {realname}"));
+                lines.push(format!("  realname     = {realname}"));
             }
             if let Some(account) = &net.sasl_account {
                 lines.push(format!(
-                    "  sasl     = {account} ({})",
+                    "  sasl         = {account} ({})",
                     format!("{:?}", net.sasl_mech).to_lowercase()
                 ));
                 lines.push(format!(
-                    "  password = {}",
+                    "  password     = {}",
                     if net.password_command.is_some() {
                         "via password_command"
                     } else {
@@ -977,10 +978,10 @@ fn handle_network(app: &mut App, arg: &str) {
                 ));
             }
             if !net.auto_join.is_empty() {
-                lines.push(format!("  join     = {}", net.auto_join.join(", ")));
+                lines.push(format!("  join         = {}", net.auto_join.join(", ")));
             }
             if let Some(state) = live {
-                lines.push(format!("  state    = {state}"));
+                lines.push(format!("  state        = {state}"));
             }
             for line in lines {
                 app.push_console(line);
@@ -1037,7 +1038,7 @@ fn parse_network_add(arg: &str) -> Result<crate::config::NetworkConfig, String> 
     use crate::config::SaslMech;
     const USAGE: &str = "usage: /network add <name> host=<server> nick=<you> \
 [port=] [tls=on|off] [user=] [realname=] [sasl_account=] [sasl_mech=plain|scram] \
-[password_command=\"...\"] [join=#a,#b]";
+[password_command=\"...\"] [join=#a,#b] [auto_connect=on|off]";
 
     let tokens = split_args(arg);
     let mut tokens = tokens.into_iter();
@@ -1048,6 +1049,7 @@ fn parse_network_add(arg: &str) -> Result<crate::config::NetworkConfig, String> 
     let (mut user, mut realname, mut sasl_account, mut password_command) = (None, None, None, None);
     let mut sasl_mech = SaslMech::Plain;
     let mut auto_join = Vec::new();
+    let mut auto_connect = true;
 
     for token in tokens {
         let (key, value) = token
@@ -1070,6 +1072,10 @@ fn parse_network_add(arg: &str) -> Result<crate::config::NetworkConfig, String> 
             }
             "password_command" => password_command = Some(value.to_string()),
             "join" => auto_join = value.split(',').map(str::to_string).collect(),
+            "auto_connect" => {
+                auto_connect =
+                    parse_bool(value).ok_or_else(|| format!("bad auto_connect '{value}'"))?
+            }
             "password" | "pass" => {
                 return Err(
                     "passwords are never stored; use password_command or NORN_PASSWORD".into(),
@@ -1091,6 +1097,7 @@ fn parse_network_add(arg: &str) -> Result<crate::config::NetworkConfig, String> 
         sasl_mech,
         password_command,
         auto_join,
+        auto_connect,
     })
 }
 
@@ -1954,6 +1961,30 @@ mod tests {
                 AppAction::Connect(0),
             ]
         );
+    }
+
+    #[test]
+    fn network_add_parses_auto_connect() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/network add idle host=h nick=n auto_connect=off");
+        assert_eq!(app.definitions.len(), 1);
+        assert!(!app.definitions[0].auto_connect);
+        // Omitted, it defaults to on.
+        run_line(&mut app, "/network add live host=h nick=n");
+        assert!(app.definitions[1].auto_connect);
+    }
+
+    #[test]
+    fn networks_form_toggles_auto_connect_independently_of_tls() {
+        let mut app = app_with_channel();
+        app.add_network_definition(); // appends a default network, focuses the form
+        let idx = |name: &str| NETWORK_FIELDS.iter().position(|f| f.name == name).unwrap();
+        assert!(app.definitions[0].tls);
+        assert!(app.definitions[0].auto_connect);
+        // Toggling auto_connect leaves tls alone.
+        app.adjust_network_field(0, idx("auto_connect")).unwrap();
+        assert!(!app.definitions[0].auto_connect);
+        assert!(app.definitions[0].tls, "tls unaffected");
     }
 
     #[test]

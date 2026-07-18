@@ -139,6 +139,10 @@ pub struct NetworkConfig {
     /// Channels to auto-join.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_join: Vec<String>,
+    /// Whether to connect this network automatically on launch. When false, it
+    /// stays defined but idle until `/connect` (or the networks manager).
+    #[serde(default = "default_true")]
+    pub auto_connect: bool,
 }
 
 /// Client-wide UI preferences (the TOML `[client]` table). The interactive
@@ -347,6 +351,7 @@ impl Cli {
             sasl_mech: self.sasl_mech,
             password_command: None,
             auto_join: self.join.clone(),
+            auto_connect: true,
         })
     }
 }
@@ -389,8 +394,13 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
         }
     }
 
-    // The CLI ad-hoc network connects at launch but is not a persisted definition.
-    let mut to_connect = definitions.clone();
+    // Only auto-connect networks dial at launch; the rest stay defined but idle
+    // (connectable in-app). The CLI ad-hoc network always connects.
+    let mut to_connect: Vec<NetworkConfig> = definitions
+        .iter()
+        .filter(|n| n.auto_connect)
+        .cloned()
+        .collect();
     if let Some(network) = cli.ad_hoc_network() {
         to_connect.push(network);
     }
@@ -437,6 +447,7 @@ mod tests {
                 sasl_mech: SaslMech::Scram,
                 password_command: Some("pass irc/libera".into()),
                 auto_join: vec!["#rust".into()],
+                auto_connect: true,
             }],
         };
         let text = toml::to_string_pretty(&config).unwrap();
@@ -452,6 +463,48 @@ mod tests {
         assert_eq!(back.networks.len(), 1);
         assert_eq!(back.networks[0].sasl_mech, SaslMech::Scram);
         assert_eq!(back.networks[0].auto_join, vec!["#rust"]);
+    }
+
+    #[test]
+    fn resolve_startup_respects_auto_connect() {
+        // Two defined networks; only the auto-connect one dials at launch.
+        let path = std::env::temp_dir().join("norn-auto-connect-test.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[network]]
+            name = "auto"
+            host = "ha"
+            nick = "n"
+
+            [[network]]
+            name = "manual"
+            host = "hb"
+            nick = "n"
+            auto_connect = false
+            "#,
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["norn", "--config", path.to_str().unwrap()]);
+        let startup = resolve_startup(&cli).unwrap();
+        assert_eq!(startup.definitions.len(), 2, "both stay defined");
+        assert_eq!(startup.connect.len(), 1, "only auto-connect dials");
+        assert_eq!(startup.connect[0].name, "auto");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_connect_defaults_true() {
+        let config: Config = toml::from_str(
+            r#"
+            [[network]]
+            name = "a"
+            host = "h"
+            nick = "n"
+            "#,
+        )
+        .unwrap();
+        assert!(config.networks[0].auto_connect, "defaults to true");
     }
 
     #[test]
@@ -518,6 +571,7 @@ mod tests {
             sasl_mech: SaslMech::Plain,
             password_command: None,
             auto_join: vec![],
+            auto_connect: true,
         };
         let settings = net.resolve().unwrap();
         assert_eq!(settings.nick(), "nick");
@@ -538,6 +592,7 @@ mod tests {
             sasl_mech: SaslMech::Plain,
             password_command: Some("printf 'sekret'".into()),
             auto_join: vec![],
+            auto_connect: true,
         };
         let settings = net.resolve().unwrap();
         assert_eq!(settings.password.as_deref(), Some("sekret"));

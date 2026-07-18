@@ -342,6 +342,10 @@ pub const NETWORK_FIELDS: &[NetField] = &[
         kind: NetFieldKind::Toggle,
     },
     NetField {
+        name: "auto_connect",
+        kind: NetFieldKind::Toggle,
+    },
+    NetField {
         name: "nick",
         kind: NetFieldKind::Text,
     },
@@ -1163,6 +1167,7 @@ impl App {
             sasl_mech: SaslMech::Plain,
             password_command: None,
             auto_join: Vec::new(),
+            auto_connect: true,
         });
         self.save_config();
         self.networks_ui.sel = self.definitions.len() - 1;
@@ -1230,6 +1235,10 @@ impl App {
             Some("tls") => {
                 cfg.tls = parse_bool(raw).ok_or_else(|| format!("expected on/off, got '{raw}'"))?
             }
+            Some("auto_connect") => {
+                cfg.auto_connect =
+                    parse_bool(raw).ok_or_else(|| format!("expected on/off, got '{raw}'"))?
+            }
             Some("nick") => {
                 if raw.is_empty() {
                     return Err("nick cannot be empty".into());
@@ -1267,8 +1276,8 @@ impl App {
         let cfg = self.definitions.get(idx).ok_or("no such network")?;
         match NETWORK_FIELDS.get(field).map(|f| (f.name, f.kind)) {
             Some((_, NetFieldKind::Toggle)) => {
-                let now = if cfg.tls { "off" } else { "on" };
-                self.set_network_field(idx, field, now)
+                let on = network_field_value(cfg, field) == "on";
+                self.set_network_field(idx, field, if on { "off" } else { "on" })
             }
             Some(("sasl_mech", _)) => {
                 let next = match cfg.sasl_mech {
@@ -1376,6 +1385,7 @@ pub fn network_field_value(cfg: &NetworkConfig, field: usize) -> String {
         Some("host") => cfg.host.clone(),
         Some("port") => cfg.port.to_string(),
         Some("tls") => if cfg.tls { "on" } else { "off" }.to_string(),
+        Some("auto_connect") => if cfg.auto_connect { "on" } else { "off" }.to_string(),
         Some("nick") => cfg.nick.clone(),
         Some("user") => cfg.user.clone().unwrap_or_default(),
         Some("realname") => cfg.realname.clone().unwrap_or_default(),
@@ -1770,6 +1780,7 @@ mod tests {
             sasl_mech: SaslMech::Plain,
             password_command: None,
             auto_join: vec![],
+            auto_connect: true,
         });
         let idx = |name: &str| NETWORK_FIELDS.iter().position(|f| f.name == name).unwrap();
         // port: rejects non-numeric, accepts a number.
@@ -1808,6 +1819,7 @@ mod tests {
                 sasl_mech: SaslMech::Plain,
                 password_command: None,
                 auto_join: vec![],
+                auto_connect: true,
             });
         }
         a.networks_ui.sel = 2; // the add row

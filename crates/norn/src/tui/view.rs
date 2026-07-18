@@ -1533,6 +1533,7 @@ mod tests {
             sasl_mech: crate::config::SaslMech::Plain,
             password_command: None,
             auto_join: vec![],
+            auto_connect: true,
         });
         app.open_networks();
         let mut terminal = Terminal::new(TestBackend::new(90, 28)).unwrap();

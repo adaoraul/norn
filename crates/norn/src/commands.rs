@@ -124,6 +124,11 @@ const NETWORK_ADD_OPTS: &[ParamDoc] = &[
         ArgKind::OptionKey,
         "channels to auto-join, comma-separated",
     ),
+    opt(
+        "auto_connect",
+        ArgKind::OptionKey,
+        "on|off, dial on launch (default on)",
+    ),
 ];
 
 const NETWORK_SUBS: &[SubDoc] = &[
