@@ -1,14 +1,16 @@
 //! TUI application state and engine-event routing.
 
 use chrono::Local;
-use irc_engine::{ChatHistoryRequest, Event, LeaveReason, Member, MessageKind, Selector};
+use irc_engine::{Event, LeaveReason, Member, MessageKind};
 use irc_proto::Source;
 use ratatui::style::Color;
 
-use crate::session::{ConnState, NetworkId, UiEvent, UiEventKind};
+use crate::session::{ConnState, NetCommand, NetworkId, UiEvent, UiEventKind};
 
 /// Max lines kept per buffer.
 const MAX_LINES: usize = 5000;
+/// How many older messages to pull per scroll-up page.
+const HISTORY_PAGE: usize = 50;
 
 /// The kind of a buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +110,9 @@ pub struct Buffer {
     pub unread_marker: Option<usize>,
     /// Whether an older-history request is in flight (avoids duplicate loads).
     pub history_pending: bool,
+    /// Whether the server has reported no older history remains (a short page),
+    /// so scrolling up should stop requesting.
+    pub history_exhausted: bool,
     /// Lines scrolled up from the bottom (0 = following live).
     pub scroll: usize,
 }
@@ -125,6 +130,7 @@ impl Buffer {
             mentioned: false,
             unread_marker: None,
             history_pending: false,
+            history_exhausted: false,
             scroll: 0,
         }
     }
@@ -350,7 +356,9 @@ impl App {
                 self.push_to(net, &target, kind, line, mention);
             }
             Event::HistoryLoaded {
-                target, messages, ..
+                target,
+                messages,
+                complete,
             } => {
                 let idx = self.ensure_buffer(net, &target, BufferKind::Channel);
                 let mut lines: Vec<Line> = messages
@@ -382,6 +390,11 @@ impl App {
                 lines.append(&mut self.buffers[idx].lines);
                 self.buffers[idx].lines = lines;
                 self.buffers[idx].history_pending = false;
+                // A short page (complete) means there is nothing older; stop
+                // paging so scrolling up does not re-request the same top.
+                if complete {
+                    self.buffers[idx].history_exhausted = true;
+                }
             }
             Event::NamesLoaded { target, members } => {
                 let idx = self.ensure_buffer(net, &target, BufferKind::Channel);
@@ -517,9 +530,9 @@ impl App {
     }
 
     /// Scroll the active buffer by `pages` (positive = up/older). Returns a
-    /// CHATHISTORY line to send when scrolling reaches the top of a channel
-    /// (to load older messages).
-    pub fn scroll(&mut self, pages: isize) -> Option<String> {
+    /// history-request command to send when scrolling reaches the top of a
+    /// channel (to load older messages).
+    pub fn scroll(&mut self, pages: isize) -> Option<NetCommand> {
         self.dirty = true;
         let idx = self.active;
         let buffer = &mut self.buffers[idx];
@@ -534,22 +547,29 @@ impl App {
         None
     }
 
-    /// Build a CHATHISTORY BEFORE request for the active channel's oldest known
-    /// message, unless one is already in flight or there is no msgid cursor.
-    fn request_older_history(&mut self) -> Option<String> {
+    /// Build a paging request for the active channel's oldest known message,
+    /// unless one is already in flight, the history is exhausted, or there is
+    /// no msgid cursor to page from.
+    fn request_older_history(&mut self) -> Option<NetCommand> {
         let idx = self.active;
-        if self.buffers[idx].kind != BufferKind::Channel || self.buffers[idx].history_pending {
+        let buffer = &self.buffers[idx];
+        if buffer.kind != BufferKind::Channel || buffer.history_pending || buffer.history_exhausted
+        {
             return None;
         }
-        let target = self.buffers[idx].name.clone();
-        let oldest = self.buffers[idx].lines.iter().find_map(|l| match l {
+        let target = buffer.name.clone();
+        let before = buffer.lines.iter().find_map(|l| match l {
             Line::Chat {
                 msgid: Some(id), ..
             } => Some(id.clone()),
             _ => None,
         })?;
         self.buffers[idx].history_pending = true;
-        Some(ChatHistoryRequest::before(target, Selector::msgid(oldest), 50).command())
+        Some(NetCommand::RequestHistory {
+            target,
+            before,
+            limit: HISTORY_PAGE,
+        })
     }
 
     /// Push a local feedback/status line into the active buffer.
@@ -848,13 +868,20 @@ mod tests {
         let idx = a.buffer_index(0, "#rust").unwrap();
         a.switch_to(idx);
 
-        // Scrolling up to the top requests older history.
+        // Scrolling up to the top requests older history as a structured command.
         let cmd = a.scroll(1);
-        assert_eq!(cmd.as_deref(), Some("CHATHISTORY BEFORE #rust msgid=m1 50"));
+        assert_eq!(
+            cmd,
+            Some(NetCommand::RequestHistory {
+                target: "#rust".into(),
+                before: "m1".into(),
+                limit: HISTORY_PAGE,
+            })
+        );
         assert!(a.buffers[idx].history_pending);
         // A second scroll does not re-request while one is in flight.
         assert!(a.scroll(1).is_none());
-        // HistoryLoaded clears the pending flag.
+        // A short (complete) page clears pending and marks history exhausted.
         a.apply(engine(
             0,
             Event::HistoryLoaded {
@@ -864,6 +891,9 @@ mod tests {
             },
         ));
         assert!(!a.buffers[idx].history_pending);
+        assert!(a.buffers[idx].history_exhausted);
+        // Once exhausted, scrolling to the top requests nothing more.
+        assert!(a.scroll(1).is_none());
     }
 
     #[test]

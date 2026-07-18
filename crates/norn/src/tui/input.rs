@@ -3,6 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::state::{App, BufferKind, Completion, Mode, Switcher};
+use crate::session::NetCommand;
 
 /// Width of the sidebar column.
 const SIDEBAR_W: u16 = 24;
@@ -10,9 +11,9 @@ const SIDEBAR_W: u16 = 24;
 const NICKLIST_W: u16 = 18;
 
 /// Handle a mouse event: click the sidebar to switch buffers, click a nick to
-/// open a query, or scroll the message view. Returns any lines to send (a scroll
-/// to the top may request older history).
-pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) -> Vec<String> {
+/// open a query, or scroll the message view. Returns any commands to send (a
+/// scroll to the top may request older history).
+pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) -> Vec<NetCommand> {
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // Sidebar and nicklist span the full height; out-of-range rows map to
@@ -74,9 +75,9 @@ fn nicklist_nick_at(app: &App, y: u16) -> Option<String> {
         .map(|m| m.nick.clone())
 }
 
-/// Handle one key. Mutates `app` and returns raw lines to send to the active
+/// Handle one key. Mutates `app` and returns commands to send to the active
 /// buffer's network (empty for local-only keys). Sets `app.should_quit` on quit.
-pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<String> {
+pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
     app.dirty = true;
     if app.mode == Mode::Switcher {
         handle_switcher(app, key);
@@ -180,7 +181,7 @@ fn switch_relative(app: &mut App, delta: isize) {
     app.switch_to(next);
 }
 
-fn submit(app: &mut App) -> Vec<String> {
+fn submit(app: &mut App) -> Vec<NetCommand> {
     let text = app.input.trim().to_string();
     app.input.clear();
     app.cursor = 0;
@@ -208,7 +209,7 @@ fn submit(app: &mut App) -> Vec<String> {
             }
             "close" | "wc" => {
                 return match app.close_active() {
-                    Some(channel) => vec![format!("PART {channel}")],
+                    Some(channel) => vec![NetCommand::Raw(format!("PART {channel}"))],
                     None => Vec::new(),
                 };
             }
@@ -236,7 +237,7 @@ fn submit(app: &mut App) -> Vec<String> {
         app.should_quit = true;
         return Vec::new();
     }
-    result.lines
+    result.lines.into_iter().map(NetCommand::Raw).collect()
 }
 
 fn complete(app: &mut App) {
@@ -376,7 +377,10 @@ mod tests {
             handle_key(&mut app, key(KeyCode::Char(c)));
         }
         let out = handle_key(&mut app, key(KeyCode::Enter));
-        assert_eq!(out, vec!["PRIVMSG #rust :hello".to_string()]);
+        assert_eq!(
+            out,
+            vec![NetCommand::Raw("PRIVMSG #rust :hello".to_string())]
+        );
         assert!(app.input.is_empty());
     }
 

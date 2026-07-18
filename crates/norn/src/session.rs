@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use irc_engine::{BringupMachine, ChatHistoryRequest, Connection, Engine, Event};
+use irc_engine::{BringupMachine, ChatHistoryRequest, Connection, Engine, Event, Selector};
 use irc_proto::{Command, Message};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -64,9 +64,21 @@ pub enum UiEventKind {
 }
 
 /// A command from the UI to a network task.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetCommand {
     /// Send a raw line to the server.
     Raw(String),
+    /// Page older history for a channel, before a known message id. Routed
+    /// through the engine so the request is labeled and its `complete` flag is
+    /// computed (the UI cannot reach the engine's label allocator directly).
+    RequestHistory {
+        /// The channel to page.
+        target: String,
+        /// Fetch messages before this message id (the oldest currently held).
+        before: String,
+        /// Maximum messages to fetch.
+        limit: usize,
+    },
     /// Quit this network (and stop reconnecting).
     Quit(Option<String>),
 }
@@ -160,6 +172,11 @@ async fn run_once(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(NetCommand::Raw(line)) => conn.send(&line).await?,
+                    Some(NetCommand::RequestHistory { target, before, limit }) => {
+                        let request = ChatHistoryRequest::before(target, Selector::msgid(before), limit);
+                        let line = engine.request_history(request);
+                        conn.send(&line).await?;
+                    }
                     Some(NetCommand::Quit(reason)) => {
                         let reason = reason.unwrap_or_else(|| "norn".to_string());
                         conn.send(&format!("QUIT :{reason}")).await?;

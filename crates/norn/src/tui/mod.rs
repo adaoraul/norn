@@ -100,18 +100,18 @@ pub async fn run(
             term = term_events.next() => {
                 match term {
                     Some(Ok(CrosstermEvent::Key(key))) if key.kind == KeyEventKind::Press => {
-                        let lines = input::handle_key(&mut app, key);
+                        let cmds = input::handle_key(&mut app, key);
                         let net = app.active_buffer().net;
-                        for line in lines {
-                            let _ = cmd_txs[net].send(NetCommand::Raw(line));
+                        for cmd in cmds {
+                            let _ = cmd_txs[net].send(cmd);
                         }
                     }
                     Some(Ok(CrosstermEvent::Mouse(mouse))) => {
                         let size = guard.terminal.size().unwrap_or_default();
-                        let lines = input::handle_mouse(&mut app, mouse, size.width, size.height);
+                        let cmds = input::handle_mouse(&mut app, mouse, size.width, size.height);
                         let net = app.active_buffer().net;
-                        for line in lines {
-                            let _ = cmd_txs[net].send(NetCommand::Raw(line));
+                        for cmd in cmds {
+                            let _ = cmd_txs[net].send(cmd);
                         }
                     }
                     Some(Ok(CrosstermEvent::Resize(_, _))) => app.dirty = true,
