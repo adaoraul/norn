@@ -188,6 +188,20 @@ impl Default for ClientConfig {
     }
 }
 
+/// A declarative addon trigger (TOML `[[trigger]]`): run a command in response
+/// to an event. `on` is a match spec (`"highlight"`, `"join #norn"`, ...) and
+/// `run` a command template with `$nick`/`$chan`/`$msg`/`$me` variables.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TriggerConfig {
+    /// The event match spec.
+    pub on: String,
+    /// The command template to run.
+    pub run: String,
+    /// Whether the trigger is active.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 /// The whole config file.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Config {
@@ -200,6 +214,9 @@ pub struct Config {
     /// Declared networks (TOML `[[network]]` or `[[networks]]`).
     #[serde(default, alias = "network", skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<NetworkConfig>,
+    /// Declarative addon triggers (TOML `[[trigger]]`).
+    #[serde(default, alias = "trigger", skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<TriggerConfig>,
 }
 
 /// Header prepended to a saved config (auto-save rewrites the file, so any
@@ -369,6 +386,8 @@ pub struct Startup {
     pub client: ClientConfig,
     /// User-defined command aliases.
     pub aliases: BTreeMap<String, String>,
+    /// Declarative addon triggers.
+    pub triggers: Vec<TriggerConfig>,
     /// The config file to auto-save to (`None` if no config dir is available).
     pub path: Option<PathBuf>,
 }
@@ -382,6 +401,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
     let mut client = ClientConfig::default();
     let mut aliases = BTreeMap::new();
     let mut definitions: Vec<NetworkConfig> = Vec::new();
+    let mut triggers: Vec<TriggerConfig> = Vec::new();
 
     if let Some(path) = &path {
         if path.exists() {
@@ -391,6 +411,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
             client = config.client;
             aliases = config.aliases;
             definitions = config.networks;
+            triggers = config.triggers;
         }
     }
 
@@ -414,6 +435,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
         definitions,
         client,
         aliases,
+        triggers,
         path,
     })
 }
@@ -449,6 +471,11 @@ mod tests {
                 auto_join: vec!["#rust".into()],
                 auto_connect: true,
             }],
+            triggers: vec![TriggerConfig {
+                on: "highlight".into(),
+                run: "notify $nick: $msg".into(),
+                enabled: true,
+            }],
         };
         let text = toml::to_string_pretty(&config).unwrap();
         // Never leak a resolved password (there is no password field to leak),
@@ -463,6 +490,9 @@ mod tests {
         assert_eq!(back.networks.len(), 1);
         assert_eq!(back.networks[0].sasl_mech, SaslMech::Scram);
         assert_eq!(back.networks[0].auto_join, vec!["#rust"]);
+        assert_eq!(back.triggers.len(), 1);
+        assert_eq!(back.triggers[0].on, "highlight");
+        assert_eq!(back.triggers[0].run, "notify $nick: $msg");
     }
 
     #[test]

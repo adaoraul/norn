@@ -5,6 +5,7 @@
 //! event stream. The default UI is the ratatui TUI; `--plain` uses the line
 //! renderer instead.
 
+mod addons;
 mod commands;
 mod config;
 mod input;
@@ -33,6 +34,7 @@ async fn main() -> std::io::Result<()> {
         definitions,
         client,
         aliases,
+        triggers,
         path,
     } = match config::resolve_startup(&cli) {
         Ok(startup) => startup,
@@ -76,6 +78,7 @@ async fn main() -> std::io::Result<()> {
             definitions,
             client,
             aliases,
+            triggers,
             path,
             quit,
         )

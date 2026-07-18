@@ -25,8 +25,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use crate::config::{ClientConfig, NetworkConfig};
-use crate::session::{NetCommand, UiEvent};
+use crate::addons::{AddonCtx, AddonEvent, AddonHost, Reaction, Triggers};
+use crate::config::{ClientConfig, NetworkConfig, TriggerConfig};
+use crate::session::{NetCommand, UiEvent, UiEventKind};
 use state::{App, AppAction, NetworkMeta};
 
 /// A terminal in raw/alternate-screen mode, restored on drop.
@@ -88,6 +89,7 @@ pub async fn run(
     definitions: Vec<NetworkConfig>,
     client: ClientConfig,
     aliases: std::collections::BTreeMap<String, String>,
+    triggers: Vec<TriggerConfig>,
     config_path: Option<PathBuf>,
     quit: Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -97,6 +99,9 @@ pub async fn run(
     let mut cmd_txs = cmd_txs;
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new(networks, client, definitions, aliases, config_path);
+    // The addon host reacts to engine events; triggers are its first backend.
+    let mut host: Box<dyn AddonHost> = Box::new(Triggers::from_configs(&triggers));
+    app.triggers = triggers;
     let mut term_events = EventStream::new();
 
     loop {
@@ -109,10 +114,10 @@ pub async fn run(
             ui = ui_rx.recv() => {
                 // `None` means all networks ended; stay until the user quits.
                 if let Some(event) = ui {
-                    app.apply(event);
+                    process_ui_event(&mut app, host.as_mut(), &cmd_txs, event);
                     // Coalesce a burst (e.g. history) into one redraw.
                     while let Ok(event) = ui_rx.try_recv() {
-                        app.apply(event);
+                        process_ui_event(&mut app, host.as_mut(), &cmd_txs, event);
                     }
                 }
             }
@@ -154,6 +159,49 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Run one UI event through the addon host, enact its reactions (send lines /
+/// show notices), then apply the event to the app state.
+fn process_ui_event(
+    app: &mut App,
+    host: &mut dyn AddonHost,
+    cmd_txs: &[mpsc::UnboundedSender<NetCommand>],
+    event: UiEvent,
+) {
+    for reaction in addon_reactions(app, host, &event) {
+        match reaction {
+            Reaction::Send { net, lines } => {
+                if let Some(tx) = cmd_txs.get(net) {
+                    for line in lines {
+                        let _ = tx.send(NetCommand::Raw(line));
+                    }
+                }
+            }
+            Reaction::Notify { net, text } => app.push_notice(net, text),
+        }
+    }
+    app.apply(event);
+}
+
+/// Ask the addon host for reactions to an engine event (nothing for non-engine
+/// events or unknown networks).
+fn addon_reactions(app: &App, host: &mut dyn AddonHost, event: &UiEvent) -> Vec<Reaction> {
+    let UiEventKind::Engine(engine_event) = &event.kind else {
+        return Vec::new();
+    };
+    let Some(meta) = app.networks.get(event.net) else {
+        return Vec::new();
+    };
+    let (my_nick, network) = (meta.my_nick.clone(), meta.name.clone());
+    let Some(addon_event) = AddonEvent::from_engine(engine_event, event.net, &my_nick) else {
+        return Vec::new();
+    };
+    let ctx = AddonCtx {
+        my_nick: &my_nick,
+        network: &network,
+    };
+    host.on_event(&addon_event, &ctx)
 }
 
 /// Perform the supervisor's queued actions: spawn new network tasks and signal

@@ -8,7 +8,7 @@ use irc_engine::{Event, LeaveReason, Member, MessageKind, TopicChange, WhoisInfo
 use irc_proto::Source;
 use ratatui::style::Color;
 
-use crate::config::{ClientConfig, Config, NetworkConfig, SaslMech};
+use crate::config::{ClientConfig, Config, NetworkConfig, SaslMech, TriggerConfig};
 use crate::session::{ConnState, NetCommand, NetworkId, UiEvent, UiEventKind};
 use crate::tui::theme;
 
@@ -82,7 +82,7 @@ fn event_line(text: String) -> Line {
 }
 
 /// The inner text of a CTCP ACTION (`\x01ACTION ...\x01`), if `text` is one.
-fn ctcp_action(text: &str) -> Option<&str> {
+pub(crate) fn ctcp_action(text: &str) -> Option<&str> {
     let inner = text.strip_prefix('\u{1}')?.strip_prefix("ACTION ")?;
     Some(inner.strip_suffix('\u{1}').unwrap_or(inner))
 }
@@ -434,6 +434,9 @@ pub struct App {
     pub definitions: Vec<NetworkConfig>,
     /// User-defined command aliases (name -> expansion template).
     pub aliases: BTreeMap<String, String>,
+    /// Declarative addon triggers (persisted; the live host is rebuilt from these
+    /// when they change).
+    pub triggers: Vec<TriggerConfig>,
     /// Where to auto-save config (`None` if no config dir is available).
     pub config_path: Option<PathBuf>,
     /// Pending control-plane actions for the supervisor to execute.
@@ -496,6 +499,7 @@ impl App {
             client,
             definitions,
             aliases,
+            triggers: Vec::new(),
             config_path,
             actions: Vec::new(),
             history: Vec::new(),
@@ -871,6 +875,19 @@ impl App {
         self.dirty = true;
     }
 
+    /// Show an addon notification: a console line tagged with the network, plus
+    /// the terminal bell.
+    pub fn push_notice(&mut self, net: NetworkId, text: String) {
+        let prefix = self
+            .networks
+            .get(net)
+            .map(|n| format!("[{}] ", n.name))
+            .unwrap_or_default();
+        self.push_console(format!("{prefix}{text}"));
+        self.bell = true;
+        self.dirty = true;
+    }
+
     /// Switch to the console buffer.
     pub fn switch_to_console(&mut self) {
         let idx = self.console();
@@ -1063,6 +1080,7 @@ impl App {
             client: self.client.clone(),
             aliases: self.aliases.clone(),
             networks: self.definitions.clone(),
+            triggers: self.triggers.clone(),
         };
         if let Err(err) = config.save(&path) {
             self.push_active_event(format!("save failed: {err}"));
@@ -1419,7 +1437,7 @@ fn parse_bool(s: &str) -> Option<bool> {
 }
 
 /// Whether `text` mentions `nick` as a whole word.
-fn mentions(text: &str, nick: &str) -> bool {
+pub(crate) fn mentions(text: &str, nick: &str) -> bool {
     if nick.is_empty() {
         return false;
     }
@@ -1502,7 +1520,7 @@ fn fmt_idle(secs: u64) -> String {
     }
 }
 
-fn source_nick(source: &Source) -> &str {
+pub(crate) fn source_nick(source: &Source) -> &str {
     match source {
         Source::User { nick, .. } => nick,
         Source::Server(name) => name,
