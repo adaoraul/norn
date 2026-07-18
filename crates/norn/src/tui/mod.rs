@@ -137,6 +137,13 @@ pub async fn run(
         // Execute any control-plane actions the input handlers queued.
         drain_actions(&mut app, &mut cmd_txs, &ui_tx, &quit);
 
+        // Ring the terminal bell if a highlight arrived and beeping is enabled.
+        if app.bell {
+            let _ = write!(io::stdout(), "\x07");
+            let _ = io::stdout().flush();
+            app.bell = false;
+        }
+
         if app.should_quit {
             quit.store(true, Ordering::SeqCst);
             for tx in &cmd_txs {

@@ -222,41 +222,156 @@ fn handle_help(app: &mut App, key: KeyEvent) {
     app.help.sel = app.help.sel.min(n.saturating_sub(1));
 }
 
-/// The number of rows on the `/settings` panel (timestamps, nicklist, theme).
-const SETTINGS_ROWS: usize = 3;
-
-/// Keys for the `/settings` panel: arrows move the selection; Space/Enter or
-/// Left/Right adjust the selected setting (toggle a bool, cycle the theme). Every
-/// change applies live and auto-saves. Esc closes.
+/// Keys for the `/settings` panel. While browsing: arrows move the selection,
+/// typing filters, Enter edits/toggles the selected row, Left/Right adjust a
+/// bool/enum, Delete removes an alias, Esc closes. While editing a text/int
+/// setting or an alias, keys edit the inline buffer (Enter commits, Esc cancels).
 fn handle_settings(app: &mut App, key: KeyEvent) {
+    if app.settings.editing.is_some() {
+        handle_settings_edit(app, key);
+        return;
+    }
+    let n = app.settings_selectable().len();
     match key.code {
         KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Up => app.settings.sel = app.settings.sel.saturating_sub(1),
-        KeyCode::Down => app.settings.sel = (app.settings.sel + 1).min(SETTINGS_ROWS - 1),
-        KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Right => adjust_setting(app, 1),
+        KeyCode::Up => {
+            app.settings.sel = app.settings.sel.saturating_sub(1);
+            app.settings.msg = None;
+        }
+        KeyCode::Down => {
+            app.settings.sel = (app.settings.sel + 1).min(n.saturating_sub(1));
+            app.settings.msg = None;
+        }
+        KeyCode::Enter => activate_setting(app),
         KeyCode::Left => adjust_setting(app, -1),
+        KeyCode::Right => adjust_setting(app, 1),
+        KeyCode::Delete => delete_selected_alias(app),
+        KeyCode::Backspace => {
+            app.settings.filter.pop();
+            app.settings.sel = 0;
+            app.settings.msg = None;
+        }
+        KeyCode::Char(c) => {
+            app.settings.filter.push(c);
+            app.settings.sel = 0;
+            app.settings.msg = None;
+        }
         _ => {}
     }
 }
 
-/// Change the selected setting by `dir` (bools toggle regardless; the theme
-/// cycles through `THEME_NAMES`), then apply and save.
-fn adjust_setting(app: &mut App, dir: isize) {
-    match app.settings.sel {
-        0 => app.client.timestamps = !app.client.timestamps,
-        1 => app.client.nicklist = !app.client.nicklist,
-        2 => {
-            let names = crate::tui::theme::THEME_NAMES;
-            let cur = names
-                .iter()
-                .position(|&n| n == app.client.theme)
-                .unwrap_or(0);
-            let next = (cur as isize + dir).rem_euclid(names.len() as isize) as usize;
-            app.client.theme = names[next].to_string();
+/// Enter on the selected row: toggle a bool / cycle an enum in place, or begin
+/// inline editing of a text/int setting or an alias.
+fn activate_setting(app: &mut App) {
+    use crate::settings::SettingKind;
+    use crate::tui::state::SettingsRow;
+    match app.selected_setting_row() {
+        Some(SettingsRow::Setting(doc)) => match doc.kind {
+            SettingKind::Bool | SettingKind::Enum(_) => adjust_setting(app, 1),
+            SettingKind::Int { .. } | SettingKind::Str => {
+                app.settings.editing = Some(app.setting_value(doc.key));
+                app.settings.msg = None;
+            }
+        },
+        Some(SettingsRow::Alias { expansion, .. }) => {
+            app.settings.editing = Some(expansion);
+            app.settings.msg = None;
         }
         _ => {}
     }
-    app.apply_client_change();
+}
+
+/// Adjust the selected bool (toggle) or enum (cycle by `dir`) setting in place.
+fn adjust_setting(app: &mut App, dir: isize) {
+    use crate::settings::SettingKind;
+    use crate::tui::state::SettingsRow;
+    let Some(SettingsRow::Setting(doc)) = app.selected_setting_row() else {
+        return;
+    };
+    let result = match doc.kind {
+        SettingKind::Bool => {
+            let on = app.setting_value(doc.key) == "on";
+            app.set_setting(doc.key, if on { "off" } else { "on" })
+        }
+        SettingKind::Enum(values) => {
+            let cur = app.setting_value(doc.key);
+            let i = values.iter().position(|&v| v == cur).unwrap_or(0);
+            let next = (i as isize + dir).rem_euclid(values.len() as isize) as usize;
+            app.set_setting(doc.key, values[next])
+        }
+        _ => return,
+    };
+    if let Err(err) = result {
+        app.settings.msg = Some(err);
+    }
+}
+
+/// Delete the alias on the selected row (a no-op on a setting row).
+fn delete_selected_alias(app: &mut App) {
+    use crate::tui::state::SettingsRow;
+    let Some(SettingsRow::Alias { name, .. }) = app.selected_setting_row() else {
+        return;
+    };
+    app.aliases.remove(&name);
+    app.save_config();
+    app.settings.msg = Some(format!("removed alias /{name}"));
+    let n = app.settings_selectable().len();
+    if app.settings.sel >= n {
+        app.settings.sel = n.saturating_sub(1);
+    }
+}
+
+/// Keys while inline-editing a settings value: type into the buffer, Enter
+/// commits, Esc cancels.
+fn handle_settings_edit(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.settings.editing = None;
+            app.settings.msg = None;
+        }
+        KeyCode::Enter => commit_settings_edit(app),
+        KeyCode::Backspace => {
+            if let Some(buf) = app.settings.editing.as_mut() {
+                buf.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(buf) = app.settings.editing.as_mut() {
+                buf.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Commit the inline edit to the selected setting or alias. On a validation
+/// error, keep editing and show the message.
+fn commit_settings_edit(app: &mut App) {
+    use crate::tui::state::SettingsRow;
+    let Some(buf) = app.settings.editing.clone() else {
+        return;
+    };
+    match app.selected_setting_row() {
+        Some(SettingsRow::Setting(doc)) => match app.set_setting(doc.key, &buf) {
+            Ok(_) => {
+                app.settings.editing = None;
+                app.settings.msg = None;
+            }
+            Err(err) => app.settings.msg = Some(err),
+        },
+        Some(SettingsRow::Alias { name, .. }) => {
+            let expansion = buf.trim().to_string();
+            if expansion.is_empty() {
+                app.settings.msg = Some("expansion cannot be empty".to_string());
+            } else {
+                app.aliases.insert(name, expansion);
+                app.save_config();
+                app.settings.editing = None;
+                app.settings.msg = None;
+            }
+        }
+        _ => app.settings.editing = None,
+    }
 }
 
 /// Buffer indices matching the switcher query.
@@ -548,19 +663,17 @@ fn substitute_args(segment: &str, args: &[&str]) -> String {
     out
 }
 
-/// `/set` - view or change a client setting, applied live and auto-saved.
+/// `/set` - view or change a client setting, validated against the settings
+/// registry, applied live, and auto-saved. Shares `App::set_setting` with the
+/// `/settings` screen.
 fn handle_set(app: &mut App, arg: &str) {
     let mut it = arg.split_whitespace();
     let Some(key) = it.next() else {
-        // No args: show the current settings in the console.
+        // No args: show all settings and their values in the console.
         app.push_console("settings:".to_string());
-        app.push_console(format!("  timestamps = {}", app.client.timestamps));
-        app.push_console(format!("  nicklist   = {}", app.client.nicklist));
-        app.push_console(format!(
-            "  theme      = {}   ({})",
-            app.client.theme,
-            crate::tui::theme::THEME_NAMES.join(", ")
-        ));
+        for s in crate::settings::SETTINGS {
+            app.push_console(format!("  {} = {}", s.key, app.setting_value(s.key)));
+        }
         app.switch_to_console();
         return;
     };
@@ -569,29 +682,10 @@ fn handle_set(app: &mut App, arg: &str) {
         app.push_active_event(format!("usage: /set {key} <value>"));
         return;
     }
-    match key {
-        "timestamps" => match parse_bool(&value) {
-            Some(on) => app.client.timestamps = on,
-            None => return app.push_active_event(format!("expected on/off, got '{value}'")),
-        },
-        "nicklist" => match parse_bool(&value) {
-            Some(on) => app.client.nicklist = on,
-            None => return app.push_active_event(format!("expected on/off, got '{value}'")),
-        },
-        "theme" => {
-            if !crate::tui::theme::THEME_NAMES.contains(&value.as_str()) {
-                return app.push_active_event(format!(
-                    "unknown theme '{value}' (try: {})",
-                    crate::tui::theme::THEME_NAMES.join(", ")
-                ));
-            }
-            app.client.theme = value.clone();
-        }
-        other => return app.push_active_event(format!("unknown setting '{other}'")),
+    match app.set_setting(key, &value) {
+        Ok(applied) => app.push_active_event(format!("set {key} = {applied}")),
+        Err(err) => app.push_active_event(err),
     }
-    // Mirror the change into the live UI and auto-save (shared with /settings).
-    app.apply_client_change();
-    app.push_active_event(format!("set {key} = {value}"));
 }
 
 /// `/network list|add|remove` - manage persisted network definitions.
@@ -844,11 +938,18 @@ fn complete(app: &mut App) {
     if matches.is_empty() {
         return;
     }
+    // A nick completed at the start of a line gets the configured completion
+    // character and a space (e.g. `nick: `); mid-line it gets nothing.
+    let suffix = if start == 0 {
+        format!("{} ", app.client.completion_char)
+    } else {
+        String::new()
+    };
     app.completion = Some(Completion {
         matches,
         idx: 0,
         start,
-        suffix: if start == 0 { ": " } else { "" },
+        suffix,
     });
     apply_completion(app, 0);
 }
@@ -885,7 +986,7 @@ fn slash_completion(app: &App) -> Option<Completion> {
         matches: candidates,
         idx: 0,
         start,
-        suffix,
+        suffix: suffix.to_string(),
     })
 }
 
@@ -1028,7 +1129,7 @@ fn apply_completion(app: &mut App, idx: usize) {
     completion.idx = idx;
     let candidate = completion.matches[idx].clone();
     let start = completion.start;
-    let suffix = completion.suffix;
+    let suffix = completion.suffix.clone();
     app.input = format!("{}{candidate}{suffix}", &app.input[..start]);
     app.cursor = app.input.len();
 }
@@ -1357,22 +1458,18 @@ mod tests {
         let mut app = app_with_channel();
         run_line(&mut app, "/settings");
         assert_eq!(app.mode, Mode::Settings);
-        // Row 0 is timestamps; Space toggles it and mirrors into the live state.
+        // Row 0 is `timestamps` (bool); Enter toggles it and mirrors live.
         assert!(app.client.timestamps);
-        handle_key(&mut app, key(KeyCode::Char(' ')));
+        handle_key(&mut app, key(KeyCode::Enter));
         assert!(!app.client.timestamps);
         assert!(!app.timestamps, "live mirror follows the change");
-        // Move to the theme row (index 2) and cycle it with Right.
+        // Row 2 is `theme` (enum); Right cycles it.
         handle_key(&mut app, key(KeyCode::Down));
         handle_key(&mut app, key(KeyCode::Down));
-        assert_eq!(app.settings.sel, 2);
         let before = app.client.theme.clone();
         handle_key(&mut app, key(KeyCode::Right));
         assert_ne!(app.client.theme, before, "theme cycled");
         assert_eq!(app.accent, crate::tui::theme::accent_for(&app.client.theme));
-        // Down is clamped to the last row; Esc closes.
-        handle_key(&mut app, key(KeyCode::Down));
-        assert_eq!(app.settings.sel, 2);
         handle_key(&mut app, key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Normal);
     }
@@ -1382,6 +1479,89 @@ mod tests {
         let mut app = app_with_channel();
         handle_key(&mut app, key(KeyCode::F(2)));
         assert_eq!(app.mode, Mode::Settings);
+    }
+
+    #[test]
+    fn settings_screen_edits_a_str_setting() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/settings");
+        // Rows: timestamps, nick_colors, theme, nicklist, completion_char, ...
+        for _ in 0..4 {
+            handle_key(&mut app, key(KeyCode::Down));
+        }
+        // Enter begins editing the current value (":").
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.settings.editing.as_deref(), Some(":"));
+        // Replace it with ">" and commit.
+        handle_key(&mut app, key(KeyCode::Backspace));
+        handle_key(&mut app, key(KeyCode::Char('>')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.settings.editing.is_none());
+        assert_eq!(app.client.completion_char, ">");
+    }
+
+    #[test]
+    fn settings_screen_edit_rejects_bad_value_and_keeps_editing() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/settings");
+        // Navigate to scrollback_lines (index 6) and edit it to something invalid.
+        for _ in 0..6 {
+            handle_key(&mut app, key(KeyCode::Down));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        // Blank the buffer and type a non-number.
+        while app.settings.editing.as_deref().map(str::len).unwrap_or(0) > 0 {
+            handle_key(&mut app, key(KeyCode::Backspace));
+        }
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.settings.editing.is_some(), "still editing after error");
+        assert!(app.settings.msg.is_some(), "shows a validation message");
+    }
+
+    #[test]
+    fn settings_screen_filters_and_deletes_alias() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/alias hi msg $1 hi");
+        run_line(&mut app, "/settings");
+        // Move to the last selectable row (the alias) and delete it.
+        for _ in 0..30 {
+            handle_key(&mut app, key(KeyCode::Down));
+        }
+        handle_key(&mut app, key(KeyCode::Delete));
+        assert!(!app.aliases.contains_key("hi"));
+    }
+
+    #[test]
+    fn settings_typing_filters_the_list() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/settings");
+        for c in "theme".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.settings.filter, "theme");
+        let rows = app.settings_selectable();
+        assert!(rows
+            .iter()
+            .all(|r| matches!(r, crate::tui::state::SettingsRow::Setting(d) if d.key == "theme")));
+    }
+
+    #[test]
+    fn set_new_settings_via_registry_and_completion_char() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/set nick_colors off");
+        assert!(!app.client.nick_colors);
+        run_line(&mut app, "/set beep_on_highlight on");
+        assert!(app.client.beep_on_highlight);
+        run_line(&mut app, "/set scrollback_lines 200");
+        assert_eq!(app.client.scrollback_lines, 200);
+        // Out-of-range and unknown keys are rejected; the value stays put.
+        run_line(&mut app, "/set scrollback_lines 5");
+        assert_eq!(app.client.scrollback_lines, 200);
+        run_line(&mut app, "/set nope 1");
+        // completion_char changes the suffix for a nick completed at line start.
+        run_line(&mut app, "/set completion_char ,");
+        assert_eq!(tab_after(&mut app, "al"), "alice, ");
     }
 
     #[test]

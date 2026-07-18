@@ -7,10 +7,20 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::state::{App, BufferKind, Line as BufLine, Mode};
+use super::state::{App, BufferKind, Line as BufLine, Mode, SettingsRow};
 use super::theme;
 
 const NICK_COL: usize = 9;
+
+/// A nick's display color, honoring the `nick_colors` setting (off = one muted
+/// color for every nick).
+fn nick_color(app: &App, nick: &str) -> ratatui::style::Color {
+    if app.client.nick_colors {
+        theme::nick_color(nick)
+    } else {
+        theme::DIM
+    }
+}
 
 /// Draw the whole UI.
 pub fn draw(f: &mut Frame, app: &App) {
@@ -297,7 +307,7 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
             action,
             ..
         } => {
-            let color = theme::nick_color(nick);
+            let color = nick_color(app, nick);
             if *action {
                 // `* nick does something`, all in the sender's color.
                 (
@@ -465,7 +475,7 @@ fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
             Some(p) if p.symbol() == '@' => ('@', theme::GOLD),
             Some(p) if p.symbol() == '+' => ('+', theme::ACCENT),
             Some(p) => (p.symbol(), theme::TEXT),
-            None => (' ', theme::nick_color(&m.nick)),
+            None => (' ', nick_color(app, &m.nick)),
         };
         // Away members render dimmed while keeping their hue identity.
         let style = if m.away {
@@ -619,14 +629,12 @@ fn draw_switcher(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inset(rect));
 }
 
-/// The `/settings` panel: a small centered modal listing each client preference
-/// as `label  value`, the selected row bar-highlighted. Editing happens live in
-/// `input::handle_settings`.
+/// The `/settings` panel: a categorized, typed, filterable list of client
+/// preferences (and the user's aliases). A header line, the row list with a
+/// centered selection, then a per-row detail line and the live filter.
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
-    let rows = settings_rows(app);
-    let w = 52.min(area.width.saturating_sub(4));
-    // Rows plus a top/bottom border, a blank spacer, and the hint row.
-    let h = (rows.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let w = 96.min(area.width.saturating_sub(2));
+    let h = 30.min(area.height.saturating_sub(2));
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
@@ -637,53 +645,187 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::BORDER_BRIGHT))
-        .title(Span::styled(
-            " settings ",
-            Style::default().fg(theme::BRIGHT),
-        ))
         .style(Style::default().bg(theme::PANEL));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    if inner.height == 0 {
+    if inner.height < 5 || inner.width < 24 {
         return;
     }
 
+    let rows = app.settings_rows();
+    let count = rows
+        .iter()
+        .filter(|r| !matches!(r, SettingsRow::Header(_)))
+        .count();
     let width = inner.width as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, (label, value)) in rows.iter().enumerate() {
-        let sel = i == app.settings.sel;
-        let bg = if sel { theme::ACTIVE_BG } else { theme::PANEL };
-        let bar = if sel { "▎" } else { " " };
-        let fg = if sel { theme::BRIGHT } else { theme::TEXT };
-        // `bar + " " + label + pad + value + " "` fills the inner width.
-        let pad = width.saturating_sub(2 + label.width() + value.width() + 1);
-        lines.push(Line::from(vec![
-            Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
-            Span::styled(format!(" {label}"), Style::default().fg(fg).bg(bg)),
-            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-            Span::styled(
-                format!("{value} "),
-                Style::default().fg(theme::BRIGHT2).bg(bg),
-            ),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "↑↓ move · Space toggle · ←→ change · Esc closes",
-        Style::default().fg(theme::DIM2),
-    )));
-    f.render_widget(Paragraph::new(lines), inner);
+
+    // Header line: title + hint on the left, match count on the right.
+    let left = "settings";
+    let hint = "  /set · type to filter · Enter to edit";
+    let right = format!("{count} matches");
+    let pad = width.saturating_sub(left.width() + hint.width() + right.width());
+    let header = Line::from(vec![
+        Span::styled(left, Style::default().fg(theme::BRIGHT)),
+        Span::styled(hint, Style::default().fg(theme::DIM2)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(right, Style::default().fg(theme::DIM2)),
+    ]);
+    f.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+    draw_rule(
+        f,
+        Rect {
+            y: inner.y + 1,
+            height: 1,
+            ..inner
+        },
+    );
+
+    // Body: the scrollable row list, between the rule and the two footer lines.
+    let body = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(4),
+        ..inner
+    };
+    draw_settings_body(f, body, app, &rows);
+
+    // Detail line: a validation message, an edit hint, or the selected row's doc.
+    let detail = settings_detail_line(app);
+    f.render_widget(
+        Paragraph::new(detail).style(Style::default().bg(theme::PANEL)),
+        Rect {
+            y: inner.y + inner.height - 2,
+            height: 1,
+            ..inner
+        },
+    );
+
+    // Filter line (cursor shown only while browsing, not editing).
+    let cursor = if app.settings.editing.is_none() {
+        "\u{2588}"
+    } else {
+        ""
+    };
+    let filter = Line::from(vec![
+        Span::styled("filter: ", Style::default().fg(theme::DIM2)),
+        Span::styled(
+            format!("{}{cursor}", app.settings.filter),
+            Style::default().fg(theme::BRIGHT),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(filter).style(Style::default().bg(theme::PANEL)),
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
+    );
 }
 
-/// The client-preference rows shown on the `/settings` panel, in the order the
-/// keys are indexed by `input::handle_settings` (timestamps, nicklist, theme).
-fn settings_rows(app: &App) -> Vec<(&'static str, String)> {
-    let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
-    vec![
-        ("timestamps", on_off(app.client.timestamps)),
-        ("nicklist", on_off(app.client.nicklist)),
-        ("theme", app.client.theme.clone()),
-    ]
+/// Render the `/settings` row list into `area`, keeping the selection centered.
+fn draw_settings_body(f: &mut Frame, area: Rect, app: &App, rows: &[SettingsRow]) {
+    let width = area.width as usize;
+    let list_h = area.height as usize;
+    let mut body: Vec<Line> = Vec::new();
+    let mut ordinal = 0usize;
+    let mut sel_line = 0usize;
+    for row in rows {
+        match row {
+            SettingsRow::Header(category) => body.push(Line::from(Span::styled(
+                format!(" {}", category.to_uppercase()),
+                Style::default().fg(theme::GOLD),
+            ))),
+            SettingsRow::Setting(_) | SettingsRow::Alias { .. } => {
+                let selected = ordinal == app.settings.sel;
+                if selected {
+                    sel_line = body.len();
+                }
+                ordinal += 1;
+                body.push(settings_row_line(app, row, selected, width));
+            }
+        }
+    }
+    if body.is_empty() {
+        body.push(Line::from(Span::styled(
+            " no matches",
+            Style::default().fg(theme::DIM2),
+        )));
+    }
+    let scroll = if body.len() <= list_h {
+        0
+    } else {
+        sel_line.saturating_sub(list_h / 2).min(body.len() - list_h)
+    };
+    let shown: Vec<Line> = body.into_iter().skip(scroll).take(list_h).collect();
+    f.render_widget(Paragraph::new(shown), area);
+}
+
+/// Build one selectable settings/alias row: `▎ key … value  type`.
+fn settings_row_line(app: &App, row: &SettingsRow, selected: bool, width: usize) -> Line<'static> {
+    let bg = if selected {
+        theme::ACTIVE_BG
+    } else {
+        theme::PANEL
+    };
+    let bar = if selected { "▎" } else { " " };
+    let label_fg = if selected {
+        theme::BRIGHT
+    } else {
+        theme::BRIGHT2
+    };
+
+    let (label, value, typ) = match row {
+        SettingsRow::Setting(doc) => (
+            doc.key.to_string(),
+            app.setting_value(doc.key),
+            doc.kind.label(),
+        ),
+        SettingsRow::Alias { name, expansion } => (name.clone(), expansion.clone(), "alias"),
+        SettingsRow::Header(_) => (String::new(), String::new(), ""),
+    };
+
+    // The selected row shows its inline edit buffer (with a cursor) as the value.
+    let (value, value_fg) = match (selected, &app.settings.editing) {
+        (true, Some(buf)) => (format!("{buf}\u{2588}"), theme::BRIGHT),
+        _ => (value, theme::GOLD),
+    };
+
+    let right_w = value.width() + 2 + typ.width();
+    let label = truncate(&label, width.saturating_sub(3 + right_w));
+    let pad = width.saturating_sub(2 + label.width() + right_w + 1);
+    Line::from(vec![
+        Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
+        Span::styled(format!(" {label}"), Style::default().fg(label_fg).bg(bg)),
+        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        Span::styled(value, Style::default().fg(value_fg).bg(bg)),
+        Span::styled("  ", Style::default().bg(bg)),
+        Span::styled(typ.to_string(), Style::default().fg(theme::DIM2).bg(bg)),
+        Span::styled(" ", Style::default().bg(bg)),
+    ])
+}
+
+/// The `/settings` detail line: a transient message, an edit hint, or the
+/// selected row's description and default.
+fn settings_detail_line(app: &App) -> Line<'static> {
+    if let Some(msg) = &app.settings.msg {
+        return Line::from(Span::styled(msg.clone(), Style::default().fg(theme::GOLD)));
+    }
+    if app.settings.editing.is_some() {
+        return Line::from(Span::styled(
+            "editing · Enter saves · Esc cancels",
+            Style::default().fg(theme::DIM),
+        ));
+    }
+    let text = match app.selected_setting_row() {
+        Some(SettingsRow::Setting(doc)) => {
+            format!("{} — {} · default {}", doc.key, doc.desc, doc.default)
+        }
+        Some(SettingsRow::Alias { name, .. }) => {
+            format!("alias /{name} · Enter edits · Delete removes")
+        }
+        _ => String::new(),
+    };
+    Line::from(Span::styled(text, Style::default().fg(theme::DIM)))
 }
 
 /// The `/help` panel: a master-detail command reference. The left pane is a
@@ -1107,13 +1249,17 @@ mod tests {
     fn settings_panel_renders() {
         let mut app = one_net_app();
         app.open_settings();
-        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 28)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("settings"));
+        assert!(text.contains("matches"));
+        // Categorized, typed rows.
+        assert!(text.contains("LOOK & FEEL"));
         assert!(text.contains("timestamps"));
         assert!(text.contains("theme"));
-        assert!(text.contains("Esc closes"));
+        assert!(text.contains("scrollback_lines"));
+        assert!(text.contains("filter:"));
     }
 
     fn chat(target: &str, from: &str, text: &str) -> irc_engine::ChatMessage {

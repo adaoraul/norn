@@ -447,9 +447,10 @@ and value, change one (applied live and auto-saved).",
         category: "Client",
         usage: "/settings",
         summary: "Open the settings screen",
-        description: "Open the interactive settings screen to view and change \
-client preferences (timestamps, nicklist, theme). Arrows move, Space toggles, \
-left/right change; every change applies live and auto-saves. Use /set to change a \
+        description: "Open the interactive settings screen: a searchable, \
+categorized list of client preferences plus your aliases. Type to filter, arrows \
+to move, Enter to edit (toggle a bool, cycle an enum, or type a value), Delete to \
+remove an alias. Every change applies live and auto-saves. Use /set to change a \
 setting directly from the input line.",
         aliases: &[],
         params: &[],

@@ -11,6 +11,7 @@ mod input;
 mod plain;
 mod render;
 mod session;
+mod settings;
 mod transport;
 mod tui;
 

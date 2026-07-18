@@ -12,8 +12,6 @@ use crate::config::{ClientConfig, Config, NetworkConfig};
 use crate::session::{ConnState, NetCommand, NetworkId, UiEvent, UiEventKind};
 use crate::tui::theme;
 
-/// Max lines kept per buffer.
-const MAX_LINES: usize = 5000;
 /// How many older messages to pull per scroll-up page.
 const HISTORY_PAGE: usize = 50;
 
@@ -145,10 +143,12 @@ pub struct Buffer {
     pub history_exhausted: bool,
     /// Lines scrolled up from the bottom (0 = following live).
     pub scroll: usize,
+    /// Maximum lines retained (the `scrollback_lines` client setting).
+    pub max_lines: usize,
 }
 
 impl Buffer {
-    fn new(net: NetworkId, name: impl Into<String>, kind: BufferKind) -> Self {
+    fn new(net: NetworkId, name: impl Into<String>, kind: BufferKind, max_lines: usize) -> Self {
         Buffer {
             net,
             name: name.into(),
@@ -162,13 +162,26 @@ impl Buffer {
             history_pending: false,
             history_exhausted: false,
             scroll: 0,
+            max_lines,
         }
     }
 
     fn push(&mut self, line: Line) {
         self.lines.push(line);
-        if self.lines.len() > MAX_LINES {
-            let overflow = self.lines.len() - MAX_LINES;
+        if self.lines.len() > self.max_lines {
+            let overflow = self.lines.len() - self.max_lines;
+            self.lines.drain(0..overflow);
+            if let Some(marker) = &mut self.unread_marker {
+                *marker = marker.saturating_sub(overflow);
+            }
+        }
+    }
+
+    /// Change the retained-line cap, trimming immediately if it shrank.
+    fn set_max_lines(&mut self, max_lines: usize) {
+        self.max_lines = max_lines.max(1);
+        if self.lines.len() > self.max_lines {
+            let overflow = self.lines.len() - self.max_lines;
             self.lines.drain(0..overflow);
             if let Some(marker) = &mut self.unread_marker {
                 *marker = marker.saturating_sub(overflow);
@@ -226,11 +239,36 @@ pub struct HelpState {
     pub detail_scroll: usize,
 }
 
-/// State of the `/settings` panel: which setting row is selected.
+/// State of the `/settings` panel: a live filter, the selected row, an optional
+/// inline edit buffer, and a transient message (e.g. a validation error).
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
-    /// Index of the highlighted setting row.
+    /// The filter query (matched against key/category/description and aliases).
+    pub filter: String,
+    /// Index of the highlighted row among the selectable (non-header) rows.
     pub sel: usize,
+    /// When editing a text/int setting or an alias, the in-progress value.
+    pub editing: Option<String>,
+    /// A transient status line (validation error or confirmation).
+    pub msg: Option<String>,
+}
+
+/// One rendered row of the `/settings` panel: a category header, a client
+/// setting, or a user alias. Built by [`App::settings_rows`] and consumed by both
+/// the view and the key handler so the two agree on ordering.
+#[derive(Debug, Clone)]
+pub enum SettingsRow {
+    /// A group heading (not selectable).
+    Header(&'static str),
+    /// A client preference from the settings registry.
+    Setting(&'static crate::settings::SettingDoc),
+    /// A user-defined command alias.
+    Alias {
+        /// The alias name.
+        name: String,
+        /// What it expands to.
+        expansion: String,
+    },
 }
 
 /// Buffer-switcher overlay state.
@@ -253,7 +291,7 @@ pub struct Completion {
     pub start: usize,
     /// Text appended after the inserted candidate (e.g. `": "` for a leading
     /// nick, `" "` for a command, `""` mid-line).
-    pub suffix: &'static str,
+    pub suffix: String,
 }
 
 /// The whole TUI application state.
@@ -302,6 +340,9 @@ pub struct App {
     pub draft: String,
     /// Set when a redraw is needed.
     pub dirty: bool,
+    /// Set when a highlight arrived and `beep_on_highlight` is on; the run loop
+    /// rings the terminal bell and clears it.
+    pub bell: bool,
     /// Set when the app should exit.
     pub should_quit: bool,
 }
@@ -316,7 +357,8 @@ impl App {
         aliases: BTreeMap<String, String>,
         config_path: Option<PathBuf>,
     ) -> Self {
-        let mut console = Buffer::new(CONSOLE, "norn", BufferKind::Status);
+        let cap = client.scrollback_lines;
+        let mut console = Buffer::new(CONSOLE, "norn", BufferKind::Status, cap);
         for line in welcome_lines(networks.is_empty()) {
             console.lines.push(event_line(line));
         }
@@ -325,7 +367,7 @@ impl App {
             networks
                 .iter()
                 .enumerate()
-                .map(|(id, _)| Buffer::new(id, "*", BufferKind::Server)),
+                .map(|(id, _)| Buffer::new(id, "*", BufferKind::Server, cap)),
         );
         // Land on the console when nothing is configured; otherwise the first
         // network's server buffer (index 1, right after the console).
@@ -353,6 +395,7 @@ impl App {
             history_pos: None,
             draft: String::new(),
             dirty: true,
+            bell: false,
             should_quit: false,
         }
     }
@@ -389,7 +432,10 @@ impl App {
             .rposition(|b| b.net == net)
             .map(|i| i + 1)
             .unwrap_or(self.buffers.len());
-        self.buffers.insert(pos, Buffer::new(net, name, kind));
+        self.buffers.insert(
+            pos,
+            Buffer::new(net, name, kind, self.client.scrollback_lines),
+        );
         if pos <= self.active && self.buffers.len() > 1 {
             self.active += 1;
         }
@@ -618,6 +664,9 @@ impl App {
                 self.buffers[idx].mentioned = true;
             }
         }
+        if mention && self.client.beep_on_highlight {
+            self.bell = true;
+        }
     }
 
     /// Switch to a buffer by index, clearing its unread state and marking where
@@ -737,11 +786,67 @@ impl App {
         self.dirty = true;
     }
 
-    /// Open the `/settings` panel with the first row selected.
+    /// Open the `/settings` panel, reset to no filter and the first row.
     pub fn open_settings(&mut self) {
         self.mode = Mode::Settings;
         self.settings = SettingsState::default();
         self.dirty = true;
+    }
+
+    /// The rows shown on the `/settings` panel for the current filter: the
+    /// registry settings (grouped by category) then an `aliases` section, each
+    /// preceded by a header. Headers appear only when the group has a match.
+    pub fn settings_rows(&self) -> Vec<SettingsRow> {
+        let filter = self.settings.filter.trim().to_lowercase();
+        let mut rows = Vec::new();
+        let mut category = "";
+        for doc in crate::settings::SETTINGS {
+            if !crate::settings::matches(doc, &filter) {
+                continue;
+            }
+            if doc.category != category {
+                rows.push(SettingsRow::Header(doc.category));
+                category = doc.category;
+            }
+            rows.push(SettingsRow::Setting(doc));
+        }
+        let alias_hit = |name: &str, exp: &str| {
+            filter.is_empty()
+                || "aliases".contains(&filter)
+                || name.to_lowercase().contains(&filter)
+                || exp.to_lowercase().contains(&filter)
+        };
+        let mut first_alias = true;
+        for (name, expansion) in &self.aliases {
+            if !alias_hit(name, expansion) {
+                continue;
+            }
+            if first_alias {
+                rows.push(SettingsRow::Header("aliases"));
+                first_alias = false;
+            }
+            rows.push(SettingsRow::Alias {
+                name: name.clone(),
+                expansion: expansion.clone(),
+            });
+        }
+        rows
+    }
+
+    /// The selectable (non-header) rows, in display order. The `sel` index refers
+    /// into this list.
+    pub fn settings_selectable(&self) -> Vec<SettingsRow> {
+        self.settings_rows()
+            .into_iter()
+            .filter(|r| !matches!(r, SettingsRow::Header(_)))
+            .collect()
+    }
+
+    /// The currently selected settings row, if any.
+    pub fn selected_setting_row(&self) -> Option<SettingsRow> {
+        self.settings_selectable()
+            .into_iter()
+            .nth(self.settings.sel)
     }
 
     /// Re-derive the live UI mirror (accent, timestamps, nicklist) from
@@ -753,6 +858,76 @@ impl App {
         self.accent = theme::accent_for(&self.client.theme);
         self.dirty = true;
         self.save_config();
+    }
+
+    /// The current value of a setting, rendered for display.
+    pub fn setting_value(&self, key: &str) -> String {
+        let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
+        match key {
+            "timestamps" => on_off(self.client.timestamps),
+            "nick_colors" => on_off(self.client.nick_colors),
+            "theme" => self.client.theme.clone(),
+            "nicklist" => on_off(self.client.nicklist),
+            "completion_char" => self.client.completion_char.clone(),
+            "beep_on_highlight" => on_off(self.client.beep_on_highlight),
+            "scrollback_lines" => self.client.scrollback_lines.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Validate and apply a setting from raw text (shared by `/set` and the
+    /// `/settings` screen). Returns the applied value on success, or a message on
+    /// invalid input. Applies live and auto-saves via [`Self::apply_client_change`].
+    pub fn set_setting(&mut self, key: &str, raw: &str) -> Result<String, String> {
+        use crate::settings::{self, SettingKind};
+        let doc = settings::find(key).ok_or_else(|| format!("unknown setting '{key}'"))?;
+        let raw = raw.trim();
+        let want_bool = || parse_bool(raw).ok_or_else(|| format!("expected on/off, got '{raw}'"));
+        match doc.key {
+            "timestamps" => self.client.timestamps = want_bool()?,
+            "nick_colors" => self.client.nick_colors = want_bool()?,
+            "nicklist" => self.client.nicklist = want_bool()?,
+            "beep_on_highlight" => self.client.beep_on_highlight = want_bool()?,
+            "theme" => {
+                let v = raw.to_ascii_lowercase();
+                if !theme::THEME_NAMES.contains(&v.as_str()) {
+                    return Err(format!(
+                        "expected one of: {}",
+                        theme::THEME_NAMES.join(", ")
+                    ));
+                }
+                self.client.theme = v;
+            }
+            "completion_char" => {
+                if raw.is_empty() {
+                    return Err("value cannot be empty".to_string());
+                }
+                self.client.completion_char = raw.to_string();
+            }
+            "scrollback_lines" => {
+                let SettingKind::Int { min, max } = doc.kind else {
+                    unreachable!("scrollback_lines is an int setting")
+                };
+                let n: usize = raw
+                    .parse()
+                    .map_err(|_| format!("expected a number, got '{raw}'"))?;
+                if !(min..=max).contains(&n) {
+                    return Err(format!("must be between {min} and {max}"));
+                }
+                self.set_scrollback(n);
+            }
+            other => return Err(format!("unknown setting '{other}'")),
+        }
+        self.apply_client_change();
+        Ok(self.setting_value(doc.key))
+    }
+
+    /// Change the per-buffer scrollback cap, trimming every buffer to fit.
+    fn set_scrollback(&mut self, n: usize) {
+        self.client.scrollback_lines = n;
+        for buffer in &mut self.buffers {
+            buffer.set_max_lines(n);
+        }
     }
 
     /// Persist current client prefs and network definitions to the config file.
@@ -918,6 +1093,15 @@ impl App {
         }
         self.cursor = self.input.len();
         self.dirty = true;
+    }
+}
+
+/// Parse `on|off|true|false|yes|no|1|0` into a bool.
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Some(true),
+        "off" | "false" | "no" | "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -1223,6 +1407,51 @@ mod tests {
         assert!(a.buffers[idx].history_exhausted);
         // Once exhausted, scrolling to the top requests nothing more.
         assert!(a.scroll(1).is_none());
+    }
+
+    #[test]
+    fn set_setting_scrollback_trims_and_validates() {
+        let mut a = app();
+        let i = a.server_buffer(0);
+        for n in 0..120 {
+            a.buffers[i].push(event_line(format!("line {n}")));
+        }
+        // The default cap (5000) keeps all 120.
+        assert_eq!(a.buffers[i].lines.len(), 120);
+        // Lowering the cap trims existing buffers immediately.
+        a.set_setting("scrollback_lines", "100").unwrap();
+        assert_eq!(a.buffers[i].lines.len(), 100);
+        assert_eq!(a.client.scrollback_lines, 100);
+        // And new pushes stay capped.
+        for n in 0..10 {
+            a.buffers[i].push(event_line(format!("more {n}")));
+        }
+        assert_eq!(a.buffers[i].lines.len(), 100);
+        // Validation: out of range, unknown key, and a bad enum are all errors.
+        assert!(a.set_setting("scrollback_lines", "0").is_err());
+        assert!(a.set_setting("nope", "x").is_err());
+        assert!(a.set_setting("theme", "chartreuse").is_err());
+        a.set_setting("theme", "amber").unwrap();
+        assert_eq!(a.client.theme, "amber");
+    }
+
+    #[test]
+    fn beep_flag_set_only_when_enabled() {
+        let mut a = app();
+        a.client.beep_on_highlight = true;
+        // A mention in a non-active buffer raises the bell flag.
+        a.apply(engine(
+            0,
+            Event::MessageReceived(chat("#rust", "x", "hey me!")),
+        ));
+        assert!(a.bell);
+        a.bell = false;
+        a.client.beep_on_highlight = false;
+        a.apply(engine(
+            0,
+            Event::MessageReceived(chat("#rust", "x", "me again")),
+        ));
+        assert!(!a.bell, "no bell when the setting is off");
     }
 
     #[test]

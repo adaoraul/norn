@@ -99,6 +99,12 @@ fn default_port() -> u16 {
 fn default_theme() -> String {
     "teal".to_string()
 }
+fn default_completion_char() -> String {
+    ":".to_string()
+}
+fn default_scrollback() -> usize {
+    5000
+}
 
 /// A network as declared in the TOML file (or synthesized from CLI flags).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -135,26 +141,45 @@ pub struct NetworkConfig {
     pub auto_join: Vec<String>,
 }
 
-/// Client-wide UI preferences (the TOML `[client]` table).
+/// Client-wide UI preferences (the TOML `[client]` table). The interactive
+/// `/settings` screen and `/set` command both edit these through the settings
+/// registry (`crate::settings`).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClientConfig {
     /// Whether to show message timestamps.
     #[serde(default = "default_true")]
     pub timestamps: bool,
+    /// Whether to color nicks by a per-nick hue (off = a single muted color).
+    #[serde(default = "default_true")]
+    pub nick_colors: bool,
     /// Accent theme name (see `tui::theme::accent_for`).
     #[serde(default = "default_theme")]
     pub theme: String,
     /// Whether the channel nicklist is shown by default.
     #[serde(default = "default_true")]
     pub nicklist: bool,
+    /// The character inserted after a nick completed at the start of a line
+    /// (followed by a space), e.g. `":"` -> `nick: `.
+    #[serde(default = "default_completion_char")]
+    pub completion_char: String,
+    /// Whether to ring the terminal bell when a message highlights your nick.
+    #[serde(default)]
+    pub beep_on_highlight: bool,
+    /// Maximum number of lines kept per buffer.
+    #[serde(default = "default_scrollback")]
+    pub scrollback_lines: usize,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         ClientConfig {
             timestamps: true,
+            nick_colors: true,
             theme: default_theme(),
             nicklist: true,
+            completion_char: default_completion_char(),
+            beep_on_highlight: false,
+            scrollback_lines: default_scrollback(),
         }
     }
 }
@@ -397,6 +422,7 @@ mod tests {
                 timestamps: false,
                 theme: "amber".into(),
                 nicklist: true,
+                ..ClientConfig::default()
             },
             aliases,
             networks: vec![NetworkConfig {
@@ -433,7 +459,11 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.client.timestamps);
         assert!(config.client.nicklist);
+        assert!(config.client.nick_colors);
         assert_eq!(config.client.theme, "teal");
+        assert_eq!(config.client.completion_char, ":");
+        assert!(!config.client.beep_on_highlight);
+        assert_eq!(config.client.scrollback_lines, 5000);
         assert!(config.networks.is_empty());
     }
 
