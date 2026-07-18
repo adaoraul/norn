@@ -674,7 +674,13 @@ mod tests {
                 nick: "svan".into(),
             },
         }];
-        let mut app = App::new(nets, ClientConfig::default(), Vec::new(), None);
+        let mut app = App::new(
+            nets,
+            ClientConfig::default(),
+            Vec::new(),
+            Default::default(),
+            None,
+        );
         app.apply(UiEvent {
             net: 0,
             kind: UiEventKind::Engine(Event::TopicChanged {
@@ -735,7 +741,13 @@ mod tests {
             my_nick: "svan".into(),
             state: ConnState::Connecting,
         }];
-        let mut app = App::new(nets, ClientConfig::default(), Vec::new(), None);
+        let mut app = App::new(
+            nets,
+            ClientConfig::default(),
+            Vec::new(),
+            Default::default(),
+            None,
+        );
         app.mode = Mode::Switcher;
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -795,7 +807,13 @@ mod tests {
                 nick: "svan".into(),
             },
         }];
-        App::new(nets, ClientConfig::default(), Vec::new(), None)
+        App::new(
+            nets,
+            ClientConfig::default(),
+            Vec::new(),
+            Default::default(),
+            None,
+        )
     }
 
     #[test]

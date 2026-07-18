@@ -1,5 +1,6 @@
 //! TUI application state and engine-event routing.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::Local;
@@ -245,6 +246,8 @@ pub struct App {
     pub client: ClientConfig,
     /// The persisted network definitions (authoritative for `/network`).
     pub definitions: Vec<NetworkConfig>,
+    /// User-defined command aliases (name -> expansion template).
+    pub aliases: BTreeMap<String, String>,
     /// Where to auto-save config (`None` if no config dir is available).
     pub config_path: Option<PathBuf>,
     /// Pending control-plane actions for the supervisor to execute.
@@ -268,6 +271,7 @@ impl App {
         networks: Vec<NetworkMeta>,
         client: ClientConfig,
         definitions: Vec<NetworkConfig>,
+        aliases: BTreeMap<String, String>,
         config_path: Option<PathBuf>,
     ) -> Self {
         let mut console = Buffer::new(CONSOLE, "norn", BufferKind::Status);
@@ -298,6 +302,7 @@ impl App {
             accent: theme::accent_for(&client.theme),
             client,
             definitions,
+            aliases,
             config_path,
             actions: Vec::new(),
             history: Vec::new(),
@@ -669,6 +674,7 @@ impl App {
         };
         let config = Config {
             client: self.client.clone(),
+            aliases: self.aliases.clone(),
             networks: self.definitions.clone(),
         };
         if let Err(err) = config.save(&path) {
@@ -883,7 +889,13 @@ mod tests {
                 state: ConnState::Connecting,
             },
         ];
-        App::new(nets, ClientConfig::default(), Vec::new(), None)
+        App::new(
+            nets,
+            ClientConfig::default(),
+            Vec::new(),
+            Default::default(),
+            None,
+        )
     }
 
     fn engine(net: NetworkId, event: Event) -> UiEvent {
@@ -906,7 +918,13 @@ mod tests {
 
     #[test]
     fn zero_networks_lands_on_console() {
-        let a = App::new(Vec::new(), ClientConfig::default(), Vec::new(), None);
+        let a = App::new(
+            Vec::new(),
+            ClientConfig::default(),
+            Vec::new(),
+            Default::default(),
+            None,
+        );
         assert_eq!(a.buffers.len(), 1);
         assert_eq!(a.buffers[0].kind, BufferKind::Status);
         assert_eq!(a.active, 0);

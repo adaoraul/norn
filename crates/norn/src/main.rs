@@ -30,6 +30,7 @@ async fn main() -> std::io::Result<()> {
         connect,
         definitions,
         client,
+        aliases,
         path,
     } = match config::resolve_startup(&cli) {
         Ok(startup) => startup,
@@ -72,6 +73,7 @@ async fn main() -> std::io::Result<()> {
             metas,
             definitions,
             client,
+            aliases,
             path,
             quit,
         )

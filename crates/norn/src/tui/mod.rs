@@ -87,6 +87,7 @@ pub async fn run(
     networks: Vec<NetworkMeta>,
     definitions: Vec<NetworkConfig>,
     client: ClientConfig,
+    aliases: std::collections::BTreeMap<String, String>,
     config_path: Option<PathBuf>,
     quit: Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -95,7 +96,7 @@ pub async fn run(
     // zero networks; `cmd_txs` grows as networks are added at runtime.
     let mut cmd_txs = cmd_txs;
     let mut guard = TerminalGuard::new()?;
-    let mut app = App::new(networks, client, definitions, config_path);
+    let mut app = App::new(networks, client, definitions, aliases, config_path);
     let mut term_events = EventStream::new();
 
     loop {

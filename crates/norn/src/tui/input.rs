@@ -190,6 +190,27 @@ fn switch_relative(app: &mut App, delta: isize) {
     app.switch_to(next);
 }
 
+/// Names of structural (stateful) commands that aliases cannot shadow.
+const STRUCTURAL: &[&str] = &[
+    "query",
+    "q",
+    "close",
+    "wc",
+    "set",
+    "network",
+    "net",
+    "connect",
+    "server",
+    "disconnect",
+    "reconnect",
+    "clear",
+    "alias",
+    "unalias",
+];
+
+/// Max alias-expansion recursion depth (guards cyclic aliases).
+const MAX_ALIAS_DEPTH: usize = 10;
+
 fn submit(app: &mut App) -> Vec<NetCommand> {
     let text = app.input.trim().to_string();
     app.input.clear();
@@ -199,8 +220,22 @@ fn submit(app: &mut App) -> Vec<NetCommand> {
         return Vec::new();
     }
     app.remember_input(&text);
+    run_command(app, &text, 0)
+}
 
-    // TUI-local commands that open/close buffers.
+/// Dispatch one input line: structural TUI commands first, then user aliases
+/// (which may expand and chain), then IRC verbs via `translate`. `depth` guards
+/// against cyclic aliases.
+fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if depth > MAX_ALIAS_DEPTH {
+        app.push_active_event("alias expansion too deep (cyclic alias?)".to_string());
+        return Vec::new();
+    }
+
     if let Some(rest) = text.strip_prefix('/') {
         let mut it = rest.splitn(2, ' ');
         let cmd = it.next().unwrap_or("").to_ascii_lowercase();
@@ -250,7 +285,25 @@ fn submit(app: &mut App) -> Vec<NetCommand> {
                 app.clear_active();
                 return Vec::new();
             }
+            "alias" => {
+                handle_alias(app, arg);
+                return Vec::new();
+            }
+            "unalias" => {
+                handle_unalias(app, arg);
+                return Vec::new();
+            }
             _ => {}
+        }
+
+        // A user alias: expand (with parameters and `;` chaining) and re-dispatch.
+        if let Some(template) = app.aliases.get(&cmd).cloned() {
+            let args: Vec<&str> = arg.split_whitespace().collect();
+            let mut out = Vec::new();
+            for segment in expand_alias(&template, &args) {
+                out.extend(run_command(app, &segment, depth + 1));
+            }
+            return out;
         }
     }
 
@@ -266,7 +319,7 @@ fn submit(app: &mut App) -> Vec<NetCommand> {
     }
 
     let mut current = target;
-    let result = crate::input::translate(&text, &mut current);
+    let result = crate::input::translate(text, &mut current);
     if let Some(feedback) = result.feedback {
         app.push_active_event(feedback);
     }
@@ -275,6 +328,119 @@ fn submit(app: &mut App) -> Vec<NetCommand> {
         return Vec::new();
     }
     result.lines.into_iter().map(NetCommand::Raw).collect()
+}
+
+/// `/alias` - list, or `/alias <name> <expansion>` to define (auto-saved).
+fn handle_alias(app: &mut App, arg: &str) {
+    if arg.is_empty() {
+        let mut lines = vec!["aliases:".to_string()];
+        if app.aliases.is_empty() {
+            lines.push("  (none defined)".to_string());
+        }
+        for (name, expansion) in &app.aliases {
+            lines.push(format!("  /{name} = {expansion}"));
+        }
+        for line in lines {
+            app.push_console(line);
+        }
+        app.switch_to_console();
+        return;
+    }
+    let mut it = arg.splitn(2, ' ');
+    let name = it
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    let expansion = it.next().unwrap_or("").trim();
+    if name.is_empty() || expansion.is_empty() {
+        app.push_active_event("usage: /alias <name> <expansion>".to_string());
+        return;
+    }
+    if STRUCTURAL.contains(&name.as_str()) {
+        app.push_active_event(format!("cannot alias the built-in command /{name}"));
+        return;
+    }
+    app.aliases.insert(name.clone(), expansion.to_string());
+    app.save_config();
+    app.push_active_event(format!("alias /{name} = {expansion}"));
+}
+
+/// `/unalias <name>` - remove a user alias (auto-saved).
+fn handle_unalias(app: &mut App, arg: &str) {
+    let name = arg
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    if app.aliases.remove(&name).is_some() {
+        app.save_config();
+        app.push_active_event(format!("removed alias /{name}"));
+    } else {
+        app.push_active_event(format!("no alias /{name}"));
+    }
+}
+
+/// Expand an alias template into one or more command lines. Segments split on
+/// `;`. If the template has no `$` placeholder, the raw args are appended;
+/// otherwise `$1..$9` and `$*` are substituted. Each result is normalized to a
+/// slash-command.
+fn expand_alias(template: &str, args: &[&str]) -> Vec<String> {
+    let has_placeholder = template.contains('$');
+    let base = if !has_placeholder && !args.is_empty() {
+        format!("{template} {}", args.join(" "))
+    } else {
+        template.to_string()
+    };
+    base.split(';')
+        .filter_map(|segment| {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                return None;
+            }
+            let expanded = if has_placeholder {
+                substitute_args(segment, args)
+            } else {
+                segment.to_string()
+            };
+            Some(if expanded.starts_with('/') {
+                expanded
+            } else {
+                format!("/{expanded}")
+            })
+        })
+        .collect()
+}
+
+/// Substitute `$1..$9` (1-based positional) and `$*` (all args) in `segment`.
+/// An out-of-range `$N` becomes empty; a `$` not forming a placeholder is kept.
+fn substitute_args(segment: &str, args: &[&str]) -> String {
+    let mut out = String::new();
+    let mut chars = segment.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('*') => {
+                chars.next();
+                out.push_str(&args.join(" "));
+            }
+            Some(d) if d.is_ascii_digit() => {
+                let n = d.to_digit(10).unwrap() as usize;
+                chars.next();
+                if n >= 1 {
+                    if let Some(arg) = args.get(n - 1) {
+                        out.push_str(arg);
+                    }
+                }
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
 }
 
 /// `/set` - view or change a client setting, applied live and auto-saved.
@@ -651,7 +817,13 @@ mod tests {
             my_nick: "me".into(),
             state: ConnState::Connecting,
         }];
-        let mut app = App::new(nets, ClientConfig::default(), Vec::new(), None);
+        let mut app = App::new(
+            nets,
+            ClientConfig::default(),
+            Vec::new(),
+            Default::default(),
+            None,
+        );
         app.apply(crate::session::UiEvent {
             net: 0,
             kind: crate::session::UiEventKind::Engine(irc_engine::Event::NamesLoaded {
@@ -944,6 +1116,55 @@ mod tests {
         assert!(app.definitions.is_empty(), "inline password refused");
         run_line(&mut app, "/network add y nick=n");
         assert!(app.definitions.is_empty(), "host is required");
+    }
+
+    #[test]
+    fn expand_alias_positional_and_star_and_append() {
+        // No placeholder -> append args.
+        assert_eq!(expand_alias("join", &["#rust"]), vec!["/join #rust"]);
+        assert_eq!(expand_alias("quit", &[]), vec!["/quit"]);
+        // Positional substitution.
+        assert_eq!(expand_alias("join $1", &["#rust"]), vec!["/join #rust"]);
+        assert_eq!(
+            expand_alias("me waves at $1", &["bob"]),
+            vec!["/me waves at bob"]
+        );
+        // $* takes all args.
+        assert_eq!(
+            expand_alias("msg bob $*", &["a", "b"]),
+            vec!["/msg bob a b"]
+        );
+        // Chaining with ; keeps a command per segment.
+        assert_eq!(
+            expand_alias("msg $1 hi;msg $1 there", &["bob"]),
+            vec!["/msg bob hi", "/msg bob there"]
+        );
+        // Out-of-range placeholder is empty.
+        assert_eq!(expand_alias("kick $1 $2", &["bob"]), vec!["/kick bob "]);
+    }
+
+    #[test]
+    fn alias_define_expand_and_recursion_guard() {
+        let mut app = app_with_channel(); // active is #rust on net 0
+        run_line(&mut app, "/alias j join $1");
+        assert_eq!(app.aliases.get("j").map(String::as_str), Some("join $1"));
+        // Using the alias expands to a JOIN line.
+        let out = run_line(&mut app, "/j #ratatui");
+        assert_eq!(out, vec![NetCommand::Raw("JOIN #ratatui".to_string())]);
+        // A cyclic alias must not blow the stack; it terminates with feedback.
+        run_line(&mut app, "/alias loop loop");
+        let out = run_line(&mut app, "/loop");
+        assert!(out.is_empty());
+        // /unalias removes it.
+        run_line(&mut app, "/unalias j");
+        assert!(!app.aliases.contains_key("j"));
+    }
+
+    #[test]
+    fn alias_cannot_shadow_a_structural_command() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/alias set something");
+        assert!(!app.aliases.contains_key("set"), "structural name refused");
     }
 
     #[test]

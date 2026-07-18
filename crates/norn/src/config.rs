@@ -6,6 +6,7 @@
 //! `password_command` whose stdout is the password, or falls back to the
 //! `NORN_PASSWORD` environment variable.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
@@ -164,6 +165,9 @@ pub struct Config {
     /// Client-wide UI preferences.
     #[serde(default)]
     pub client: ClientConfig,
+    /// User-defined command aliases (TOML `[aliases]`), name -> expansion.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
     /// Declared networks (TOML `[[network]]` or `[[networks]]`).
     #[serde(default, alias = "network", skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<NetworkConfig>,
@@ -333,6 +337,8 @@ pub struct Startup {
     pub definitions: Vec<NetworkConfig>,
     /// Client UI preferences.
     pub client: ClientConfig,
+    /// User-defined command aliases.
+    pub aliases: BTreeMap<String, String>,
     /// The config file to auto-save to (`None` if no config dir is available).
     pub path: Option<PathBuf>,
 }
@@ -344,6 +350,7 @@ pub struct Startup {
 pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
     let path = cli.config.clone().or_else(default_config_path);
     let mut client = ClientConfig::default();
+    let mut aliases = BTreeMap::new();
     let mut definitions: Vec<NetworkConfig> = Vec::new();
 
     if let Some(path) = &path {
@@ -352,6 +359,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
             let config: Config = toml::from_str(&text)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             client = config.client;
+            aliases = config.aliases;
             definitions = config.networks;
         }
     }
@@ -370,6 +378,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
         connect,
         definitions,
         client,
+        aliases,
         path,
     })
 }
@@ -380,12 +389,16 @@ mod tests {
 
     #[test]
     fn config_round_trips_through_save_serialization() {
+        let mut aliases = BTreeMap::new();
+        aliases.insert("j".to_string(), "join $1".to_string());
+        aliases.insert("exit".to_string(), "quit".to_string());
         let config = Config {
             client: ClientConfig {
                 timestamps: false,
                 theme: "amber".into(),
                 nicklist: true,
             },
+            aliases,
             networks: vec![NetworkConfig {
                 name: "libera".into(),
                 host: "irc.libera.chat".into(),
@@ -408,6 +421,8 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.client.theme, "amber");
         assert!(!back.client.timestamps);
+        assert_eq!(back.aliases.get("j").map(String::as_str), Some("join $1"));
+        assert_eq!(back.aliases.get("exit").map(String::as_str), Some("quit"));
         assert_eq!(back.networks.len(), 1);
         assert_eq!(back.networks[0].sasl_mech, SaslMech::Scram);
         assert_eq!(back.networks[0].auto_join, vec!["#rust"]);
