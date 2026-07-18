@@ -242,6 +242,14 @@ fn submit(app: &mut App) -> Vec<NetCommand> {
                 app.disconnect_active(reason);
                 return Vec::new();
             }
+            "reconnect" => {
+                app.reconnect_active();
+                return Vec::new();
+            }
+            "clear" => {
+                app.clear_active();
+                return Vec::new();
+            }
             _ => {}
         }
     }
@@ -327,7 +335,7 @@ fn handle_network(app: &mut App, arg: &str) {
     let sub = it.next().unwrap_or("").to_ascii_lowercase();
     let rest = it.next().unwrap_or("").trim();
     match sub.as_str() {
-        "list" | "" => {
+        "list" | "ls" | "" => {
             let mut lines = vec!["networks:".to_string()];
             if app.definitions.is_empty() {
                 lines.push("  (none defined)".to_string());
@@ -383,7 +391,61 @@ fn handle_network(app: &mut App, arg: &str) {
                 app.push_active_event(format!("removed network '{name}'"));
             }
         }
-        other => app.push_active_event(format!("usage: /network list|add|remove (got '{other}')")),
+        "show" => {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            let Some(net) = app
+                .definitions
+                .iter()
+                .find(|n| n.name.eq_ignore_ascii_case(name))
+                .cloned()
+            else {
+                app.push_active_event(format!("no network named '{name}'"));
+                return;
+            };
+            // Live connection state, if a network of this name is connected.
+            let live = app
+                .networks
+                .iter()
+                .find(|m| m.name.eq_ignore_ascii_case(&net.name))
+                .map(|m| format!("{:?}", m.state).to_lowercase());
+            let mut lines = vec![
+                format!("network {}:", net.name),
+                format!("  host     = {}:{}", net.host, net.port),
+                format!("  tls      = {}", net.tls),
+                format!("  nick     = {}", net.nick),
+            ];
+            if let Some(user) = &net.user {
+                lines.push(format!("  user     = {user}"));
+            }
+            if let Some(realname) = &net.realname {
+                lines.push(format!("  realname = {realname}"));
+            }
+            if let Some(account) = &net.sasl_account {
+                lines.push(format!(
+                    "  sasl     = {account} ({})",
+                    format!("{:?}", net.sasl_mech).to_lowercase()
+                ));
+                lines.push(format!(
+                    "  password = {}",
+                    if net.password_command.is_some() {
+                        "via password_command"
+                    } else {
+                        "via NORN_PASSWORD"
+                    }
+                ));
+            }
+            if !net.auto_join.is_empty() {
+                lines.push(format!("  join     = {}", net.auto_join.join(", ")));
+            }
+            if let Some(state) = live {
+                lines.push(format!("  state    = {state}"));
+            }
+            for line in lines {
+                app.push_console(line);
+            }
+            app.switch_to_console();
+        }
+        other => app.push_active_event(format!("usage: /network ls|add|rm|show (got '{other}')")),
     }
 }
 
@@ -822,6 +884,56 @@ mod tests {
         assert_eq!(
             app.actions,
             vec![AppAction::Disconnect(0, Some("bye".to_string()))]
+        );
+    }
+
+    #[test]
+    fn network_show_dumps_a_definition() {
+        let mut app = app_with_channel();
+        run_line(
+            &mut app,
+            "/network add libera host=irc.libera.chat nick=svan",
+        );
+        run_line(&mut app, "/network show libera");
+        // Output lands in the console, which becomes active.
+        assert_eq!(app.active_buffer().kind, BufferKind::Status);
+        let text: String = app
+            .active_buffer()
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                crate::tui::state::Line::Event { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("network libera"));
+        assert!(text.contains("irc.libera.chat"));
+    }
+
+    #[test]
+    fn clear_empties_the_active_buffer() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "hi there"); // active is #rust; sends a PRIVMSG
+        app.push_active_event("some noise".to_string());
+        assert!(!app.active_buffer().lines.is_empty());
+        run_line(&mut app, "/clear");
+        assert!(app.active_buffer().lines.is_empty());
+    }
+
+    #[test]
+    fn reconnect_queues_disconnect_then_connect() {
+        use crate::session::ConnState;
+        use crate::tui::state::AppAction;
+        let mut app = app_with_channel();
+        app.networks[0].state = ConnState::Registered { nick: "me".into() };
+        run_line(&mut app, "/reconnect");
+        assert_eq!(
+            app.actions,
+            vec![
+                AppAction::Disconnect(0, Some("reconnecting".to_string())),
+                AppAction::Connect(0),
+            ]
         );
     }
 

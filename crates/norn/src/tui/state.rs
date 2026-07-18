@@ -732,6 +732,32 @@ impl App {
         self.actions.push(AppAction::Disconnect(net, reason));
     }
 
+    /// Reconnect the active buffer's network: drop it then redial. If it is not
+    /// currently connected, just connect. No-op on the console.
+    pub fn reconnect_active(&mut self) {
+        let net = self.active_buffer().net;
+        let Some(meta) = self.networks.get(net) else {
+            self.push_active_event("no network here to reconnect".to_string());
+            return;
+        };
+        if !matches!(meta.state, ConnState::Disconnected | ConnState::Closed) {
+            self.actions
+                .push(AppAction::Disconnect(net, Some("reconnecting".to_string())));
+        }
+        self.actions.push(AppAction::Connect(net));
+    }
+
+    /// Clear the active buffer's scrollback.
+    pub fn clear_active(&mut self) {
+        let idx = self.active;
+        let buffer = &mut self.buffers[idx];
+        buffer.lines.clear();
+        buffer.scroll = 0;
+        buffer.unread = 0;
+        buffer.unread_marker = None;
+        self.dirty = true;
+    }
+
     /// Open (or focus) a query buffer with `nick` on `net`.
     pub fn open_query(&mut self, net: NetworkId, nick: &str) {
         let idx = self.ensure_buffer(net, nick, BufferKind::Query);
