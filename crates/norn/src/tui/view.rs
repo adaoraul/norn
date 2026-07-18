@@ -634,7 +634,7 @@ mod tests {
     use super::*;
     use crate::session::{ConnState, UiEvent, UiEventKind};
     use crate::tui::state::{App, NetworkMeta};
-    use irc_engine::Event;
+    use irc_engine::{Event, TopicChange};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -654,7 +654,7 @@ mod tests {
             net: 0,
             kind: UiEventKind::Engine(Event::TopicChanged {
                 target: "#ratatui".into(),
-                topic: Some("Rust TUI library".into()),
+                change: TopicChange::Set("Rust TUI library".into()),
                 set_by: None,
                 set_at: None,
             }),

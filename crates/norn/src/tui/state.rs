@@ -1,7 +1,7 @@
 //! TUI application state and engine-event routing.
 
 use chrono::Local;
-use irc_engine::{Event, LeaveReason, Member, MessageKind};
+use irc_engine::{Event, LeaveReason, Member, MessageKind, TopicChange};
 use irc_proto::Source;
 use ratatui::style::Color;
 
@@ -402,19 +402,18 @@ impl App {
             }
             Event::TopicChanged {
                 target,
-                topic,
+                change,
                 set_by,
                 ..
             } => {
                 let idx = self.ensure_buffer(net, &target, BufferKind::Channel);
-                // Set text when present; a bare 331 (no setter) clears it; a
-                // metadata-only 333 (setter, no text) leaves the text alone.
-                if topic.is_some() {
-                    self.buffers[idx].topic = topic.clone();
-                } else if set_by.is_none() {
-                    self.buffers[idx].topic = None;
+                // Set/clear the stored text; a metadata-only 333 leaves it alone.
+                match &change {
+                    TopicChange::Set(t) => self.buffers[idx].topic = Some(t.clone()),
+                    TopicChange::Cleared => self.buffers[idx].topic = None,
+                    TopicChange::Unchanged => {}
                 }
-                if let Some(text) = topic_line(&target, &topic, &set_by) {
+                if let Some(text) = topic_line(&target, &change, &set_by) {
                     self.buffers[idx].push(event_line(text));
                 }
             }
@@ -665,11 +664,12 @@ fn source_nick(source: &Source) -> &str {
     }
 }
 
-fn topic_line(target: &str, topic: &Option<String>, set_by: &Option<String>) -> Option<String> {
-    match (topic, set_by) {
-        (Some(t), _) => Some(format!("topic for {target}: {t}")),
-        (None, Some(by)) => Some(format!("topic set by {by}")),
-        (None, None) => Some(format!("{target} has no topic")),
+fn topic_line(target: &str, change: &TopicChange, set_by: &Option<String>) -> Option<String> {
+    match (change, set_by) {
+        (TopicChange::Set(t), _) => Some(format!("topic for {target}: {t}")),
+        (TopicChange::Unchanged, Some(by)) => Some(format!("topic set by {by}")),
+        (TopicChange::Unchanged, None) => None,
+        (TopicChange::Cleared, _) => Some(format!("{target} has no topic")),
     }
 }
 
@@ -839,24 +839,37 @@ mod tests {
             0,
             Event::TopicChanged {
                 target: "#rust".into(),
-                topic: Some("hello".into()),
+                change: TopicChange::Set("hello".into()),
                 set_by: None,
                 set_at: None,
             },
         ));
         let idx = a.buffer_index(0, "#rust").unwrap();
         assert_eq!(a.buffers[idx].topic.as_deref(), Some("hello"));
-        // 333-style metadata: setter present, no text -> keep the topic.
+        // 333-style metadata: Unchanged -> keep the topic text.
         a.apply(engine(
             0,
             Event::TopicChanged {
                 target: "#rust".into(),
-                topic: None,
+                change: TopicChange::Unchanged,
                 set_by: Some("op".into()),
                 set_at: None,
             },
         ));
         assert_eq!(a.buffers[idx].topic.as_deref(), Some("hello"));
+        // A genuine live clear (Cleared) removes the stored topic, even though
+        // it too has a setter -- the case the old Option model could not tell
+        // apart from 333 metadata.
+        a.apply(engine(
+            0,
+            Event::TopicChanged {
+                target: "#rust".into(),
+                change: TopicChange::Cleared,
+                set_by: Some("op".into()),
+                set_at: None,
+            },
+        ));
+        assert_eq!(a.buffers[idx].topic, None);
     }
 
     #[test]

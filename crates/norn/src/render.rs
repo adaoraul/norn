@@ -4,7 +4,7 @@
 //! caller prefixes them with the network name and prints them. The TUI consumes
 //! the same `Event`s directly instead.
 
-use irc_engine::{ChatMessage, Event, LeaveReason, MessageKind};
+use irc_engine::{ChatMessage, Event, LeaveReason, MessageKind, TopicChange};
 use irc_proto::Source;
 
 /// Format one event as zero or more display lines.
@@ -42,13 +42,16 @@ pub fn render(event: &Event) -> Vec<String> {
         }
         Event::TopicChanged {
             target,
-            topic,
+            change,
             set_by,
             ..
-        } => match (topic, set_by) {
-            (Some(topic), _) => vec![format!("-- topic for {target}: {topic}")],
-            (None, Some(by)) => vec![format!("-- topic for {target} set by {by}")],
-            (None, None) => vec![format!("-- {target} has no topic")],
+        } => match (change, set_by) {
+            (TopicChange::Set(topic), _) => vec![format!("-- topic for {target}: {topic}")],
+            (TopicChange::Unchanged, Some(by)) => {
+                vec![format!("-- topic for {target} set by {by}")]
+            }
+            (TopicChange::Unchanged, None) => vec![],
+            (TopicChange::Cleared, _) => vec![format!("-- {target} has no topic")],
         },
         Event::MemberJoined {
             target,

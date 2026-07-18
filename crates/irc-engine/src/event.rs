@@ -49,6 +49,20 @@ impl User {
     }
 }
 
+/// What a [`Event::TopicChanged`] asserts about the topic text, kept distinct
+/// so a genuine clear is never confused with a metadata-only update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicChange {
+    /// The topic text is now this (RPL_TOPIC 332, or a live `TOPIC` with text).
+    Set(String),
+    /// The topic was cleared or there is none (RPL_NOTOPIC 331, or a live
+    /// `TOPIC` with an empty trailing param).
+    Cleared,
+    /// This event carries only who/when metadata (RPL_TOPICWHOTIME 333); the
+    /// topic text is unchanged and must not be overwritten.
+    Unchanged,
+}
+
 /// Why a member left a channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaveReason {
@@ -107,16 +121,14 @@ pub enum Event {
     },
     /// A channel topic, or its metadata, changed.
     ///
-    /// `topic` is `Some` for topic text (RPL_TOPIC 332 or a live `TOPIC`), and
-    /// `None` when there is no topic (RPL_NOTOPIC 331), the topic was cleared,
-    /// or this event carries only who/when metadata (RPL_TOPICWHOTIME 333). A
-    /// consumer must not overwrite stored topic text when `topic` is `None` but
-    /// `set_by`/`set_at` are present.
+    /// `change` distinguishes a topic set, a clear, and a metadata-only update
+    /// (RPL_TOPICWHOTIME 333) so a live clear is never mistaken for stale
+    /// metadata. `set_by`/`set_at` carry who/when when the server supplies them.
     TopicChanged {
         /// The channel.
         target: String,
-        /// The topic text, if this event sets it.
-        topic: Option<String>,
+        /// What happened to the topic text.
+        change: TopicChange,
         /// Who set the topic, if known.
         set_by: Option<String>,
         /// When the topic was set, if known.

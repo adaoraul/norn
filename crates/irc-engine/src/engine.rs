@@ -14,7 +14,7 @@ use irc_proto::{Command, Message};
 
 use crate::batch::{BatchCollector, CollectorOutput, CompletedBatch};
 use crate::chat::ChatMessage;
-use crate::event::{Event, LeaveReason};
+use crate::event::{Event, LeaveReason, TopicChange};
 use crate::history::ChatHistoryRequest;
 use crate::identity::identity_event;
 use crate::labels::LabelRouter;
@@ -126,7 +126,7 @@ impl Engine {
                 if let Some(channel) = msg.params.get(1) {
                     events.push(Event::TopicChanged {
                         target: channel.clone(),
-                        topic: Some(msg.params.get(2).cloned().unwrap_or_default()),
+                        change: TopicChange::Set(msg.params.get(2).cloned().unwrap_or_default()),
                         set_by: None,
                         set_at: None,
                     });
@@ -138,7 +138,7 @@ impl Engine {
                 if let Some(channel) = msg.params.get(1) {
                     events.push(Event::TopicChanged {
                         target: channel.clone(),
-                        topic: None,
+                        change: TopicChange::Cleared,
                         set_by: None,
                         set_at: None,
                     });
@@ -155,7 +155,8 @@ impl Engine {
                         .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0));
                     events.push(Event::TopicChanged {
                         target: channel.clone(),
-                        topic: None,
+                        // Metadata only: never touch the stored topic text.
+                        change: TopicChange::Unchanged,
                         set_by: msg.params.get(2).cloned(),
                         set_at,
                     });
@@ -165,9 +166,10 @@ impl Engine {
             // Live topic change: :nick!u@h TOPIC <channel> :<new topic>
             Command::Named(name) if name == "TOPIC" => {
                 if let Some(channel) = msg.params.first() {
-                    let topic = match msg.params.get(1) {
-                        Some(t) if !t.is_empty() => Some(t.clone()),
-                        _ => None, // cleared
+                    // A present-but-empty trailing param is a genuine clear.
+                    let change = match msg.params.get(1) {
+                        Some(t) if !t.is_empty() => TopicChange::Set(t.clone()),
+                        _ => TopicChange::Cleared,
                     };
                     let set_by = msg.source.as_ref().and_then(|s| match s {
                         irc_proto::Source::User { nick, .. } => Some(nick.clone()),
@@ -175,7 +177,7 @@ impl Engine {
                     });
                     events.push(Event::TopicChanged {
                         target: channel.clone(),
-                        topic,
+                        change,
                         set_by,
                         set_at: msg.server_time(),
                     });
@@ -314,11 +316,12 @@ mod tests {
         let events = feed(&mut e, ":s 332 me #rust :Rust programming");
         assert!(matches!(
             &events[0],
-            Event::TopicChanged { target, topic: Some(t), .. } if target == "#rust" && t == "Rust programming"
+            Event::TopicChanged { target, change: TopicChange::Set(t), .. }
+                if target == "#rust" && t == "Rust programming"
         ));
         let events = feed(&mut e, ":s 333 me #rust setter 1600000000");
         let Event::TopicChanged {
-            topic,
+            change,
             set_by,
             set_at,
             ..
@@ -326,7 +329,8 @@ mod tests {
         else {
             panic!("expected TopicChanged");
         };
-        assert!(topic.is_none()); // metadata only, don't overwrite text
+        // Metadata only: unchanged, so a consumer keeps the stored text.
+        assert_eq!(*change, TopicChange::Unchanged);
         assert_eq!(set_by.as_deref(), Some("setter"));
         assert!(set_at.is_some());
     }
@@ -336,18 +340,22 @@ mod tests {
         let mut e = Engine::new();
         assert!(matches!(
             &feed(&mut e, ":s 331 me #rust :No topic is set")[0],
-            Event::TopicChanged { topic: None, .. }
+            Event::TopicChanged {
+                change: TopicChange::Cleared,
+                ..
+            }
         ));
         assert!(matches!(
             &feed(&mut e, ":op!u@h TOPIC #rust :new topic")[0],
-            Event::TopicChanged { topic: Some(t), set_by: Some(by), .. }
+            Event::TopicChanged { change: TopicChange::Set(t), set_by: Some(by), .. }
                 if t == "new topic" && by == "op"
         ));
-        // Empty trailing clears the topic.
+        // A live TOPIC with an empty trailing is a genuine clear (distinct from
+        // the metadata-only 333, which would be Unchanged).
         assert!(matches!(
             &feed(&mut e, ":op!u@h TOPIC #rust :")[0],
             Event::TopicChanged {
-                topic: None,
+                change: TopicChange::Cleared,
                 set_by: Some(_),
                 ..
             }
