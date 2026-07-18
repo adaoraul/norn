@@ -200,9 +200,19 @@ fn process_ui_event(
                 }
             }
             Reaction::Notify { net, text } => app.push_notice(net, text),
+            Reaction::Desktop { text } => desktop_notify(text),
         }
     }
     app.apply(event);
+}
+
+/// Raise an OS desktop notification via `notify-send`, fire-and-forget. Errors
+/// (missing binary, no desktop) are ignored; this never blocks the UI loop.
+fn desktop_notify(text: String) {
+    let _ = tokio::process::Command::new("notify-send")
+        .arg("norn")
+        .arg(text)
+        .spawn();
 }
 
 /// Store the discovered plugins on the app and report any load failures to the

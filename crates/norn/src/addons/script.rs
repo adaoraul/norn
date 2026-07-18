@@ -414,6 +414,13 @@ fn build_engine(state: Rc<RefCell<HostState>>) -> Engine {
     engine.register_fn("nick", move || -> ImmutableString {
         st.borrow().my_nick.clone().into()
     });
+    // desktop_notify(text): raise an OS desktop notification (host runs it).
+    let st = state.clone();
+    engine.register_fn("desktop_notify", move |text: ImmutableString| {
+        st.borrow_mut().reactions.push(Reaction::Desktop {
+            text: text.to_string(),
+        });
+    });
 
     // KV store: `store.get/set/del/has/keys`, namespaced per plugin and persisted
     // by the host. Scripts never see the path or touch disk themselves.
@@ -640,6 +647,20 @@ mod tests {
                 "PRIVMSG #c :[]",
             ]
         );
+    }
+
+    #[test]
+    fn desktop_notify_yields_a_desktop_reaction() {
+        let mut h = RhaiHost::from_sources(
+            &[(
+                "d.rhai",
+                r#"fn on_message(m) { desktop_notify("hi " + m.nick); }"#,
+            )],
+            &[],
+        );
+        let out = h.on_event(&message("#c", "bob", "hey"), &ctx("me"));
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Reaction::Desktop { text } if text == "hi bob"));
     }
 
     #[test]

@@ -196,6 +196,11 @@ pub enum Reaction {
         /// The text to show.
         text: String,
     },
+    /// Raise an OS desktop notification (the host runs `notify-send`).
+    Desktop {
+        /// The notification body.
+        text: String,
+    },
 }
 
 /// A source of reactions to engine events, behind one boundary.
@@ -291,6 +296,7 @@ mod tests {
                     net: event.net,
                     lines: lines.clone(),
                 }],
+                Reaction::Desktop { text } => vec![Reaction::Desktop { text: text.clone() }],
             }
         }
     }
