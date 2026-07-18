@@ -43,12 +43,21 @@ impl LabelRouter {
         LabelRouter::default()
     }
 
+    /// Mint a fresh label with no waiter attached. Use this for commands whose
+    /// response is correlated out-of-band (e.g. turned into an emitted event,
+    /// as CHATHISTORY is) rather than awaited through a oneshot. Sharing this
+    /// allocator keeps every `@label` on a connection drawn from one sequence,
+    /// so a router-awaited command and an event-correlated one never collide.
+    pub fn allocate(&mut self) -> String {
+        self.counter += 1;
+        self.counter.to_string()
+    }
+
     /// Allocate a unique label and return it together with the receiver that
     /// resolves when the response arrives. Attach the label to the outgoing
     /// command as `@label=<id>` and `await` the receiver for the result.
     pub fn register(&mut self) -> (String, oneshot::Receiver<LabeledResponse>) {
-        self.counter += 1;
-        let label = self.counter.to_string();
+        let label = self.allocate();
         let (tx, rx) = oneshot::channel();
         self.pending.insert(label.clone(), tx);
         (label, rx)
@@ -145,6 +154,22 @@ mod tests {
         let mut router = LabelRouter::new();
         assert!(!router.resolve_empty("does-not-exist"));
         assert_eq!(router.pending_count(), 0);
+    }
+
+    #[test]
+    fn allocate_and_register_draw_from_one_sequence() {
+        // A bare allocation and a registered (awaited) label must never repeat:
+        // one shared counter backs both so labels on a connection stay unique.
+        let mut router = LabelRouter::new();
+        let a = router.allocate();
+        let (b, _rx) = router.register();
+        let c = router.allocate();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        // A bare allocation registers no waiter.
+        assert!(!router.is_pending(&a));
+        assert!(router.is_pending(&b));
     }
 
     #[tokio::test]

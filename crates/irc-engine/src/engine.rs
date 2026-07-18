@@ -17,6 +17,7 @@ use crate::chat::ChatMessage;
 use crate::event::{Event, LeaveReason};
 use crate::history::ChatHistoryRequest;
 use crate::identity::identity_event;
+use crate::labels::LabelRouter;
 use crate::roster::Roster;
 use crate::stdreply::StandardReply;
 
@@ -34,7 +35,10 @@ pub struct Engine {
     history: HashMap<String, ChatHistoryRequest>,
     /// Per-channel membership, accumulated from NAMES and membership events.
     rosters: HashMap<String, Roster>,
-    next_label: u64,
+    /// The single `@label` authority for this connection. CHATHISTORY mints
+    /// bare labels here (correlated via `history` on batch close); awaited
+    /// labeled commands would `register` for a oneshot on the same sequence.
+    labels: LabelRouter,
 }
 
 impl Engine {
@@ -47,8 +51,7 @@ impl Engine {
     /// context so the response can be turned into `HistoryLoaded`. Send the
     /// returned line to the server.
     pub fn request_history(&mut self, request: ChatHistoryRequest) -> String {
-        self.next_label += 1;
-        let label = self.next_label.to_string();
+        let label = self.labels.allocate();
         let line = format!("@label={label} {}", request.command());
         self.history.insert(label, request);
         line
