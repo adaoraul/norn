@@ -238,6 +238,11 @@ pub struct Config {
     /// Addon script filenames that are installed but disabled (not loaded).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_plugins: Vec<String>,
+    /// Per-plugin config overrides (TOML `[plugin_config.<file>]`): plugin
+    /// filename -> key -> value. Only values differing from the plugin's declared
+    /// default are stored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugin_config: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Header prepended to a saved config (auto-save rewrites the file, so any
@@ -430,6 +435,8 @@ pub struct Startup {
     pub triggers: Vec<TriggerConfig>,
     /// Disabled addon script filenames.
     pub disabled_plugins: Vec<String>,
+    /// Per-plugin config overrides (filename -> key -> value).
+    pub plugin_config: BTreeMap<String, BTreeMap<String, String>>,
     /// The config file to auto-save to (`None` if no config dir is available).
     pub path: Option<PathBuf>,
 }
@@ -445,6 +452,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
     let mut definitions: Vec<NetworkConfig> = Vec::new();
     let mut triggers: Vec<TriggerConfig> = Vec::new();
     let mut disabled_plugins: Vec<String> = Vec::new();
+    let mut plugin_config: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
 
     if let Some(path) = &path {
         if path.exists() {
@@ -456,6 +464,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
             definitions = config.networks;
             triggers = config.triggers;
             disabled_plugins = config.disabled_plugins;
+            plugin_config = config.plugin_config;
         }
     }
 
@@ -481,6 +490,7 @@ pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
         aliases,
         triggers,
         disabled_plugins,
+        plugin_config,
         path,
     })
 }
@@ -524,6 +534,13 @@ mod tests {
                 enabled: true,
             }],
             disabled_plugins: vec!["weather.rhai".into()],
+            plugin_config: {
+                let mut m = BTreeMap::new();
+                let mut keys = BTreeMap::new();
+                keys.insert("TRUSTED".to_string(), "alice,bob".to_string());
+                m.insert("autoop.rhai".to_string(), keys);
+                m
+            },
         };
         let text = toml::to_string_pretty(&config).unwrap();
         // Never leak a resolved password (there is no password field to leak),
@@ -544,6 +561,12 @@ mod tests {
         assert_eq!(back.triggers[0].on, "highlight");
         assert_eq!(back.triggers[0].run, "notify $nick: $msg");
         assert_eq!(back.disabled_plugins, vec!["weather.rhai"]);
+        assert_eq!(
+            back.plugin_config
+                .get("autoop.rhai")
+                .and_then(|m| m.get("TRUSTED")),
+            Some(&"alice,bob".to_string())
+        );
     }
 
     #[test]

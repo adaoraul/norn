@@ -256,6 +256,13 @@ const PLUGINS_SUBS: &[SubDoc] = &[
         params: &[req("name", ArgKind::Plugin, "the script to disable")],
         examples: &["/plugins disable urlgrab"],
     },
+    SubDoc {
+        name: "config",
+        usage: "/plugins config <name>",
+        desc: "Open a plugin's settings editor (for plugins that declare CONFIG).",
+        params: &[req("name", ArgKind::Plugin, "the plugin to configure")],
+        examples: &["/plugins config autoop"],
+    },
 ];
 
 const SET_SUBS: &[SubDoc] = &[

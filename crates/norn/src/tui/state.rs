@@ -224,6 +224,8 @@ pub enum Mode {
     Networks,
     /// The `/plugins` manager is open.
     Plugins,
+    /// A single plugin's config editor is open.
+    PluginConfig,
 }
 
 /// Which pane of the `/help` panel has focus.
@@ -255,6 +257,21 @@ pub struct HelpState {
 pub struct PluginsState {
     /// Index of the highlighted plugin (into `App.plugins`).
     pub sel: usize,
+}
+
+/// State of a single plugin's config editor (`/plugins config <name>`).
+#[derive(Debug, Clone, Default)]
+pub struct PluginConfigState {
+    /// The plugin's filename (key into `plugin_config`).
+    pub file: String,
+    /// The plugin's display name (for the header).
+    pub name: String,
+    /// Index of the highlighted config key.
+    pub sel: usize,
+    /// When editing a value, the in-progress text.
+    pub editing: Option<String>,
+    /// A transient status line (e.g. "saved").
+    pub msg: Option<String>,
 }
 
 /// State of the `/settings` panel: a live filter, the selected row, an optional
@@ -461,6 +478,11 @@ pub struct App {
     pub triggers: Vec<TriggerConfig>,
     /// Disabled addon-script filenames (persisted).
     pub disabled_plugins: Vec<String>,
+    /// Per-plugin config overrides (persisted): filename -> key -> value.
+    pub plugin_config:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// State of the per-plugin config editor.
+    pub plugin_cfg: PluginConfigState,
     /// Discovered addon scripts with status/metadata for `/plugins` (runtime).
     pub plugins: Vec<PluginInfo>,
     /// Where to auto-save config (`None` if no config dir is available).
@@ -528,6 +550,8 @@ impl App {
             aliases,
             triggers: Vec::new(),
             disabled_plugins: Vec::new(),
+            plugin_config: std::collections::BTreeMap::new(),
+            plugin_cfg: PluginConfigState::default(),
             plugins: Vec::new(),
             config_path,
             actions: Vec::new(),
@@ -1147,6 +1171,7 @@ impl App {
             networks: self.definitions.clone(),
             triggers: self.triggers.clone(),
             disabled_plugins: self.disabled_plugins.clone(),
+            plugin_config: self.plugin_config.clone(),
         };
         if let Err(err) = config.save(&path) {
             self.push_active_event(format!("save failed: {err}"));
@@ -1233,6 +1258,81 @@ impl App {
         std::fs::write(&path, plugin.source).map_err(|e| e.to_string())?;
         self.actions.push(AppAction::ReloadAddons);
         Ok(file)
+    }
+
+    /// Open the config editor for the plugin selected on the `/plugins` screen.
+    /// Reports (without opening) if that plugin declares no config.
+    pub fn open_plugin_config_selected(&mut self) {
+        let idx = self.plugins_ui.sel;
+        let Some(p) = self.plugins.get(idx) else {
+            return;
+        };
+        let (file, name, empty) = (p.file.clone(), p.name.clone(), p.config.is_empty());
+        if empty {
+            self.push_active_event(format!("{name} has no configurable settings"));
+            return;
+        }
+        self.plugin_cfg = PluginConfigState {
+            file,
+            name,
+            sel: 0,
+            editing: None,
+            msg: None,
+        };
+        self.mode = Mode::PluginConfig;
+    }
+
+    /// Open the config editor for a plugin by name/file/stem (`/plugins config`).
+    pub fn open_plugin_config(&mut self, name: &str) {
+        let Some(idx) = self.plugins.iter().position(|p| {
+            p.name.eq_ignore_ascii_case(name)
+                || p.file.eq_ignore_ascii_case(name)
+                || p.file.eq_ignore_ascii_case(&format!("{name}.rhai"))
+        }) else {
+            self.push_active_event(format!("no plugin '{name}'"));
+            return;
+        };
+        self.plugins_ui.sel = idx;
+        self.open_plugin_config_selected();
+    }
+
+    /// The config schema (key, default) of the plugin being edited.
+    pub fn plugin_cfg_schema(&self) -> Vec<(String, String)> {
+        self.plugins
+            .iter()
+            .find(|p| p.file == self.plugin_cfg.file)
+            .map(|p| p.config.clone())
+            .unwrap_or_default()
+    }
+
+    /// The current value of a config key: the user override, else the default.
+    pub fn plugin_cfg_value(&self, key: &str, default: &str) -> String {
+        self.plugin_config
+            .get(&self.plugin_cfg.file)
+            .and_then(|m| m.get(key))
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
+    }
+
+    /// Set a config override for the edited plugin (dropping it when equal to the
+    /// default so the config file stays clean), then save and reload.
+    pub fn set_plugin_cfg_value(&mut self, key: &str, value: &str, default: &str) {
+        let file = self.plugin_cfg.file.clone();
+        if value == default {
+            if let Some(m) = self.plugin_config.get_mut(&file) {
+                m.remove(key);
+                if m.is_empty() {
+                    self.plugin_config.remove(&file);
+                }
+            }
+        } else {
+            self.plugin_config
+                .entry(file)
+                .or_default()
+                .insert(key.to_string(), value.to_string());
+        }
+        self.save_config();
+        self.actions.push(AppAction::ReloadAddons);
     }
 
     /// Connect a network by name: revive an existing idle one, or spawn a new

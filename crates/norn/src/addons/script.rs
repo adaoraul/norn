@@ -7,7 +7,7 @@
 //! default (no filesystem or network access is registered).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -39,6 +39,9 @@ struct HostState {
     store_path: Option<PathBuf>,
     /// Our presence on the event's network (for the read-only accessors).
     presence: Presence,
+    /// Effective per-plugin config (defaults merged with user overrides): plugin
+    /// stem -> key -> value. Read by `cfg(key)`.
+    config: HashMap<String, HashMap<String, String>>,
 }
 
 /// The `store` handle scripts call methods on (`store.get`/`set`/...). Zero-sized;
@@ -69,7 +72,11 @@ impl RhaiHost {
     /// Load every `*.rhai` file under `dir` (sorted). Each is compiled to detect
     /// failures and read metadata; only enabled (not `disabled`) ones that
     /// compile get their hooks registered. Missing dir is fine.
-    pub fn load(dir: &Path, disabled: &HashSet<String>) -> RhaiHost {
+    pub fn load(
+        dir: &Path,
+        disabled: &HashSet<String>,
+        overrides: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> RhaiHost {
         let mut entries: Vec<(String, Result<String, String>)> = Vec::new();
         if dir.is_dir() {
             let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
@@ -95,25 +102,36 @@ impl RhaiHost {
                 ));
             }
         }
-        RhaiHost::build(entries, disabled, Some(dir.join("store.toml")))
+        RhaiHost::build(entries, disabled, Some(dir.join("store.toml")), overrides)
     }
 
     /// Build from in-memory `(file, source)` scripts (for tests). The KV store is
     /// in-memory only (no persistence path).
     #[cfg(test)]
     pub fn from_sources(sources: &[(&str, &str)], disabled: &[&str]) -> RhaiHost {
+        RhaiHost::from_sources_cfg(sources, disabled, &BTreeMap::new())
+    }
+
+    /// Like [`Self::from_sources`], with per-plugin config overrides (for tests).
+    #[cfg(test)]
+    pub fn from_sources_cfg(
+        sources: &[(&str, &str)],
+        disabled: &[&str],
+        overrides: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> RhaiHost {
         let entries = sources
             .iter()
             .map(|(f, s)| (f.to_string(), Ok(s.to_string())))
             .collect();
         let disabled: HashSet<String> = disabled.iter().map(|s| s.to_string()).collect();
-        RhaiHost::build(entries, &disabled, None)
+        RhaiHost::build(entries, &disabled, None, overrides)
     }
 
     fn build(
         entries: Vec<(String, Result<String, String>)>,
         disabled: &HashSet<String>,
         store_path: Option<PathBuf>,
+        overrides: &BTreeMap<String, BTreeMap<String, String>>,
     ) -> RhaiHost {
         let mut host_state = HostState::default();
         if let Some(path) = &store_path {
@@ -128,6 +146,8 @@ impl RhaiHost {
         let engine = build_engine(state.clone());
         let mut scripts = Vec::new();
         let mut plugins = Vec::new();
+        // Effective config per enabled plugin (stem -> key -> value), read by cfg().
+        let mut effective: HashMap<String, HashMap<String, String>> = HashMap::new();
         for (file, source) in entries {
             let src = match source {
                 Ok(src) => src,
@@ -139,6 +159,7 @@ impl RhaiHost {
             match engine.compile(&src) {
                 Ok(ast) => {
                     let (name, description, version) = read_metadata(&ast, &file);
+                    let schema = read_config_schema(&ast);
                     let off = disabled.contains(&file);
                     if !off {
                         let hooks: HashSet<String> =
@@ -147,6 +168,17 @@ impl RhaiHost {
                             .iter_literal_variables(true, false)
                             .map(|(k, _, v)| (k.to_string(), v))
                             .collect();
+                        // Defaults overridden by the user's stored values (only
+                        // keys the plugin actually declares).
+                        let mut eff: HashMap<String, String> = schema.iter().cloned().collect();
+                        if let Some(ov) = overrides.get(&file) {
+                            for (k, v) in ov {
+                                if eff.contains_key(k) {
+                                    eff.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        effective.insert(stem(&file), eff);
                         scripts.push(Script {
                             label: file.clone(),
                             ast,
@@ -164,11 +196,13 @@ impl RhaiHost {
                         } else {
                             PluginStatus::Loaded
                         },
+                        config: schema,
                     });
                 }
                 Err(err) => plugins.push(failed_plugin(&file, err.to_string())),
             }
         }
+        state.borrow_mut().config = effective;
         // Order for display: loaded, then disabled, then failed; name within.
         let group = |p: &PluginInfo| match p.status {
             PluginStatus::Loaded => 0u8,
@@ -202,6 +236,7 @@ fn failed_plugin(file: &str, err: String) -> PluginInfo {
         description: String::new(),
         version: String::new(),
         status: PluginStatus::Failed(err),
+        config: Vec::new(),
     }
 }
 
@@ -230,6 +265,24 @@ fn read_metadata(ast: &AST, file: &str) -> (String, String, String) {
         name = stem(file);
     }
     (name, description, version)
+}
+
+/// Read a script's `CONFIG` const (a map of key -> default value) as sorted
+/// `(key, default)` pairs, without running it. Empty if absent or not a map.
+fn read_config_schema(ast: &AST) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (key, _is_const, value) in ast.iter_literal_variables(true, false) {
+        if key == "CONFIG" {
+            if let Some(map) = value.try_cast::<Map>() {
+                for (k, v) in map {
+                    let text = v.clone().into_string().unwrap_or_else(|_| v.to_string());
+                    out.push((k.to_string(), text));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 impl AddonHost for RhaiHost {
@@ -440,6 +493,18 @@ fn build_engine(state: Rc<RefCell<HostState>>) -> Engine {
     let st = state.clone();
     engine.register_fn("nick", move || -> ImmutableString {
         st.borrow().my_nick.clone().into()
+    });
+    // cfg(key): this plugin's config value (user override, else declared default,
+    // else ""). Lets scripts read tunable settings without hard-coding them.
+    let st = state.clone();
+    engine.register_fn("cfg", move |key: ImmutableString| -> ImmutableString {
+        let s = st.borrow();
+        s.config
+            .get(&s.current_script)
+            .and_then(|m| m.get(key.as_str()))
+            .cloned()
+            .unwrap_or_default()
+            .into()
     });
     // desktop_notify(text): raise an OS desktop notification (host runs it).
     let st = state.clone();
@@ -821,6 +886,34 @@ mod tests {
         };
         let out = h.on_event(&active, &ctx("me"));
         assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["AWAY"]));
+    }
+
+    #[test]
+    fn cfg_returns_override_else_default() {
+        let src = r##"const CONFIG = #{ greeting: "hi", target: "#norn" };
+                     fn on_message(m) { reply(cfg("greeting") + " to " + cfg("target")); }"##;
+        // No override: declared defaults.
+        let mut h = RhaiHost::from_sources(&[("g.rhai", src)], &[]);
+        let out = h.on_event(&message("#c", "bob", "yo"), &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Send { lines, .. }
+            if lines == &["PRIVMSG #c :hi to #norn"]));
+        // The declared schema is exposed on PluginInfo, sorted by key.
+        assert_eq!(
+            h.plugins()[0].config,
+            vec![
+                ("greeting".to_string(), "hi".to_string()),
+                ("target".to_string(), "#norn".to_string()),
+            ]
+        );
+        // With an override on one key, the other keeps its default.
+        let mut overrides = BTreeMap::new();
+        let mut keys = BTreeMap::new();
+        keys.insert("greeting".to_string(), "yo".to_string());
+        overrides.insert("g.rhai".to_string(), keys);
+        let mut h = RhaiHost::from_sources_cfg(&[("g.rhai", src)], &[], &overrides);
+        let out = h.on_event(&message("#c", "bob", "yo"), &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Send { lines, .. }
+            if lines == &["PRIVMSG #c :yo to #norn"]));
     }
 
     #[test]

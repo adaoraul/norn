@@ -9,7 +9,7 @@ pub mod official;
 mod script;
 mod triggers;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use irc_engine::{Event, LeaveReason, MessageKind};
@@ -279,6 +279,9 @@ pub struct PluginInfo {
     pub version: String,
     /// Load status.
     pub status: PluginStatus,
+    /// Declared config keys and their defaults (from the `CONFIG` const), sorted
+    /// by key. Empty if the plugin declares no config.
+    pub config: Vec<(String, String)>,
 }
 
 /// The result of assembling the addon host: the host plus the discovered plugin
@@ -296,11 +299,12 @@ pub fn build_addon_host(
     triggers: &[TriggerConfig],
     plugins_dir: Option<&Path>,
     disabled: &HashSet<String>,
+    plugin_config: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> AddonReport {
     let mut hosts: Vec<Box<dyn AddonHost>> = vec![Box::new(Triggers::from_configs(triggers))];
     let plugins = match plugins_dir {
         Some(dir) => {
-            let host = RhaiHost::load(dir, disabled);
+            let host = RhaiHost::load(dir, disabled, plugin_config);
             let plugins = host.plugins().to_vec();
             hosts.push(Box::new(host));
             plugins

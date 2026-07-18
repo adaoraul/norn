@@ -111,6 +111,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
         handle_plugins_screen(app, key);
         return Vec::new();
     }
+    if app.mode == Mode::PluginConfig {
+        handle_plugin_config_screen(app, key);
+        return Vec::new();
+    }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -884,6 +888,52 @@ fn handle_plugins_screen(app: &mut App, key: KeyEvent) {
             let idx = app.plugins_ui.sel;
             app.toggle_plugin(idx);
         }
+        KeyCode::Char('c') => app.open_plugin_config_selected(),
+        _ => {}
+    }
+}
+
+/// The per-plugin config editor (`Mode::PluginConfig`): navigate keys, edit a
+/// value inline, save on Enter. Esc cancels an edit or closes back to plugins.
+fn handle_plugin_config_screen(app: &mut App, key: KeyEvent) {
+    let rows = app.plugin_cfg_schema();
+    // Editing a value: capture text until Enter (commit) or Esc (cancel).
+    if let Some(buf) = app.plugin_cfg.editing.clone() {
+        match key.code {
+            KeyCode::Esc => app.plugin_cfg.editing = None,
+            KeyCode::Enter => {
+                if let Some((k, default)) = rows.get(app.plugin_cfg.sel) {
+                    app.set_plugin_cfg_value(k, buf.trim(), default);
+                    app.plugin_cfg.msg = Some(format!("saved {k}"));
+                }
+                app.plugin_cfg.editing = None;
+            }
+            KeyCode::Backspace => {
+                let mut b = buf;
+                b.pop();
+                app.plugin_cfg.editing = Some(b);
+            }
+            KeyCode::Char(c) => {
+                let mut b = buf;
+                b.push(c);
+                app.plugin_cfg.editing = Some(b);
+            }
+            _ => {}
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Plugins,
+        KeyCode::Up => app.plugin_cfg.sel = app.plugin_cfg.sel.saturating_sub(1),
+        KeyCode::Down => {
+            app.plugin_cfg.sel = (app.plugin_cfg.sel + 1).min(rows.len().saturating_sub(1));
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if let Some((k, default)) = rows.get(app.plugin_cfg.sel) {
+                app.plugin_cfg.msg = None;
+                app.plugin_cfg.editing = Some(app.plugin_cfg_value(k, default));
+            }
+        }
         _ => {}
     }
 }
@@ -975,8 +1025,16 @@ fn handle_plugins(app: &mut App, arg: &str) {
                 Err(err) => app.push_active_event(err),
             }
         }
+        "config" | "configure" => {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if name.is_empty() {
+                app.push_active_event("usage: /plugins config <name>".to_string());
+                return;
+            }
+            app.open_plugin_config(name);
+        }
         other => app.push_active_event(format!(
-            "usage: /plugins ls|available|install|reload|enable|disable (got '{other}')"
+            "usage: /plugins ls|available|install|reload|enable|disable|config (got '{other}')"
         )),
     }
 }
@@ -2278,6 +2336,7 @@ mod tests {
             description: "does things".into(),
             version: "1.0".into(),
             status,
+            config: Vec::new(),
         }
     }
 
@@ -2318,6 +2377,55 @@ mod tests {
         assert!(app.disabled_plugins.iter().any(|f| f == "urlgrab.rhai"));
         assert!(app.actions.contains(&AppAction::ReloadAddons));
         handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn plugin_config_editor_edits_and_clears_override() {
+        use crate::addons::{PluginInfo, PluginStatus};
+        use crate::tui::state::Mode;
+        let mut app = app_with_channel();
+        app.plugins = vec![PluginInfo {
+            name: "autoop".into(),
+            file: "autoop.rhai".into(),
+            description: "op trusted".into(),
+            version: "1.0".into(),
+            status: PluginStatus::Loaded,
+            config: vec![("TRUSTED".into(), "alice".into())],
+        }];
+        // Open the editor via the command.
+        run_line(&mut app, "/plugins config autoop");
+        assert_eq!(app.mode, Mode::PluginConfig);
+        // Edit the value (buffer seeds with the current "alice") and save.
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_key(&mut app, key(KeyCode::Char('2')));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            app.plugin_config
+                .get("autoop.rhai")
+                .and_then(|m| m.get("TRUSTED"))
+                .map(String::as_str),
+            Some("alice2")
+        );
+        assert!(app.actions.contains(&AppAction::ReloadAddons));
+        // Editing back to the default drops the override entirely.
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_key(&mut app, key(KeyCode::Backspace));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(!app.plugin_config.contains_key("autoop.rhai"));
+        // Esc returns to the plugins screen.
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Plugins);
+    }
+
+    #[test]
+    fn plugins_config_reports_when_no_settings() {
+        use crate::addons::PluginStatus;
+        use crate::tui::state::Mode;
+        let mut app = app_with_channel();
+        // A plugin with no CONFIG cannot be configured.
+        app.plugins = vec![plugin("plain", "plain.rhai", PluginStatus::Loaded)];
+        run_line(&mut app, "/plugins config plain");
         assert_eq!(app.mode, Mode::Normal);
     }
 

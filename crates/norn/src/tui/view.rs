@@ -82,6 +82,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_networks(f, area, app);
     } else if app.mode == Mode::Plugins {
         draw_plugins(f, area, app);
+    } else if app.mode == Mode::PluginConfig {
+        draw_plugin_config(f, area, app);
     } else if let Some(completion) = &app.completion {
         draw_completion(f, center[4], completion);
     }
@@ -1255,6 +1257,146 @@ fn plugin_row_line(
     ])
 }
 
+/// The per-plugin config editor: a floating list of the plugin's declared keys
+/// with their current value (override or default). Enter edits/saves a value.
+fn draw_plugin_config(f: &mut Frame, area: Rect, app: &App) {
+    let w = 96.min(area.width.saturating_sub(2));
+    let h = 30.min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::BORDER_BRIGHT))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 4 || inner.width < 24 {
+        return;
+    }
+
+    let width = inner.width as usize;
+    let editing = app.plugin_cfg.editing.is_some();
+    let left = format!("configure {}", app.plugin_cfg.name);
+    let hint = if editing {
+        "  Enter save · Esc cancel"
+    } else {
+        "  Enter edit · Esc back"
+    };
+    let right = app.plugin_cfg.msg.clone().unwrap_or_default();
+    let pad = width.saturating_sub(left.width() + hint.width() + right.width());
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(left, Style::default().fg(theme::BRIGHT)),
+            Span::styled(hint, Style::default().fg(theme::DIM2)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(right, Style::default().fg(theme::GOLD)),
+        ])),
+        Rect { height: 1, ..inner },
+    );
+    draw_rule(
+        f,
+        Rect {
+            y: inner.y + 1,
+            height: 1,
+            ..inner
+        },
+    );
+    let body = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+
+    let schema = app.plugin_cfg_schema();
+    if schema.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " this plugin has no configurable settings",
+                Style::default().fg(theme::DIM2),
+            ))),
+            body,
+        );
+        return;
+    }
+    let sel = app.plugin_cfg.sel.min(schema.len() - 1);
+    let list_h = body.height as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (key, default)) in schema.iter().enumerate() {
+        lines.push(plugin_cfg_row_line(app, key, default, i == sel, width));
+    }
+    let scroll = if lines.len() <= list_h {
+        0
+    } else {
+        sel.saturating_sub(list_h / 2).min(lines.len() - list_h)
+    };
+    let shown: Vec<Line> = lines.into_iter().skip(scroll).take(list_h).collect();
+    f.render_widget(Paragraph::new(shown), body);
+}
+
+/// One config row: `▎ key    value` (value in the accent when overridden). When
+/// the selected row is being edited, its value shows the edit buffer + a caret.
+fn plugin_cfg_row_line(
+    app: &App,
+    key: &str,
+    default: &str,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let bg = if selected {
+        theme::ACTIVE_BG
+    } else {
+        theme::PANEL
+    };
+    let editing = selected && app.plugin_cfg.editing.is_some();
+    let overridden = app
+        .plugin_config
+        .get(&app.plugin_cfg.file)
+        .and_then(|m| m.get(key))
+        .is_some();
+    let value = if editing {
+        format!("{}_", app.plugin_cfg.editing.clone().unwrap_or_default())
+    } else {
+        app.plugin_cfg_value(key, default)
+    };
+    let val_fg = if editing {
+        theme::BRIGHT
+    } else if overridden {
+        app.accent
+    } else {
+        theme::DIM
+    };
+    let name = truncate(key, 18);
+    let name_pad = " ".repeat(18usize.saturating_sub(name.width()));
+    let left_w = 1 + 1 + 18 + 2; // bar + sp + key + gap
+    let val_room = width.saturating_sub(left_w + 1);
+    let value = truncate(&value, val_room);
+    let gap = width.saturating_sub(left_w + value.width() + 1);
+    Line::from(vec![
+        Span::styled(
+            if selected { "▎" } else { " " },
+            Style::default().fg(app.accent).bg(bg),
+        ),
+        Span::styled(
+            format!(" {name}{name_pad}  "),
+            Style::default()
+                .fg(if selected {
+                    theme::BRIGHT
+                } else {
+                    theme::BRIGHT2
+                })
+                .bg(bg),
+        ),
+        Span::styled(value, Style::default().fg(val_fg).bg(bg)),
+        Span::styled(" ".repeat(gap), Style::default().bg(bg)),
+        Span::styled(" ", Style::default().bg(bg)),
+    ])
+}
+
 /// The `/help` panel: a master-detail command reference. The left pane is a
 /// searchable, categorized command list; the right pane shows the selected
 /// command's full documentation. `→` focuses the detail to scroll it.
@@ -1704,6 +1846,7 @@ mod tests {
                 description: "deterministic nick colors".into(),
                 version: "1.4".into(),
                 status: PluginStatus::Loaded,
+                config: Vec::new(),
             },
             PluginInfo {
                 name: "weather".into(),
@@ -1711,6 +1854,7 @@ mod tests {
                 description: String::new(),
                 version: "0.2".into(),
                 status: PluginStatus::Failed("missing dep".into()),
+                config: Vec::new(),
             },
         ];
         app.open_plugins();
@@ -1725,6 +1869,31 @@ mod tests {
         assert!(text.contains("deterministic nick colors"));
         assert!(text.contains("v1.4"));
         assert!(text.contains("failed to load: missing dep"));
+    }
+
+    #[test]
+    fn plugin_config_panel_renders() {
+        use crate::addons::{PluginInfo, PluginStatus};
+        let mut app = one_net_app();
+        app.plugins = vec![PluginInfo {
+            name: "autoop".into(),
+            file: "autoop.rhai".into(),
+            description: "op trusted".into(),
+            version: "1.0".into(),
+            status: PluginStatus::Loaded,
+            config: vec![
+                ("CHANNELS".into(), "#norn".into()),
+                ("TRUSTED".into(), "alice".into()),
+            ],
+        }];
+        app.open_plugin_config("autoop");
+        let mut terminal = Terminal::new(TestBackend::new(90, 28)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("configure autoop"));
+        assert!(text.contains("CHANNELS"));
+        assert!(text.contains("TRUSTED"));
+        assert!(text.contains("alice"));
     }
 
     #[test]

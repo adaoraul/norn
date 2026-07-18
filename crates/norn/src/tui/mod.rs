@@ -96,6 +96,7 @@ pub async fn run(
     aliases: std::collections::BTreeMap<String, String>,
     triggers: Vec<TriggerConfig>,
     disabled_plugins: Vec<String>,
+    plugin_config: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     config_path: Option<PathBuf>,
     quit: Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -114,8 +115,14 @@ pub async fn run(
     // The addon host reacts to engine events: declarative triggers plus scripts.
     app.triggers = triggers;
     app.disabled_plugins = disabled_plugins;
+    app.plugin_config = plugin_config;
     let disabled: HashSet<String> = app.disabled_plugins.iter().cloned().collect();
-    let report = build_addon_host(&app.triggers, plugins_dir.as_deref(), &disabled);
+    let report = build_addon_host(
+        &app.triggers,
+        plugins_dir.as_deref(),
+        &disabled,
+        &app.plugin_config,
+    );
     let mut host = report.host;
     report_addon_load(&mut app, report.plugins);
     let mut term_events = EventStream::new();
@@ -363,7 +370,8 @@ fn drain_actions(
         match action {
             AppAction::ReloadAddons => {
                 let disabled: HashSet<String> = app.disabled_plugins.iter().cloned().collect();
-                let report = build_addon_host(&app.triggers, plugins_dir, &disabled);
+                let report =
+                    build_addon_host(&app.triggers, plugins_dir, &disabled, &app.plugin_config);
                 *host = report.host;
                 report_addon_load(app, report.plugins);
             }
