@@ -14,7 +14,7 @@ use irc_proto::{Command, Message};
 
 use crate::batch::{BatchCollector, CollectorOutput, CompletedBatch};
 use crate::chat::ChatMessage;
-use crate::event::{Event, LeaveReason, TopicChange};
+use crate::event::{Event, LeaveReason, TopicChange, WhoisInfo};
 use crate::history::ChatHistoryRequest;
 use crate::identity::identity_event;
 use crate::labels::LabelRouter;
@@ -39,6 +39,9 @@ pub struct Engine {
     /// bare labels here (correlated via `history` on batch close); awaited
     /// labeled commands would `register` for a oneshot on the same sequence.
     labels: LabelRouter,
+    /// In-progress WHOIS replies, keyed by normalized nick. Populated by the
+    /// whois numerics and drained into one `WhoisReceived` at end-of-whois (318).
+    whois: HashMap<String, WhoisInfo>,
 }
 
 impl Engine {
@@ -73,6 +76,10 @@ impl Engine {
         // Channel state (NAMES/TOPIC): numerics and TOPIC that are neither a
         // standard reply, an identity command, nor a chat message.
         if self.handle_channel_state(msg, events) {
+            return;
+        }
+        // WHOIS reply numerics accumulate into one WhoisReceived at 318.
+        if self.handle_whois(msg, events) {
             return;
         }
         // Standard replies (rule 15) take precedence over chat interpretation.
@@ -207,6 +214,92 @@ impl Engine {
             Command::Numeric(315) => true,
             _ => false,
         }
+    }
+
+    /// Accumulate WHOIS reply numerics into a per-nick [`WhoisInfo`] and emit one
+    /// `WhoisReceived` at end-of-whois (318). For every whois numeric the target
+    /// nick is `params[1]`. Returns whether the message was a whois numeric (and
+    /// thus consumed). A standalone RPL_AWAY (301) that is not part of an
+    /// in-progress whois is left for other handlers.
+    fn handle_whois(&mut self, msg: &Message, events: &mut Vec<Event>) -> bool {
+        let Command::Numeric(n) = &msg.command else {
+            return false;
+        };
+        let n = *n;
+        if !matches!(n, 301 | 311 | 312 | 313 | 317 | 318 | 319 | 330 | 671) {
+            return false;
+        }
+        let Some(nick) = msg.params.get(1).cloned() else {
+            return true; // malformed whois numeric: consume it silently
+        };
+        let key = norm(&nick);
+        match n {
+            // 311 RPL_WHOISUSER: <me> <nick> <user> <host> * :<realname>
+            311 => {
+                let e = self.whois.entry(key).or_default();
+                e.nick = nick;
+                e.user = msg.params.get(2).cloned();
+                e.host = msg.params.get(3).cloned();
+                e.realname = msg.params.get(5).cloned();
+            }
+            // 312 RPL_WHOISSERVER: <me> <nick> <server> :<server info>
+            312 => {
+                let e = self.whois.entry(key).or_default();
+                e.nick = nick;
+                e.server = msg.params.get(2).cloned();
+            }
+            // 313 RPL_WHOISOPERATOR
+            313 => {
+                let e = self.whois.entry(key).or_default();
+                e.nick = nick;
+                e.is_operator = true;
+            }
+            // 317 RPL_WHOISIDLE: <me> <nick> <seconds> [<signon>] :...
+            317 => {
+                let e = self.whois.entry(key).or_default();
+                e.nick = nick;
+                e.idle_secs = msg.params.get(2).and_then(|s| s.parse().ok());
+                e.signon = msg
+                    .params
+                    .get(3)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0));
+            }
+            // 319 RPL_WHOISCHANNELS: <me> <nick> :<prefixed channel list>
+            319 => {
+                let e = self.whois.entry(key).or_default();
+                e.nick = nick;
+                e.channels = msg.params.get(2).cloned().filter(|c| !c.is_empty());
+            }
+            // 330 RPL_WHOISACCOUNT: <me> <nick> <account> :is logged in as
+            330 => {
+                let e = self.whois.entry(key).or_default();
+                e.nick = nick;
+                e.account = msg.params.get(2).cloned();
+            }
+            // 671 RPL_WHOISSECURE
+            671 => {
+                let e = self.whois.entry(key).or_default();
+                e.nick = nick;
+                e.secure = true;
+            }
+            // 301 RPL_AWAY: only fold into an in-progress whois; a bare away
+            // notice (when messaging an away user) is left for other handlers.
+            301 => match self.whois.get_mut(&key) {
+                Some(e) => e.away = msg.params.get(2).cloned(),
+                None => return false,
+            },
+            // 318 RPL_ENDOFWHOIS: emit what we gathered (or a bare nick).
+            318 => {
+                let info = self.whois.remove(&key).unwrap_or(WhoisInfo {
+                    nick,
+                    ..Default::default()
+                });
+                events.push(Event::WhoisReceived(info));
+            }
+            _ => unreachable!("guarded by the matches! above"),
+        }
+        true
     }
 
     /// Mirror a membership event into the per-channel rosters so the engine's
@@ -422,6 +515,41 @@ mod tests {
     fn unrelated_numeric_yields_no_event() {
         let mut e = Engine::new();
         assert!(feed(&mut e, ":s 375 me :- Message of the Day -").is_empty());
+    }
+
+    #[test]
+    fn whois_accumulates_then_emits_at_end() {
+        let mut e = Engine::new();
+        // The reply numerics accumulate; only 318 emits one WhoisReceived.
+        assert!(feed(&mut e, ":s 311 me alice ~u host.example * :Alice A").is_empty());
+        assert!(feed(&mut e, ":s 319 me alice :@#rust +#ratatui").is_empty());
+        assert!(feed(&mut e, ":s 330 me alice aliceacct :is logged in as").is_empty());
+        assert!(feed(&mut e, ":s 317 me alice 42 1700000000 :seconds idle").is_empty());
+        assert!(feed(&mut e, ":s 671 me alice :is using a secure connection").is_empty());
+        let events = feed(&mut e, ":s 318 me alice :End of /WHOIS list");
+        assert_eq!(events.len(), 1);
+        let Event::WhoisReceived(info) = &events[0] else {
+            panic!("expected WhoisReceived, got {:?}", events[0]);
+        };
+        assert_eq!(info.nick, "alice");
+        assert_eq!(info.user.as_deref(), Some("~u"));
+        assert_eq!(info.host.as_deref(), Some("host.example"));
+        assert_eq!(info.realname.as_deref(), Some("Alice A"));
+        assert_eq!(info.channels.as_deref(), Some("@#rust +#ratatui"));
+        assert_eq!(info.account.as_deref(), Some("aliceacct"));
+        assert_eq!(info.idle_secs, Some(42));
+        assert!(info.secure);
+        // The accumulator is drained after the end.
+        let again = feed(&mut e, ":s 318 me alice :End of /WHOIS list");
+        assert!(matches!(&again[0], Event::WhoisReceived(i) if i.user.is_none()));
+    }
+
+    #[test]
+    fn standalone_away_numeric_is_not_a_whois() {
+        // RPL_AWAY outside a whois (messaging an away user) must not fabricate a
+        // whois block; it is simply consumed with no event.
+        let mut e = Engine::new();
+        assert!(feed(&mut e, ":s 301 me bob :gone fishing").is_empty());
     }
 
     // The integration proof: label routing + batch collection + server-time all

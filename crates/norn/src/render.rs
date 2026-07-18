@@ -90,6 +90,34 @@ pub fn render(event: &Event) -> Vec<String> {
         Event::RealnameChanged { nick, realname } => {
             vec![format!("-- {nick} set realname to {realname}")]
         }
+        Event::WhoisReceived(info) => {
+            let mut lines = match (&info.user, &info.host) {
+                (Some(user), Some(host)) => vec![format!("-- {} is {user}@{host}", info.nick)],
+                _ => vec![format!("-- whois {}", info.nick)],
+            };
+            if let Some(realname) = &info.realname {
+                lines.push(format!("--   realname: {realname}"));
+            }
+            if let Some(account) = &info.account {
+                lines.push(format!("--   account: {account}"));
+            }
+            if let Some(server) = &info.server {
+                lines.push(format!("--   server: {server}"));
+            }
+            if let Some(channels) = &info.channels {
+                lines.push(format!("--   channels: {channels}"));
+            }
+            if info.is_operator {
+                lines.push("--   is an IRC operator".to_string());
+            }
+            if info.secure {
+                lines.push("--   using a secure connection".to_string());
+            }
+            if let Some(away) = &info.away {
+                lines.push(format!("--   away: {away}"));
+            }
+            lines
+        }
         Event::StandardReply(reply) => vec![format!(
             "-- {:?} {} {}: {}",
             reply.kind, reply.command, reply.code, reply.description

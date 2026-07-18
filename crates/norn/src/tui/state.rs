@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::Local;
-use irc_engine::{Event, LeaveReason, Member, MessageKind, TopicChange};
+use irc_engine::{Event, LeaveReason, Member, MessageKind, TopicChange, WhoisInfo};
 use irc_proto::Source;
 use ratatui::style::Color;
 
@@ -755,6 +755,18 @@ impl App {
                 let i = self.server_buffer(net);
                 self.buffers[i].push(event_line(text));
             }
+            // Show the whois where the user is looking (the active buffer on this
+            // network), else the server buffer.
+            Event::WhoisReceived(info) => {
+                let idx = if self.buffers[self.active].net == net {
+                    self.active
+                } else {
+                    self.server_buffer(net)
+                };
+                for line in whois_lines(&info) {
+                    self.buffers[idx].push(event_line(line));
+                }
+            }
             // Registered / caps / other state: surfaced via ConnState + server
             // buffer; ignore here to avoid duplicate lines.
             _ => {}
@@ -1434,6 +1446,59 @@ fn welcome_lines(no_networks: bool) -> Vec<String> {
     lines
 }
 
+/// Render a completed whois into buffer lines (a header plus indented details).
+fn whois_lines(info: &WhoisInfo) -> Vec<String> {
+    let mut lines = Vec::new();
+    match (&info.user, &info.host) {
+        (Some(user), Some(host)) => lines.push(format!("{} is {user}@{host}", info.nick)),
+        _ => lines.push(format!("whois {}", info.nick)),
+    }
+    if let Some(realname) = &info.realname {
+        lines.push(format!("  realname: {realname}"));
+    }
+    if let Some(account) = &info.account {
+        lines.push(format!("  account: {account}"));
+    }
+    if let Some(server) = &info.server {
+        lines.push(format!("  server: {server}"));
+    }
+    if let Some(channels) = &info.channels {
+        lines.push(format!("  channels: {channels}"));
+    }
+    if info.is_operator {
+        lines.push("  is an IRC operator".to_string());
+    }
+    if info.secure {
+        lines.push("  using a secure connection".to_string());
+    }
+    if let Some(away) = &info.away {
+        lines.push(format!("  away: {away}"));
+    }
+    if let Some(idle) = info.idle_secs {
+        let mut line = format!("  idle {}", fmt_idle(idle));
+        if let Some(signon) = info.signon {
+            line.push_str(&format!(
+                ", signon {}",
+                signon.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            ));
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// Format an idle duration in seconds compactly (e.g. `1h5m`, `30s`).
+fn fmt_idle(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m{s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 fn source_nick(source: &Source) -> &str {
     match source {
         Source::User { nick, .. } => nick,
@@ -1828,6 +1893,42 @@ mod tests {
         assert_eq!(a.definitions[0].name, "a");
         // The add row is now index 1; the selection clamps to it.
         assert_eq!(a.networks_ui.sel, 1);
+    }
+
+    #[test]
+    fn whois_renders_into_the_active_buffer() {
+        let mut a = app(); // active is net 0's server buffer
+        a.apply(engine(
+            0,
+            Event::WhoisReceived(WhoisInfo {
+                nick: "alice".into(),
+                user: Some("~u".into()),
+                host: Some("host.example".into()),
+                realname: Some("Alice A".into()),
+                server: Some("irc.example.net".into()),
+                account: Some("acct".into()),
+                channels: Some("#rust".into()),
+                idle_secs: Some(65),
+                signon: None,
+                is_operator: false,
+                secure: true,
+                away: None,
+            }),
+        ));
+        let text: String = a
+            .active_buffer()
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Event { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("alice is ~u@host.example"));
+        assert!(text.contains("account: acct"));
+        assert!(text.contains("using a secure connection"));
+        assert!(text.contains("idle 1m5s"));
     }
 
     #[test]

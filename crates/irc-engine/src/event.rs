@@ -63,6 +63,37 @@ pub enum TopicChange {
     Unchanged,
 }
 
+/// The accumulated result of a `WHOIS`, assembled from its reply numerics and
+/// emitted as one unit at end-of-whois (318). Fields are `None`/empty when the
+/// server did not supply them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WhoisInfo {
+    /// The nick queried.
+    pub nick: String,
+    /// User/ident (311).
+    pub user: Option<String>,
+    /// Host (311).
+    pub host: Option<String>,
+    /// Realname / GECOS (311).
+    pub realname: Option<String>,
+    /// The server they are on (312).
+    pub server: Option<String>,
+    /// Their authenticated account (330).
+    pub account: Option<String>,
+    /// The channels they are on, as the server's prefixed list (319).
+    pub channels: Option<String>,
+    /// Idle time in seconds (317).
+    pub idle_secs: Option<u64>,
+    /// Signon time (317).
+    pub signon: Option<DateTime<Utc>>,
+    /// Whether they are an IRC operator (313).
+    pub is_operator: bool,
+    /// Whether they are on a secure (TLS) connection (671).
+    pub secure: bool,
+    /// Their away message, if away (301, only when part of a whois).
+    pub away: Option<String>,
+}
+
 /// Why a member left a channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaveReason {
@@ -191,6 +222,9 @@ pub enum Event {
         /// The new realname.
         realname: String,
     },
+    /// A completed `WHOIS`, assembled from its reply numerics (311-319/330/671),
+    /// emitted as one unit at end-of-whois (318).
+    WhoisReceived(WhoisInfo),
     /// A `FAIL`/`WARN`/`NOTE` standard reply (rule 15).
     StandardReply(StandardReply),
     /// The connection was terminated.
