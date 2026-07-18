@@ -96,6 +96,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
         handle_help(app, key);
         return Vec::new();
     }
+    if app.mode == Mode::Settings {
+        handle_settings(app, key);
+        return Vec::new();
+    }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -106,6 +110,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
             app.mode = Mode::Switcher;
             app.switcher = Switcher::default();
         }
+        KeyCode::F(2) => app.open_settings(),
         KeyCode::F(9) => app.nicklist_visible = !app.nicklist_visible,
         KeyCode::Left if alt => switch_relative(app, -1),
         KeyCode::Right if alt => switch_relative(app, 1),
@@ -217,6 +222,43 @@ fn handle_help(app: &mut App, key: KeyEvent) {
     app.help.sel = app.help.sel.min(n.saturating_sub(1));
 }
 
+/// The number of rows on the `/settings` panel (timestamps, nicklist, theme).
+const SETTINGS_ROWS: usize = 3;
+
+/// Keys for the `/settings` panel: arrows move the selection; Space/Enter or
+/// Left/Right adjust the selected setting (toggle a bool, cycle the theme). Every
+/// change applies live and auto-saves. Esc closes.
+fn handle_settings(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Up => app.settings.sel = app.settings.sel.saturating_sub(1),
+        KeyCode::Down => app.settings.sel = (app.settings.sel + 1).min(SETTINGS_ROWS - 1),
+        KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Right => adjust_setting(app, 1),
+        KeyCode::Left => adjust_setting(app, -1),
+        _ => {}
+    }
+}
+
+/// Change the selected setting by `dir` (bools toggle regardless; the theme
+/// cycles through `THEME_NAMES`), then apply and save.
+fn adjust_setting(app: &mut App, dir: isize) {
+    match app.settings.sel {
+        0 => app.client.timestamps = !app.client.timestamps,
+        1 => app.client.nicklist = !app.client.nicklist,
+        2 => {
+            let names = crate::tui::theme::THEME_NAMES;
+            let cur = names
+                .iter()
+                .position(|&n| n == app.client.theme)
+                .unwrap_or(0);
+            let next = (cur as isize + dir).rem_euclid(names.len() as isize) as usize;
+            app.client.theme = names[next].to_string();
+        }
+        _ => {}
+    }
+    app.apply_client_change();
+}
+
 /// Buffer indices matching the switcher query.
 pub fn switcher_matches(app: &App) -> Vec<usize> {
     let q = app.switcher.query.to_lowercase();
@@ -251,6 +293,7 @@ const STRUCTURAL: &[&str] = &[
     "close",
     "wc",
     "set",
+    "settings",
     "network",
     "net",
     "connect",
@@ -313,6 +356,10 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
             }
             "set" => {
                 handle_set(app, arg);
+                return Vec::new();
+            }
+            "settings" => {
+                app.open_settings();
                 return Vec::new();
             }
             "network" | "net" => {
@@ -524,17 +571,11 @@ fn handle_set(app: &mut App, arg: &str) {
     }
     match key {
         "timestamps" => match parse_bool(&value) {
-            Some(on) => {
-                app.timestamps = on;
-                app.client.timestamps = on;
-            }
+            Some(on) => app.client.timestamps = on,
             None => return app.push_active_event(format!("expected on/off, got '{value}'")),
         },
         "nicklist" => match parse_bool(&value) {
-            Some(on) => {
-                app.nicklist_visible = on;
-                app.client.nicklist = on;
-            }
+            Some(on) => app.client.nicklist = on,
             None => return app.push_active_event(format!("expected on/off, got '{value}'")),
         },
         "theme" => {
@@ -544,12 +585,12 @@ fn handle_set(app: &mut App, arg: &str) {
                     crate::tui::theme::THEME_NAMES.join(", ")
                 ));
             }
-            app.accent = crate::tui::theme::accent_for(&value);
             app.client.theme = value.clone();
         }
         other => return app.push_active_event(format!("unknown setting '{other}'")),
     }
-    app.save_config();
+    // Mirror the change into the live UI and auto-save (shared with /settings).
+    app.apply_client_change();
     app.push_active_event(format!("set {key} = {value}"));
 }
 
@@ -1309,6 +1350,38 @@ mod tests {
         assert!(!app.client.timestamps);
         run_line(&mut app, "/set timestamps on");
         assert!(app.timestamps);
+    }
+
+    #[test]
+    fn settings_screen_toggles_and_cycles_live() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/settings");
+        assert_eq!(app.mode, Mode::Settings);
+        // Row 0 is timestamps; Space toggles it and mirrors into the live state.
+        assert!(app.client.timestamps);
+        handle_key(&mut app, key(KeyCode::Char(' ')));
+        assert!(!app.client.timestamps);
+        assert!(!app.timestamps, "live mirror follows the change");
+        // Move to the theme row (index 2) and cycle it with Right.
+        handle_key(&mut app, key(KeyCode::Down));
+        handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.settings.sel, 2);
+        let before = app.client.theme.clone();
+        handle_key(&mut app, key(KeyCode::Right));
+        assert_ne!(app.client.theme, before, "theme cycled");
+        assert_eq!(app.accent, crate::tui::theme::accent_for(&app.client.theme));
+        // Down is clamped to the last row; Esc closes.
+        handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.settings.sel, 2);
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn f2_opens_settings() {
+        let mut app = app_with_channel();
+        handle_key(&mut app, key(KeyCode::F(2)));
+        assert_eq!(app.mode, Mode::Settings);
     }
 
     #[test]

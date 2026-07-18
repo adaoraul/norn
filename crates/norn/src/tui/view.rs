@@ -61,6 +61,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_switcher(f, area, app);
     } else if app.mode == Mode::Help {
         draw_help(f, area, app);
+    } else if app.mode == Mode::Settings {
+        draw_settings(f, area, app);
     } else if let Some(completion) = &app.completion {
         draw_completion(f, center[4], completion);
     }
@@ -617,6 +619,73 @@ fn draw_switcher(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inset(rect));
 }
 
+/// The `/settings` panel: a small centered modal listing each client preference
+/// as `label  value`, the selected row bar-highlighted. Editing happens live in
+/// `input::handle_settings`.
+fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
+    let rows = settings_rows(app);
+    let w = 52.min(area.width.saturating_sub(4));
+    // Rows plus a top/bottom border, a blank spacer, and the hint row.
+    let h = (rows.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::BORDER_BRIGHT))
+        .title(Span::styled(
+            " settings ",
+            Style::default().fg(theme::BRIGHT),
+        ))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    let width = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let sel = i == app.settings.sel;
+        let bg = if sel { theme::ACTIVE_BG } else { theme::PANEL };
+        let bar = if sel { "▎" } else { " " };
+        let fg = if sel { theme::BRIGHT } else { theme::TEXT };
+        // `bar + " " + label + pad + value + " "` fills the inner width.
+        let pad = width.saturating_sub(2 + label.width() + value.width() + 1);
+        lines.push(Line::from(vec![
+            Span::styled(bar, Style::default().fg(app.accent).bg(bg)),
+            Span::styled(format!(" {label}"), Style::default().fg(fg).bg(bg)),
+            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+            Span::styled(
+                format!("{value} "),
+                Style::default().fg(theme::BRIGHT2).bg(bg),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓ move · Space toggle · ←→ change · Esc closes",
+        Style::default().fg(theme::DIM2),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The client-preference rows shown on the `/settings` panel, in the order the
+/// keys are indexed by `input::handle_settings` (timestamps, nicklist, theme).
+fn settings_rows(app: &App) -> Vec<(&'static str, String)> {
+    let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
+    vec![
+        ("timestamps", on_off(app.client.timestamps)),
+        ("nicklist", on_off(app.client.nicklist)),
+        ("theme", app.client.theme.clone()),
+    ]
+}
+
 /// The `/help` panel: a master-detail command reference. The left pane is a
 /// searchable, categorized command list; the right pane shows the selected
 /// command's full documentation. `→` focuses the detail to scroll it.
@@ -1032,6 +1101,19 @@ mod tests {
         assert!(text.contains("SUBCOMMANDS"));
         assert!(text.contains("host"));
         assert!(text.contains("Enter inserts"));
+    }
+
+    #[test]
+    fn settings_panel_renders() {
+        let mut app = one_net_app();
+        app.open_settings();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("settings"));
+        assert!(text.contains("timestamps"));
+        assert!(text.contains("theme"));
+        assert!(text.contains("Esc closes"));
     }
 
     fn chat(target: &str, from: &str, text: &str) -> irc_engine::ChatMessage {

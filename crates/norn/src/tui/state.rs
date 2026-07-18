@@ -198,6 +198,8 @@ pub enum Mode {
     Switcher,
     /// The `/help` panel is open.
     Help,
+    /// The `/settings` panel is open.
+    Settings,
 }
 
 /// Which pane of the `/help` panel has focus.
@@ -222,6 +224,13 @@ pub struct HelpState {
     pub focus: HelpFocus,
     /// First visible line of the detail pane.
     pub detail_scroll: usize,
+}
+
+/// State of the `/settings` panel: which setting row is selected.
+#[derive(Debug, Clone, Default)]
+pub struct SettingsState {
+    /// Index of the highlighted setting row.
+    pub sel: usize,
 }
 
 /// Buffer-switcher overlay state.
@@ -265,6 +274,8 @@ pub struct App {
     pub switcher: Switcher,
     /// Help-panel state.
     pub help: HelpState,
+    /// Settings-panel state.
+    pub settings: SettingsState,
     /// Tab-completion state.
     pub completion: Option<Completion>,
     /// Whether the nicklist is shown.
@@ -328,6 +339,7 @@ impl App {
             mode: Mode::Normal,
             switcher: Switcher::default(),
             help: HelpState::default(),
+            settings: SettingsState::default(),
             completion: None,
             nicklist_visible: client.nicklist,
             timestamps: client.timestamps,
@@ -723,6 +735,24 @@ impl App {
             },
         };
         self.dirty = true;
+    }
+
+    /// Open the `/settings` panel with the first row selected.
+    pub fn open_settings(&mut self) {
+        self.mode = Mode::Settings;
+        self.settings = SettingsState::default();
+        self.dirty = true;
+    }
+
+    /// Re-derive the live UI mirror (accent, timestamps, nicklist) from
+    /// `self.client`, mark dirty, and persist. The single apply-and-save path
+    /// shared by `/set` and the Settings screen, so the two never drift.
+    pub fn apply_client_change(&mut self) {
+        self.timestamps = self.client.timestamps;
+        self.nicklist_visible = self.client.nicklist;
+        self.accent = theme::accent_for(&self.client.theme);
+        self.dirty = true;
+        self.save_config();
     }
 
     /// Persist current client prefs and network definitions to the config file.

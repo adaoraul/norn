@@ -443,6 +443,20 @@ and value, change one (applied live and auto-saved).",
         examples: &["/set", "/set theme amber", "/set timestamps off"],
     },
     CommandDoc {
+        name: "settings",
+        category: "Client",
+        usage: "/settings",
+        summary: "Open the settings screen",
+        description: "Open the interactive settings screen to view and change \
+client preferences (timestamps, nicklist, theme). Arrows move, Space toggles, \
+left/right change; every change applies live and auto-saves. Use /set to change a \
+setting directly from the input line.",
+        aliases: &[],
+        params: &[],
+        subcommands: &[],
+        examples: &["/settings"],
+    },
+    CommandDoc {
         name: "alias",
         category: "Client",
         usage: "/alias [name expansion]",
