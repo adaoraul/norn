@@ -140,7 +140,7 @@ pub async fn run(
         }
 
         // Execute any control-plane actions the input handlers queued.
-        drain_actions(&mut app, &mut cmd_txs, &ui_tx, &quit);
+        drain_actions(&mut app, &mut cmd_txs, &mut host, &ui_tx, &quit);
 
         // Ring the terminal bell if a highlight arrived and beeping is enabled.
         if app.bell {
@@ -209,11 +209,15 @@ fn addon_reactions(app: &App, host: &mut dyn AddonHost, event: &UiEvent) -> Vec<
 fn drain_actions(
     app: &mut App,
     cmd_txs: &mut Vec<mpsc::UnboundedSender<NetCommand>>,
+    host: &mut Box<dyn AddonHost>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     quit: &Arc<AtomicBool>,
 ) {
     for action in std::mem::take(&mut app.actions) {
         match action {
+            AppAction::ReloadAddons => {
+                *host = Box::new(Triggers::from_configs(&app.triggers));
+            }
             AppAction::AddNetwork { id, config } => match config.resolve() {
                 Ok(settings) => {
                     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();

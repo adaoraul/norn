@@ -311,6 +311,11 @@ impl Matcher {
     }
 }
 
+/// Whether an `on` match spec parses (for validating `/trigger add`).
+pub fn matcher_is_valid(on: &str) -> bool {
+    Matcher::parse(on).is_some()
+}
+
 /// The reply target for a message: the sender for a private message (target is
 /// our own nick), otherwise the channel.
 fn reply_target(target: &str, sender: &str, my_nick: &str) -> String {

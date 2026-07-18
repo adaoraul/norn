@@ -167,6 +167,39 @@ sasl_mech=scram password_command=\"pass irc/libera\"",
     },
 ];
 
+const TRIGGER_SUBS: &[SubDoc] = &[
+    SubDoc {
+        name: "ls",
+        usage: "/trigger ls",
+        desc: "List defined triggers with their numbers.",
+        params: &[],
+        examples: &["/trigger ls"],
+    },
+    SubDoc {
+        name: "add",
+        usage: "/trigger add <on> = <run>",
+        desc: "Define a trigger: when the <on> event fires, run the <run> command \
+template. Events: highlight, message, notice, join, part, quit, nick (each may \
+add a #channel filter). Templates use $nick, $chan, $msg, $me, chain with ;, and \
+`notify <text>` shows a local notification.",
+        params: &[
+            req("on", ArgKind::Free, "the event to match, e.g. join #norn"),
+            req("run", ArgKind::Free, "the command template to run"),
+        ],
+        examples: &[
+            "/trigger add highlight = notify $nick: $msg",
+            "/trigger add join #norn = msg $chan welcome $nick!",
+        ],
+    },
+    SubDoc {
+        name: "rm",
+        usage: "/trigger rm <number>",
+        desc: "Remove a trigger by its number (see /trigger ls).",
+        params: &[req("number", ArgKind::Free, "the trigger number")],
+        examples: &["/trigger rm 1"],
+    },
+];
+
 const SET_SUBS: &[SubDoc] = &[
     SubDoc {
         name: "timestamps",
@@ -497,6 +530,19 @@ its trailing args appended when it contains no placeholder.",
             "/alias j join $1",
             "/alias hello msg $1 hi;msg $1 there",
         ],
+    },
+    CommandDoc {
+        name: "trigger",
+        category: "Client",
+        usage: "/trigger ls|add|rm",
+        summary: "Manage addon event triggers",
+        description: "List, define, and remove declarative triggers: run a command \
+when an event fires (highlight -> notify, join -> greet, ...). Edits are saved and \
+applied live. See `/trigger add` for the event and template grammar.",
+        aliases: &[],
+        params: &[],
+        subcommands: TRIGGER_SUBS,
+        examples: &["/trigger ls", "/trigger add highlight = notify $nick: $msg"],
     },
     CommandDoc {
         name: "unalias",

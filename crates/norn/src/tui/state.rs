@@ -102,6 +102,8 @@ pub enum AppAction {
     Connect(NetworkId),
     /// Ask a network to disconnect (go idle), with an optional quit reason.
     Disconnect(NetworkId, Option<String>),
+    /// Rebuild the addon host from `app.triggers` after an in-app edit.
+    ReloadAddons,
 }
 
 /// A network's metadata.

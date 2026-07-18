@@ -3,8 +3,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::state::{
-    network_field_value, App, BufferKind, Completion, Mode, NetFieldKind, NetworksFocus, Switcher,
-    NETWORK_FIELDS,
+    network_field_value, App, AppAction, BufferKind, Completion, Mode, NetFieldKind, NetworksFocus,
+    Switcher, NETWORK_FIELDS,
 };
 use crate::session::NetCommand;
 
@@ -597,6 +597,7 @@ const STRUCTURAL: &[&str] = &[
     "clear",
     "alias",
     "unalias",
+    "trigger",
 ];
 
 /// Max alias-expansion recursion depth (guards cyclic aliases).
@@ -692,6 +693,10 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
                 handle_unalias(app, arg);
                 return Vec::new();
             }
+            "trigger" => {
+                handle_trigger(app, arg);
+                return Vec::new();
+            }
             "help" | "h" => {
                 app.open_help(arg);
                 return Vec::new();
@@ -782,6 +787,77 @@ fn handle_unalias(app: &mut App, arg: &str) {
         app.push_active_event(format!("removed alias /{name}"));
     } else {
         app.push_active_event(format!("no alias /{name}"));
+    }
+}
+
+/// `/trigger` - list, define, or remove addon triggers. Edits are auto-saved and
+/// the live addon host is rebuilt via [`AppAction::ReloadAddons`].
+fn handle_trigger(app: &mut App, arg: &str) {
+    let mut it = arg.splitn(2, ' ');
+    let sub = it.next().unwrap_or("").to_ascii_lowercase();
+    let rest = it.next().unwrap_or("").trim();
+    match sub.as_str() {
+        "" | "ls" | "list" => {
+            let mut lines = vec!["triggers:".to_string()];
+            if app.triggers.is_empty() {
+                lines.push("  (none defined)".to_string());
+            }
+            for (i, t) in app.triggers.iter().enumerate() {
+                let off = if t.enabled { "" } else { "  (disabled)" };
+                lines.push(format!("  {}. on {} = {}{off}", i + 1, t.on, t.run));
+            }
+            for line in lines {
+                app.push_console(line);
+            }
+            app.switch_to_console();
+        }
+        "add" => {
+            let Some((on, run)) = rest.split_once('=') else {
+                app.push_active_event("usage: /trigger add <on> = <run>".to_string());
+                return;
+            };
+            let (on, run) = (on.trim(), run.trim());
+            if on.is_empty() || run.is_empty() {
+                app.push_active_event("usage: /trigger add <on> = <run>".to_string());
+                return;
+            }
+            if !crate::addons::matcher_is_valid(on) {
+                app.push_active_event(format!(
+                    "unknown trigger event '{on}' (try: highlight, message, notice, join, part, quit, nick)"
+                ));
+                return;
+            }
+            app.triggers.push(crate::config::TriggerConfig {
+                on: on.to_string(),
+                run: run.to_string(),
+                enabled: true,
+            });
+            app.save_config();
+            app.actions.push(AppAction::ReloadAddons);
+            app.push_active_event(format!("added trigger: on {on} = {run}"));
+        }
+        "remove" | "rm" | "del" => {
+            let Some(n) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+            else {
+                app.push_active_event("usage: /trigger rm <number>".to_string());
+                return;
+            };
+            if n == 0 || n > app.triggers.len() {
+                app.push_active_event(format!("no trigger {n} (see /trigger ls)"));
+                return;
+            }
+            let removed = app.triggers.remove(n - 1);
+            app.save_config();
+            app.actions.push(AppAction::ReloadAddons);
+            app.push_active_event(format!(
+                "removed trigger: on {} = {}",
+                removed.on, removed.run
+            ));
+        }
+        other => app.push_active_event(format!("usage: /trigger ls|add|rm (got '{other}')")),
     }
 }
 
@@ -2036,6 +2112,26 @@ mod tests {
         // /unalias removes it.
         run_line(&mut app, "/unalias j");
         assert!(!app.aliases.contains_key("j"));
+    }
+
+    #[test]
+    fn trigger_add_rm_and_reload() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/trigger add highlight = notify $nick: $msg");
+        assert_eq!(app.triggers.len(), 1);
+        assert_eq!(app.triggers[0].on, "highlight");
+        assert_eq!(app.triggers[0].run, "notify $nick: $msg");
+        // Editing queues a live addon reload.
+        assert!(app.actions.contains(&AppAction::ReloadAddons));
+        // A bad event name is rejected.
+        run_line(&mut app, "/trigger add bogus = notify hi");
+        assert_eq!(app.triggers.len(), 1, "invalid matcher refused");
+        // Remove by number.
+        run_line(&mut app, "/trigger rm 1");
+        assert!(app.triggers.is_empty());
+        // Out-of-range removal is a no-op with feedback.
+        run_line(&mut app, "/trigger rm 5");
+        assert!(app.triggers.is_empty());
     }
 
     #[test]
