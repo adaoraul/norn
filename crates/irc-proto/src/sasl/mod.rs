@@ -60,6 +60,22 @@ pub trait Mechanism: Send {
     fn respond(&mut self, challenge: &[u8]) -> Result<Vec<u8>, SaslError>;
 }
 
+/// Apply SASLprep (RFC 4013) to a username or password, as PLAIN (RFC 4616)
+/// and SCRAM (RFC 5802) require, so a client and server that type the same
+/// credential differently (non-ASCII spaces, compatibility forms, combining
+/// marks) still agree after normalization.
+///
+/// SASLprep is the identity on ASCII printable strings, so the common case is
+/// untouched. On a prohibited-output error (control characters, etc.) we fall
+/// back to the original string rather than failing the exchange here: that is
+/// no worse than sending the raw credential, and it keeps this a pure,
+/// infallible transform at the mechanism boundary.
+pub(crate) fn saslprep(input: &str) -> String {
+    stringprep::saslprep(input)
+        .map(|prepped| prepped.into_owned())
+        .unwrap_or_else(|_| input.to_string())
+}
+
 /// base64-encode a raw payload (standard alphabet, padded).
 pub fn encode_b64(raw: &[u8]) -> String {
     STANDARD.encode(raw)

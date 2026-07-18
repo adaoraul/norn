@@ -11,13 +11,13 @@
 //!
 //! The client nonce is supplied by the caller so this stays pure and the
 //! known-answer test is deterministic; in real use the engine generates a fresh
-//! random nonce per attempt. Usernames are escaped (`=` -> `=3D`, `,` ->
-//! `=2C`); full SASLprep normalization is not applied (identity for ASCII).
+//! random nonce per attempt. Username and password are SASLprep'd (RFC 4013)
+//! at construction, then the username is escaped (`=` -> `=3D`, `,` -> `=2C`).
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use super::{decode_b64, encode_b64, Mechanism, SaslError};
+use super::{decode_b64, encode_b64, saslprep, Mechanism, SaslError};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -88,8 +88,10 @@ impl ScramSha256 {
         client_nonce: impl Into<String>,
     ) -> Self {
         ScramSha256 {
-            username: username.into(),
-            password: password.into(),
+            // SASLprep both credentials (RFC 5802 §5.1): the SCRAM proof binds
+            // the normalized password, and `n=` carries the normalized username.
+            username: saslprep(&username.into()),
+            password: saslprep(&password.into()),
             client_nonce: client_nonce.into(),
             state: ScramState::Initial,
             client_first_bare: String::new(),
@@ -279,5 +281,14 @@ mod tests {
         let mut scram = ScramSha256::new("a,b=c", "pw", "nonce123");
         let first = String::from_utf8(scram.respond(b"").unwrap()).unwrap();
         assert_eq!(first, "n,,n=a=2Cb=3Dc,r=nonce123");
+    }
+
+    #[test]
+    fn saslprep_normalizes_username_and_password() {
+        // Soft hyphen maps to nothing, no-break space maps to a plain space:
+        // both credentials are SASLprep'd before use (RFC 5802 §5.1).
+        let scram = ScramSha256::new("us\u{00AD}er", "pen\u{00A0}cil", "nonce");
+        assert_eq!(scram.username, "user");
+        assert_eq!(scram.password, "pen cil");
     }
 }

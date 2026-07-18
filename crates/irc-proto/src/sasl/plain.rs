@@ -3,8 +3,10 @@
 //! authzid is usually empty, so the payload is `\0account\0password`. PLAIN
 //! sends the password in the clear (post-base64), so it must be offered over
 //! TLS only; that policy is enforced by the engine, not here.
+//!
+//! The three fields are SASLprep'd (RFC 4013) at construction, per RFC 4616.
 
-use super::{Mechanism, SaslError};
+use super::{saslprep, Mechanism, SaslError};
 
 /// SASL PLAIN credentials.
 #[derive(Debug, Clone)]
@@ -22,8 +24,8 @@ impl Plain {
     pub fn new(authcid: impl Into<String>, password: impl Into<String>) -> Self {
         Plain {
             authzid: String::new(),
-            authcid: authcid.into(),
-            password: password.into(),
+            authcid: saslprep(&authcid.into()),
+            password: saslprep(&password.into()),
         }
     }
 
@@ -34,9 +36,9 @@ impl Plain {
         password: impl Into<String>,
     ) -> Self {
         Plain {
-            authzid: authzid.into(),
-            authcid: authcid.into(),
-            password: password.into(),
+            authzid: saslprep(&authzid.into()),
+            authcid: saslprep(&authcid.into()),
+            password: saslprep(&password.into()),
         }
     }
 
@@ -90,5 +92,18 @@ mod tests {
     fn authzid_is_included_when_set() {
         let p = Plain::with_authzid("admin", "adao", "hunter2");
         assert_eq!(p.encode(), b"admin\x00adao\x00hunter2");
+    }
+
+    #[test]
+    fn saslprep_normalizes_credentials() {
+        // Soft hyphen (U+00AD) maps to nothing; no-break space (U+00A0) -> space.
+        let p = Plain::new("ad\u{00AD}ao", "hunter\u{00A0}2");
+        assert_eq!(p.authcid, "adao");
+        assert_eq!(p.password, "hunter 2");
+        // Pure ASCII is untouched (SASLprep identity), so known answers hold.
+        assert_eq!(
+            Plain::new("adao", "hunter2").encode(),
+            b"\x00adao\x00hunter2"
+        );
     }
 }
