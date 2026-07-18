@@ -270,13 +270,49 @@ impl Cli {
     }
 }
 
-/// Load and resolve all networks from the config file and/or CLI flags.
-pub fn load_networks(cli: &Cli) -> io::Result<Vec<NetworkSettings>> {
-    let mut configs: Vec<NetworkConfig> = Vec::new();
+/// The commented template written on first run.
+const CONFIG_TEMPLATE: &str = "\
+# norn configuration.
+#
+# Define one or more [[network]] blocks below, then run `norn` again.
+# Passwords are never stored here: set `password_command` to a shell command
+# whose stdout is the password (or leave it out and use the NORN_PASSWORD env
+# var).
 
+# [[network]]
+# name = \"libera\"
+# host = \"irc.libera.chat\"
+# port = 6697
+# tls = true
+# nick = \"yournick\"
+# # SASL (optional):
+# sasl_account = \"yournick\"
+# sasl_mech = \"scram\"                    # plain | scram
+# password_command = \"pass irc/libera\"   # stdout is the password
+# auto_join = [\"#rust\", \"#ratatui\"]
+";
+
+/// The outcome of resolving startup configuration.
+pub enum Startup {
+    /// Ready to connect to these networks.
+    Connect(Vec<NetworkSettings>),
+    /// No config existed; a template was written here. The user should edit it.
+    WroteTemplate(PathBuf),
+    /// Config exists but declares no networks.
+    NoNetworks(PathBuf),
+}
+
+/// Resolve networks from the config file and/or CLI flags. On a first run with
+/// no config and no CLI network, write a template and ask the user to edit it
+/// (irssi-style), rather than connecting.
+pub fn resolve_startup(cli: &Cli) -> io::Result<Startup> {
     let path = cli.config.clone().or_else(default_config_path);
+    let mut configs: Vec<NetworkConfig> = Vec::new();
+    let mut file_existed = false;
+
     if let Some(path) = &path {
         if path.exists() {
+            file_existed = true;
             let text = std::fs::read_to_string(path)?;
             let config: Config = toml::from_str(&text)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -288,20 +324,41 @@ pub fn load_networks(cli: &Cli) -> io::Result<Vec<NetworkSettings>> {
         configs.push(network);
     }
 
-    if configs.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no networks configured: pass --server/--nick or create a config file \
-             (~/.config/norn/config.toml)",
-        ));
+    if !configs.is_empty() {
+        let settings = configs
+            .iter()
+            .map(NetworkConfig::resolve)
+            .collect::<io::Result<Vec<_>>>()?;
+        return Ok(Startup::Connect(settings));
     }
 
-    configs.iter().map(NetworkConfig::resolve).collect()
+    match path {
+        // First run: no config file yet -> write a template and stop.
+        Some(path) if !file_existed => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, CONFIG_TEMPLATE)?;
+            Ok(Startup::WroteTemplate(path))
+        }
+        // Config exists but is empty of networks.
+        Some(path) => Ok(Startup::NoNetworks(path)),
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no config directory available; pass --config or --server/--nick",
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_is_valid_toml_with_no_active_networks() {
+        let config: Config = toml::from_str(CONFIG_TEMPLATE).unwrap();
+        assert!(config.networks.is_empty());
+    }
 
     #[test]
     fn nonce_is_well_formed_and_varies() {

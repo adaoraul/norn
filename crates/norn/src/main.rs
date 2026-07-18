@@ -19,15 +19,29 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::sync::mpsc;
 
-use config::Cli;
+use config::{Cli, Startup};
 use session::{ConnState, NetCommand, UiEvent};
 use tui::state::NetworkMeta;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
-    let networks = match config::load_networks(&cli) {
-        Ok(networks) => networks,
+    let networks = match config::resolve_startup(&cli) {
+        Ok(Startup::Connect(networks)) => networks,
+        Ok(Startup::WroteTemplate(path)) => {
+            println!(
+                "Created a starter config at {}.\nEdit it to add a network, then run norn again.",
+                path.display()
+            );
+            return Ok(());
+        }
+        Ok(Startup::NoNetworks(path)) => {
+            println!(
+                "No networks configured in {}.\nAdd a [[network]] block (or pass --server/--nick).",
+                path.display()
+            );
+            return Ok(());
+        }
         Err(err) => {
             eprintln!("norn: {err}");
             std::process::exit(2);
