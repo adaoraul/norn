@@ -89,6 +89,13 @@ pub enum AddonEventKind {
         /// New nick.
         new: String,
     },
+    /// We crossed the keyboard-idle threshold (synthetic, not from the engine).
+    Idle {
+        /// Seconds of inactivity when the event fired.
+        seconds: u64,
+    },
+    /// We resumed activity after being idle (synthetic, not from the engine).
+    Active,
 }
 
 impl AddonEvent {

@@ -1062,6 +1062,7 @@ impl App {
             "completion_char" => self.client.completion_char.clone(),
             "beep_on_highlight" => on_off(self.client.beep_on_highlight),
             "scrollback_lines" => self.client.scrollback_lines.to_string(),
+            "idle_secs" => self.client.idle_secs.to_string(),
             _ => String::new(),
         }
     }
@@ -1106,6 +1107,18 @@ impl App {
                     return Err(format!("must be between {min} and {max}"));
                 }
                 self.set_scrollback(n);
+            }
+            "idle_secs" => {
+                let SettingKind::Int { min, max } = doc.kind else {
+                    unreachable!("idle_secs is an int setting")
+                };
+                let n: usize = raw
+                    .parse()
+                    .map_err(|_| format!("expected a number, got '{raw}'"))?;
+                if !(min..=max).contains(&n) {
+                    return Err(format!("must be between {min} and {max}"));
+                }
+                self.client.idle_secs = n;
             }
             other => return Err(format!("unknown setting '{other}'")),
         }

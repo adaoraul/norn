@@ -51,6 +51,10 @@ struct Script {
     label: String,
     ast: AST,
     hooks: HashSet<String>,
+    /// Top-level literal constants (`const NAME = ...`), pushed into a hook's
+    /// scope so functions can read them (Rhai does not share them into `call_fn`
+    /// scopes automatically).
+    consts: Vec<(String, Dynamic)>,
 }
 
 /// The Rhai scripting host.
@@ -139,10 +143,15 @@ impl RhaiHost {
                     if !off {
                         let hooks: HashSet<String> =
                             ast.iter_functions().map(|f| f.name.to_string()).collect();
+                        let consts: Vec<(String, Dynamic)> = ast
+                            .iter_literal_variables(true, false)
+                            .map(|(k, _, v)| (k.to_string(), v))
+                            .collect();
                         scripts.push(Script {
                             label: file.clone(),
                             ast,
                             hooks,
+                            consts,
                         });
                     }
                     plugins.push(PluginInfo {
@@ -247,6 +256,9 @@ impl AddonHost for RhaiHost {
             // Namespace the KV store to the plugin about to run.
             self.state.borrow_mut().current_script = stem(&script.label);
             let mut scope = Scope::new();
+            for (name, value) in &script.consts {
+                scope.push_constant(name.as_str(), value.clone());
+            }
             scope.push_constant("store", Store);
             if let Err(err) =
                 self.engine
@@ -273,6 +285,8 @@ fn hook_for(kind: &AddonEventKind) -> &'static str {
         AddonEventKind::Kick { .. } => "on_kick",
         AddonEventKind::Quit { .. } => "on_quit",
         AddonEventKind::NickChange { .. } => "on_nick",
+        AddonEventKind::Idle { .. } => "on_idle",
+        AddonEventKind::Active => "on_active",
     }
 }
 
@@ -292,6 +306,7 @@ fn event_map(kind: &AddonEventKind, ctx: &AddonCtx) -> Map {
     m.insert("highlight".into(), Dynamic::from(false));
     m.insert("from_self".into(), Dynamic::from(false));
     m.insert("is_me".into(), Dynamic::from(false));
+    m.insert("seconds".into(), Dynamic::from(0_i64));
 
     let reply_to = event_reply_target(kind, ctx.my_nick).unwrap_or_default();
     match kind {
@@ -352,6 +367,13 @@ fn event_map(kind: &AddonEventKind, ctx: &AddonCtx) -> Map {
             m.insert("type".into(), Dynamic::from("nick".to_string()));
             m.insert("nick".into(), Dynamic::from(old.clone()));
             m.insert("new".into(), Dynamic::from(new.clone()));
+        }
+        AddonEventKind::Idle { seconds } => {
+            m.insert("type".into(), Dynamic::from("idle".to_string()));
+            m.insert("seconds".into(), Dynamic::from(*seconds as i64));
+        }
+        AddonEventKind::Active => {
+            m.insert("type".into(), Dynamic::from("active".to_string()));
         }
     }
     m
@@ -775,6 +797,30 @@ mod tests {
                 "PRIVMSG #rust :names=2",
             ]
         );
+    }
+
+    #[test]
+    fn idle_and_active_hooks_fire() {
+        let mut h = RhaiHost::from_sources(
+            &[(
+                "a.rhai",
+                r#"fn on_idle(m) { raw("AWAY :idle " + m.seconds.to_string()); }
+                   fn on_active(m) { raw("AWAY"); }"#,
+            )],
+            &[],
+        );
+        let idle = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Idle { seconds: 300 },
+        };
+        let out = h.on_event(&idle, &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["AWAY :idle 300"]));
+        let active = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Active,
+        };
+        let out = h.on_event(&active, &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["AWAY"]));
     }
 
     #[test]

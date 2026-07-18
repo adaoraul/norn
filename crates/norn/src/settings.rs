@@ -102,6 +102,16 @@ pub const SETTINGS: &[SettingDoc] = &[
         desc: "maximum number of lines kept per buffer",
         default: "5000",
     },
+    SettingDoc {
+        key: "idle_secs",
+        category: "behavior",
+        kind: SettingKind::Int {
+            min: 0,
+            max: 86_400,
+        },
+        desc: "seconds of inactivity before plugins get on_idle (0 disables)",
+        default: "300",
+    },
 ];
 
 /// Look up a setting by key.

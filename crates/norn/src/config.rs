@@ -106,6 +106,10 @@ fn default_scrollback() -> usize {
     5000
 }
 
+fn default_idle_secs() -> usize {
+    300
+}
+
 /// A network as declared in the TOML file (or synthesized from CLI flags).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NetworkConfig {
@@ -181,6 +185,10 @@ pub struct ClientConfig {
     /// Maximum number of lines kept per buffer.
     #[serde(default = "default_scrollback")]
     pub scrollback_lines: usize,
+    /// Seconds of keyboard inactivity before plugins get an `on_idle` event
+    /// (0 disables idle tracking).
+    #[serde(default = "default_idle_secs")]
+    pub idle_secs: usize,
 }
 
 impl Default for ClientConfig {
@@ -193,6 +201,7 @@ impl Default for ClientConfig {
             completion_char: default_completion_char(),
             beep_on_highlight: false,
             scrollback_lines: default_scrollback(),
+            idle_secs: default_idle_secs(),
         }
     }
 }
@@ -490,6 +499,7 @@ mod tests {
                 timestamps: false,
                 theme: "amber".into(),
                 nicklist: true,
+                idle_secs: 120,
                 ..ClientConfig::default()
             },
             aliases,
@@ -523,6 +533,7 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.client.theme, "amber");
         assert!(!back.client.timestamps);
+        assert_eq!(back.client.idle_secs, 120);
         assert_eq!(back.aliases.get("j").map(String::as_str), Some("join $1"));
         assert_eq!(back.aliases.get("exit").map(String::as_str), Some("quit"));
         assert_eq!(back.networks.len(), 1);

@@ -14,6 +14,7 @@ use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEventKind,
@@ -27,10 +28,11 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::addons::{
-    build_addon_host, AddonCtx, AddonEvent, AddonHost, PluginInfo, PluginStatus, Presence, Reaction,
+    build_addon_host, AddonCtx, AddonEvent, AddonEventKind, AddonHost, PluginInfo, PluginStatus,
+    Presence, Reaction,
 };
 use crate::config::{ClientConfig, NetworkConfig, TriggerConfig};
-use crate::session::{NetCommand, UiEvent, UiEventKind};
+use crate::session::{ConnState, NetCommand, NetworkId, UiEvent, UiEventKind};
 use state::{App, AppAction, BufferKind, NetworkMeta};
 
 /// A terminal in raw/alternate-screen mode, restored on drop.
@@ -117,6 +119,10 @@ pub async fn run(
     let mut host = report.host;
     report_addon_load(&mut app, report.plugins);
     let mut term_events = EventStream::new();
+    // Keystroke-idle tracking for the on_idle/on_active plugin hooks.
+    let mut last_activity = Instant::now();
+    let mut is_idle = false;
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(5));
 
     loop {
         if app.dirty {
@@ -138,6 +144,11 @@ pub async fn run(
             term = term_events.next() => {
                 match term {
                     Some(Ok(CrosstermEvent::Key(key))) if key.kind == KeyEventKind::Press => {
+                        last_activity = Instant::now();
+                        if is_idle {
+                            is_idle = false;
+                            fire_synthetic(&mut app, host.as_mut(), &cmd_txs, || AddonEventKind::Active);
+                        }
                         let cmds = input::handle_key(&mut app, key);
                         send_to_active(&app, &cmd_txs, cmds);
                     }
@@ -149,6 +160,17 @@ pub async fn run(
                     Some(Ok(CrosstermEvent::Resize(_, _))) => app.dirty = true,
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break, // input stream ended
+                }
+            }
+            _ = idle_tick.tick() => {
+                let idle_secs = app.client.idle_secs as u64;
+                if !is_idle && idle_secs > 0 {
+                    let elapsed = last_activity.elapsed().as_secs();
+                    if elapsed >= idle_secs {
+                        is_idle = true;
+                        fire_synthetic(&mut app, host.as_mut(), &cmd_txs,
+                            || AddonEventKind::Idle { seconds: elapsed });
+                    }
                 }
             }
         }
@@ -190,7 +212,19 @@ fn process_ui_event(
     cmd_txs: &[mpsc::UnboundedSender<NetCommand>],
     event: UiEvent,
 ) {
-    for reaction in addon_reactions(app, host, &event) {
+    let reactions = addon_reactions(app, host, &event);
+    enact_reactions(app, cmd_txs, reactions);
+    app.apply(event);
+}
+
+/// Enact host reactions: send raw lines, show local notices, or raise desktop
+/// notifications.
+fn enact_reactions(
+    app: &mut App,
+    cmd_txs: &[mpsc::UnboundedSender<NetCommand>],
+    reactions: Vec<Reaction>,
+) {
+    for reaction in reactions {
         match reaction {
             Reaction::Send { net, lines } => {
                 if let Some(tx) = cmd_txs.get(net) {
@@ -203,7 +237,6 @@ fn process_ui_event(
             Reaction::Desktop { text } => desktop_notify(text),
         }
     }
-    app.apply(event);
 }
 
 /// Raise an OS desktop notification via `notify-send`, fire-and-forget. Errors
@@ -239,11 +272,61 @@ fn addon_reactions(app: &App, host: &mut dyn AddonHost, event: &UiEvent) -> Vec<
     let Some(addon_event) = AddonEvent::from_engine(engine_event, event.net, &my_nick) else {
         return Vec::new();
     };
-    // Snapshot our presence on this network for the read-only accessors.
+    let presence = network_presence(app, event.net);
+    let ctx = AddonCtx {
+        my_nick: &my_nick,
+        network: &network,
+        presence: &presence,
+    };
+    host.on_event(&addon_event, &ctx)
+}
+
+/// Fire a synthetic (non-engine) addon event on every registered network and
+/// enact the reactions. Used for idle/active events, which are client-local.
+fn fire_synthetic(
+    app: &mut App,
+    host: &mut dyn AddonHost,
+    cmd_txs: &[mpsc::UnboundedSender<NetCommand>],
+    make_kind: impl Fn() -> AddonEventKind,
+) {
+    let targets: Vec<usize> = app
+        .networks
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m.state, ConnState::Registered { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    for net in targets {
+        let (my_nick, network) = {
+            let m = &app.networks[net];
+            (m.my_nick.clone(), m.name.clone())
+        };
+        let presence = network_presence(app, net);
+        let ev = AddonEvent {
+            net,
+            kind: make_kind(),
+        };
+        let ctx = AddonCtx {
+            my_nick: &my_nick,
+            network: &network,
+            presence: &presence,
+        };
+        let reactions = host.on_event(&ev, &ctx);
+        enact_reactions(app, cmd_txs, reactions);
+    }
+}
+
+/// Snapshot our presence on `net`: away/account plus each channel's roster.
+fn network_presence(app: &App, net: NetworkId) -> Presence {
+    let (away, account) = app
+        .networks
+        .get(net)
+        .map(|m| (m.away, m.account.clone()))
+        .unwrap_or((false, None));
     let channels = app
         .buffers
         .iter()
-        .filter(|b| b.net == event.net && b.kind == BufferKind::Channel)
+        .filter(|b| b.net == net && b.kind == BufferKind::Channel)
         .map(|b| {
             let members = b
                 .members
@@ -253,17 +336,11 @@ fn addon_reactions(app: &App, host: &mut dyn AddonHost, event: &UiEvent) -> Vec<
             (b.name.clone(), members)
         })
         .collect();
-    let presence = Presence {
-        away: meta.away,
-        account: meta.account.clone(),
+    Presence {
+        away,
+        account,
         channels,
-    };
-    let ctx = AddonCtx {
-        my_nick: &my_nick,
-        network: &network,
-        presence: &presence,
-    };
-    host.on_event(&addon_event, &ctx)
+    }
 }
 
 /// Whether a channel member holds op or higher (op, admin, or owner).

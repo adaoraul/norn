@@ -39,6 +39,11 @@ pub const OFFICIAL: &[OfficialPlugin] = &[
         description: "track when nicks were last seen (KV store demo)",
         source: include_str!("official/seen.rhai"),
     },
+    OfficialPlugin {
+        name: "autoaway",
+        description: "set away when idle, back when active",
+        source: include_str!("official/autoaway.rhai"),
+    },
 ];
 
 /// Look up a bundled plugin by name.
@@ -50,8 +55,8 @@ pub fn find(name: &str) -> Option<&'static OfficialPlugin> {
 mod tests {
     use super::*;
     use crate::addons::{
-        AddonCtx, AddonEvent, AddonEventKind, AddonHost, PluginStatus, Reaction, RhaiHost,
-        EMPTY_PRESENCE,
+        AddonCtx, AddonEvent, AddonEventKind, AddonHost, PluginStatus, Presence, Reaction,
+        RhaiHost, EMPTY_PRESENCE,
     };
 
     #[test]
@@ -120,5 +125,46 @@ mod tests {
         let out = host.on_event(&msg("bob", "!seen nobody"), &ctx);
         assert!(matches!(&out[0], Reaction::Send { lines, .. }
             if lines[0].contains("have not seen")));
+    }
+
+    #[test]
+    fn autoaway_sets_and_clears_from_presence() {
+        let src = find("autoaway").unwrap().source;
+        let mut host = RhaiHost::from_sources(&[("autoaway.rhai", src)], &[]);
+        // Not away yet: on_idle sets AWAY.
+        let not_away = Presence {
+            away: false,
+            ..Presence::default()
+        };
+        let ctx = AddonCtx {
+            my_nick: "me",
+            network: "libera",
+            presence: &not_away,
+        };
+        let idle = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Idle { seconds: 300 },
+        };
+        let out = host.on_event(&idle, &ctx);
+        assert!(matches!(&out[0], Reaction::Send { lines, .. }
+            if lines[0].starts_with("AWAY :")));
+        // Already away: on_idle again does nothing.
+        let away = Presence {
+            away: true,
+            ..Presence::default()
+        };
+        let ctx = AddonCtx {
+            my_nick: "me",
+            network: "libera",
+            presence: &away,
+        };
+        assert!(host.on_event(&idle, &ctx).is_empty());
+        // Away: on_active clears it.
+        let active = AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Active,
+        };
+        let out = host.on_event(&active, &ctx);
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["AWAY"]));
     }
 }
