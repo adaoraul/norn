@@ -903,15 +903,18 @@ fn mentions(text: &str, nick: &str) -> bool {
         .any(|word| word == nick)
 }
 
-/// The console's opening lines. When nothing is configured yet, point the user
-/// at the commands that add and connect a network.
+/// The console's opening lines. Always point the user at `/help`; when nothing
+/// is configured yet, also show the quickest path to a first connection.
 fn welcome_lines(no_networks: bool) -> Vec<String> {
-    let mut lines = vec!["welcome to norn".to_string()];
+    let mut lines = vec![
+        "welcome to norn".to_string(),
+        "type /help to browse commands (arrows to move, → for details, Enter to use)".to_string(),
+        "or press Tab while typing a / command to autocomplete it".to_string(),
+    ];
     if no_networks {
-        lines.push("no networks configured yet.".to_string());
-        lines.push("  /network add <name> host=<server> nick=<you>".to_string());
-        lines.push("  /connect <name>       connect a defined network".to_string());
-        lines.push("  /set                  view and change settings".to_string());
+        lines.push("no networks configured yet. to get started:".to_string());
+        lines.push("  /network add <name> host=<server> nick=<you>   define a network".to_string());
+        lines.push("  /connect <name>                                connect to it".to_string());
     }
     lines
 }
