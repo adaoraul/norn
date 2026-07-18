@@ -36,11 +36,13 @@ pub enum ConnState {
         /// The nick the server accepted.
         nick: String,
     },
-    /// Disconnected; will retry after the given delay.
+    /// Dropped unexpectedly; will retry after the given delay.
     Reconnecting {
         /// Backoff before the next attempt.
         delay: Duration,
     },
+    /// Idle after a user `/disconnect`; stays until `/connect` revives it.
+    Disconnected,
     /// Stopped for good (user quit).
     Closed,
 }
@@ -79,12 +81,30 @@ pub enum NetCommand {
         /// Maximum messages to fetch.
         limit: usize,
     },
-    /// Quit this network (and stop reconnecting).
+    /// (Re)connect an idle network task.
+    Connect,
+    /// Disconnect but keep the task alive (idle), with an optional quit reason.
+    /// A later `Connect` revives it.
+    Disconnect(Option<String>),
+    /// Quit this network for good (and stop the task).
     Quit(Option<String>),
 }
 
-/// Run one network for the life of the program: connect, register, run, and
-/// reconnect with backoff until told to quit.
+/// Why a connection attempt ended.
+enum RunOutcome {
+    /// The user quit this network for good; stop the task.
+    Quit,
+    /// The user asked to disconnect; go idle until a `Connect`.
+    Disconnected,
+    /// The connection dropped (or bring-up failed); reconnect with backoff.
+    Dropped,
+}
+
+/// Run one network task for the life of the program. The task owns a
+/// desired-connection state: when connected it dials and, on an unexpected
+/// drop, reconnects with backoff; when disconnected (via `/disconnect`) it idles
+/// on the command channel until a `Connect` revives it. Only `Quit` (or the UI
+/// closing) ends the task.
 pub async fn run_network(
     id: NetworkId,
     settings: NetworkSettings,
@@ -93,15 +113,43 @@ pub async fn run_network(
     quit: Arc<AtomicBool>,
 ) {
     let mut backoff = BACKOFF_START;
+    // Spawned tasks always want to connect (they were just `/connect`ed, or are
+    // a startup network).
+    let mut want_connected = true;
+
     loop {
+        if quit.load(Ordering::SeqCst) {
+            break;
+        }
+        if !want_connected {
+            // Idle: wait for a control command.
+            match cmd_rx.recv().await {
+                Some(NetCommand::Connect) => {
+                    want_connected = true;
+                    backoff = BACKOFF_START;
+                }
+                Some(NetCommand::Quit(_)) | None => break,
+                _ => {} // ignore raw/history/disconnect while already idle
+            }
+            continue;
+        }
+
         let _ = ui_tx.send(UiEvent {
             net: id,
             kind: UiEventKind::ConnState(ConnState::Connecting),
         });
 
         match run_once(id, &settings, &ui_tx, &mut cmd_rx).await {
-            Ok(true) => break, // user quit
-            Ok(false) => {}
+            Ok(RunOutcome::Quit) => break,
+            Ok(RunOutcome::Disconnected) => {
+                let _ = ui_tx.send(UiEvent {
+                    net: id,
+                    kind: UiEventKind::ConnState(ConnState::Disconnected),
+                });
+                want_connected = false;
+                continue;
+            }
+            Ok(RunOutcome::Dropped) => {}
             Err(err) => {
                 let _ = ui_tx.send(UiEvent {
                     net: id,
@@ -127,13 +175,15 @@ pub async fn run_network(
     });
 }
 
-/// One connection attempt. Returns `Ok(true)` if the user asked to quit.
+/// One connection attempt: connect, register, then run the post-registration
+/// loop until it ends. The return value tells the caller whether to stop, idle,
+/// or reconnect.
 async fn run_once(
     id: NetworkId,
     settings: &NetworkSettings,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     cmd_rx: &mut mpsc::UnboundedReceiver<NetCommand>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<RunOutcome> {
     let stream = transport::connect(&settings.conn).await?;
     let mut conn = Connection::new(stream);
     let mut machine = BringupMachine::new(settings.bringup());
@@ -154,7 +204,7 @@ async fn run_once(
         });
     }
     if !machine.is_registered() {
-        return Ok(false);
+        return Ok(RunOutcome::Dropped);
     }
 
     for channel in &settings.auto_join {
@@ -166,7 +216,7 @@ async fn run_once(
             incoming = conn.recv() => {
                 match incoming? {
                     Some(msg) => on_message(id, msg, &mut engine, &mut conn, &my_nick, ui_tx).await?,
-                    None => return Ok(false), // server closed
+                    None => return Ok(RunOutcome::Dropped), // server closed
                 }
             }
             cmd = cmd_rx.recv() => {
@@ -177,12 +227,18 @@ async fn run_once(
                         let line = engine.request_history(request);
                         conn.send(&line).await?;
                     }
+                    Some(NetCommand::Connect) => {} // already connected
+                    Some(NetCommand::Disconnect(reason)) => {
+                        let reason = reason.unwrap_or_else(|| "norn".to_string());
+                        conn.send(&format!("QUIT :{reason}")).await?;
+                        return Ok(RunOutcome::Disconnected);
+                    }
                     Some(NetCommand::Quit(reason)) => {
                         let reason = reason.unwrap_or_else(|| "norn".to_string());
                         conn.send(&format!("QUIT :{reason}")).await?;
-                        return Ok(true);
+                        return Ok(RunOutcome::Quit);
                     }
-                    None => return Ok(true), // UI gone
+                    None => return Ok(RunOutcome::Quit), // UI gone
                 }
             }
         }

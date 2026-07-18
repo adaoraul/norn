@@ -100,7 +100,7 @@ fn default_theme() -> String {
 }
 
 /// A network as declared in the TOML file (or synthesized from CLI flags).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NetworkConfig {
     /// Display name for the network.
     pub name: String,

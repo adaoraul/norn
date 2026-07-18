@@ -230,6 +230,18 @@ fn submit(app: &mut App) -> Vec<NetCommand> {
                 handle_network(app, arg);
                 return Vec::new();
             }
+            "connect" | "server" => {
+                match arg.split_whitespace().next() {
+                    Some(name) => app.connect_network(name),
+                    None => app.push_active_event("usage: /connect <name>".to_string()),
+                }
+                return Vec::new();
+            }
+            "disconnect" => {
+                let reason = (!arg.is_empty()).then(|| arg.to_string());
+                app.disconnect_active(reason);
+                return Vec::new();
+            }
             _ => {}
         }
     }
@@ -769,6 +781,48 @@ mod tests {
         // remove drops it.
         run_line(&mut app, "/network remove libera");
         assert!(app.definitions.is_empty());
+    }
+
+    #[test]
+    fn connect_defined_network_allocates_and_queues_add() {
+        use crate::tui::state::AppAction;
+        let mut app = app_with_channel(); // one live network "net" (id 0)
+        run_line(
+            &mut app,
+            "/network add libera host=irc.libera.chat nick=svan",
+        );
+        run_line(&mut app, "/connect libera");
+        // A new network slot (id 1) was allocated and an AddNetwork queued.
+        assert_eq!(app.networks.len(), 2);
+        assert_eq!(app.networks[1].name, "libera");
+        assert!(matches!(
+            app.actions.as_slice(),
+            [AppAction::AddNetwork { id: 1, .. }]
+        ));
+        // We switched to the new network's server buffer.
+        assert_eq!(app.active_buffer().net, 1);
+    }
+
+    #[test]
+    fn connect_unknown_network_is_rejected() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/connect nope");
+        assert_eq!(app.networks.len(), 1, "no slot allocated for unknown net");
+        assert!(app.actions.is_empty());
+    }
+
+    #[test]
+    fn disconnect_active_queues_disconnect() {
+        use crate::session::ConnState;
+        use crate::tui::state::AppAction;
+        let mut app = app_with_channel();
+        app.networks[0].state = ConnState::Registered { nick: "me".into() };
+        // Active buffer is #rust on net 0.
+        run_line(&mut app, "/disconnect bye");
+        assert_eq!(
+            app.actions,
+            vec![AppAction::Disconnect(0, Some("bye".to_string()))]
+        );
     }
 
     #[test]

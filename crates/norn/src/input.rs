@@ -33,7 +33,8 @@ impl Translated {
 
 /// Short help listing the available commands.
 pub const HELP: &str = "commands: /join #chan · /part [#chan] · /msg <t> <text> · \
-/query <nick> · /nick <n> · /names · /me <action> · /raw <line> · /help · /quit";
+/query <nick> · /nick <n> · /names · /me <action> · /raw <line> · /help · /quit · \
+/set [key val] · /network list|add|remove · /connect <name> · /disconnect [reason]";
 
 /// Translate one input line for the given current target.
 pub fn translate(input: &str, current: &mut Option<String>) -> Translated {

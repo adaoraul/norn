@@ -88,6 +88,23 @@ fn ctcp_action(text: &str) -> Option<&str> {
     Some(inner.strip_suffix('\u{1}').unwrap_or(inner))
 }
 
+/// A control-plane request from the UI to the supervisor (the `tui::run` loop),
+/// which owns the tokio machinery needed to spawn and signal network tasks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppAction {
+    /// Spawn and connect a task for a just-allocated network id.
+    AddNetwork {
+        /// The allocated id (equals `cmd_txs.len()` at spawn time).
+        id: NetworkId,
+        /// The network definition to resolve and dial.
+        config: NetworkConfig,
+    },
+    /// Ask an existing idle network to (re)connect.
+    Connect(NetworkId),
+    /// Ask a network to disconnect (go idle), with an optional quit reason.
+    Disconnect(NetworkId, Option<String>),
+}
+
 /// A network's metadata.
 #[derive(Debug, Clone)]
 pub struct NetworkMeta {
@@ -230,6 +247,8 @@ pub struct App {
     pub definitions: Vec<NetworkConfig>,
     /// Where to auto-save config (`None` if no config dir is available).
     pub config_path: Option<PathBuf>,
+    /// Pending control-plane actions for the supervisor to execute.
+    pub actions: Vec<AppAction>,
     /// Previously submitted input lines (for recall).
     pub history: Vec<String>,
     /// Position while navigating history (`None` = at the live draft).
@@ -280,6 +299,7 @@ impl App {
             client,
             definitions,
             config_path,
+            actions: Vec::new(),
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
@@ -354,6 +374,7 @@ impl App {
             ConnState::Reconnecting { delay } => {
                 format!("reconnecting in {}s...", delay.as_secs())
             }
+            ConnState::Disconnected => "disconnected".to_string(),
             ConnState::Closed => "connection closed".to_string(),
         };
         self.networks[net].state = state;
@@ -653,6 +674,62 @@ impl App {
         if let Err(err) = config.save(&path) {
             self.push_active_event(format!("save failed: {err}"));
         }
+    }
+
+    /// Connect a network by name: revive an existing idle one, or spawn a new
+    /// task from its definition. Queues an [`AppAction`] for the supervisor.
+    pub fn connect_network(&mut self, name: &str) {
+        // Already a live network with this name?
+        if let Some(id) = self
+            .networks
+            .iter()
+            .position(|n| n.name.eq_ignore_ascii_case(name))
+        {
+            match self.networks[id].state {
+                ConnState::Connecting | ConnState::Registered { .. } => {
+                    self.push_active_event(format!("{name} is already connected"));
+                }
+                _ => {
+                    self.networks[id].state = ConnState::Connecting;
+                    self.actions.push(AppAction::Connect(id));
+                }
+            }
+            return;
+        }
+        // Otherwise dial a defined network.
+        let Some(config) = self
+            .definitions
+            .iter()
+            .find(|n| n.name.eq_ignore_ascii_case(name))
+            .cloned()
+        else {
+            self.push_active_event(format!("no network '{name}' (define it with /network add)"));
+            return;
+        };
+        let id = self.networks.len();
+        self.networks.push(NetworkMeta {
+            name: config.name.clone(),
+            my_nick: config.nick.clone(),
+            state: ConnState::Connecting,
+        });
+        let idx = self.ensure_buffer(id, "*", BufferKind::Server);
+        self.actions.push(AppAction::AddNetwork { id, config });
+        self.switch_to(idx);
+    }
+
+    /// Disconnect the active buffer's network (keeping the task idle so it can be
+    /// reconnected). No-op on the console.
+    pub fn disconnect_active(&mut self, reason: Option<String>) {
+        let net = self.active_buffer().net;
+        let Some(meta) = self.networks.get(net) else {
+            self.push_active_event("no network here to disconnect".to_string());
+            return;
+        };
+        if matches!(meta.state, ConnState::Disconnected | ConnState::Closed) {
+            self.push_active_event(format!("{} is not connected", meta.name));
+            return;
+        }
+        self.actions.push(AppAction::Disconnect(net, reason));
     }
 
     /// Open (or focus) a query buffer with `nick` on `net`.

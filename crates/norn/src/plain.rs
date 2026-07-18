@@ -79,6 +79,7 @@ fn print_event(event: &UiEvent, names: &[String]) {
                 ConnState::Reconnecting { delay } => {
                     format!("reconnecting in {}s...", delay.as_secs())
                 }
+                ConnState::Disconnected => "disconnected".to_string(),
                 ConnState::Closed => "connection closed".to_string(),
             };
             println!("[{net}] {text}");

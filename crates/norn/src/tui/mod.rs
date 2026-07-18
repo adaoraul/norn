@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{ClientConfig, NetworkConfig};
 use crate::session::{NetCommand, UiEvent};
-use state::{App, NetworkMeta};
+use state::{App, AppAction, NetworkMeta};
 
 /// A terminal in raw/alternate-screen mode, restored on drop.
 struct TerminalGuard {
@@ -91,9 +91,9 @@ pub async fn run(
     quit: Arc<AtomicBool>,
 ) -> io::Result<()> {
     install_panic_hook();
-    // Held so `ui_rx` stays open even with zero networks (the console stays up);
-    // the supervisor will clone it to spawn networks at runtime.
-    let _ui_tx = ui_tx;
+    // `ui_tx` is held (and cloned when spawning) so `ui_rx` stays open even with
+    // zero networks; `cmd_txs` grows as networks are added at runtime.
+    let mut cmd_txs = cmd_txs;
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new(networks, client, definitions, config_path);
     let mut term_events = EventStream::new();
@@ -133,6 +133,9 @@ pub async fn run(
             }
         }
 
+        // Execute any control-plane actions the input handlers queued.
+        drain_actions(&mut app, &mut cmd_txs, &ui_tx, &quit);
+
         if app.should_quit {
             quit.store(true, Ordering::SeqCst);
             for tx in &cmd_txs {
@@ -143,4 +146,45 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Perform the supervisor's queued actions: spawn new network tasks and signal
+/// existing ones to connect or disconnect.
+fn drain_actions(
+    app: &mut App,
+    cmd_txs: &mut Vec<mpsc::UnboundedSender<NetCommand>>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    quit: &Arc<AtomicBool>,
+) {
+    for action in std::mem::take(&mut app.actions) {
+        match action {
+            AppAction::AddNetwork { id, config } => match config.resolve() {
+                Ok(settings) => {
+                    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                    // The id was allocated as `networks.len()`, kept in lockstep
+                    // with `cmd_txs`, so a plain push lands it at index `id`.
+                    debug_assert_eq!(id, cmd_txs.len());
+                    cmd_txs.push(cmd_tx);
+                    tokio::spawn(crate::session::run_network(
+                        id,
+                        settings,
+                        ui_tx.clone(),
+                        cmd_rx,
+                        quit.clone(),
+                    ));
+                }
+                Err(err) => app.push_active_event(format!("connect failed: {err}")),
+            },
+            AppAction::Connect(id) => {
+                if let Some(tx) = cmd_txs.get(id) {
+                    let _ = tx.send(NetCommand::Connect);
+                }
+            }
+            AppAction::Disconnect(id, reason) => {
+                if let Some(tx) = cmd_txs.get(id) {
+                    let _ = tx.send(NetCommand::Disconnect(reason));
+                }
+            }
+        }
+    }
 }
