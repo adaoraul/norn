@@ -1448,6 +1448,9 @@ fn welcome_lines(no_networks: bool) -> Vec<String> {
 
 /// Render a completed whois into buffer lines (a header plus indented details).
 fn whois_lines(info: &WhoisInfo) -> Vec<String> {
+    if info.not_found {
+        return vec![format!("no such nick: {}", info.nick)];
+    }
     let mut lines = Vec::new();
     match (&info.user, &info.host) {
         (Some(user), Some(host)) => lines.push(format!("{} is {user}@{host}", info.nick)),
@@ -1913,6 +1916,7 @@ mod tests {
                 is_operator: false,
                 secure: true,
                 away: None,
+                not_found: false,
             }),
         ));
         let text: String = a
@@ -1929,6 +1933,30 @@ mod tests {
         assert!(text.contains("account: acct"));
         assert!(text.contains("using a secure connection"));
         assert!(text.contains("idle 1m5s"));
+    }
+
+    #[test]
+    fn whois_not_found_renders_no_such_nick() {
+        let mut a = app();
+        a.apply(engine(
+            0,
+            Event::WhoisReceived(WhoisInfo {
+                nick: "ghost".into(),
+                not_found: true,
+                ..Default::default()
+            }),
+        ));
+        let text: String = a
+            .active_buffer()
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Event { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("no such nick: ghost"));
     }
 
     #[test]

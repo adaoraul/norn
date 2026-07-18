@@ -90,6 +90,9 @@ pub fn render(event: &Event) -> Vec<String> {
         Event::RealnameChanged { nick, realname } => {
             vec![format!("-- {nick} set realname to {realname}")]
         }
+        Event::WhoisReceived(info) if info.not_found => {
+            vec![format!("-- no such nick: {}", info.nick)]
+        }
         Event::WhoisReceived(info) => {
             let mut lines = match (&info.user, &info.host) {
                 (Some(user), Some(host)) => vec![format!("-- {} is {user}@{host}", info.nick)],

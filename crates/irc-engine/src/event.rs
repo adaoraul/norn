@@ -92,6 +92,8 @@ pub struct WhoisInfo {
     pub secure: bool,
     /// Their away message, if away (301, only when part of a whois).
     pub away: Option<String>,
+    /// The nick does not exist (ERR_NOSUCHNICK 401); the other fields are unset.
+    pub not_found: bool,
 }
 
 /// Why a member left a channel.

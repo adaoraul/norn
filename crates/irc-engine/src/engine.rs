@@ -226,7 +226,7 @@ impl Engine {
             return false;
         };
         let n = *n;
-        if !matches!(n, 301 | 311 | 312 | 313 | 317 | 318 | 319 | 330 | 671) {
+        if !matches!(n, 301 | 311 | 312 | 313 | 317 | 318 | 319 | 330 | 401 | 671) {
             return false;
         }
         let Some(nick) = msg.params.get(1).cloned() else {
@@ -289,13 +289,23 @@ impl Engine {
                 Some(e) => e.away = msg.params.get(2).cloned(),
                 None => return false,
             },
-            // 318 RPL_ENDOFWHOIS: emit what we gathered (or a bare nick).
-            318 => {
-                let info = self.whois.remove(&key).unwrap_or(WhoisInfo {
+            // 401 ERR_NOSUCHNICK: the nick does not exist. Emit at once (also
+            // surfacing a bare 401 from e.g. messaging a vanished nick) and drop
+            // any pending accumulator so the trailing 318 does not double up.
+            401 => {
+                self.whois.remove(&key);
+                events.push(Event::WhoisReceived(WhoisInfo {
                     nick,
+                    not_found: true,
                     ..Default::default()
-                });
-                events.push(Event::WhoisReceived(info));
+                }));
+            }
+            // 318 RPL_ENDOFWHOIS: emit what we gathered. Nothing to emit when the
+            // whois resolved to a 401 (already reported) or never accumulated.
+            318 => {
+                if let Some(info) = self.whois.remove(&key) {
+                    events.push(Event::WhoisReceived(info));
+                }
             }
             _ => unreachable!("guarded by the matches! above"),
         }
@@ -539,9 +549,23 @@ mod tests {
         assert_eq!(info.account.as_deref(), Some("aliceacct"));
         assert_eq!(info.idle_secs, Some(42));
         assert!(info.secure);
-        // The accumulator is drained after the end.
-        let again = feed(&mut e, ":s 318 me alice :End of /WHOIS list");
-        assert!(matches!(&again[0], Event::WhoisReceived(i) if i.user.is_none()));
+        assert!(!info.not_found);
+        // The accumulator is drained: a second end-of-whois emits nothing.
+        assert!(feed(&mut e, ":s 318 me alice :End of /WHOIS list").is_empty());
+    }
+
+    #[test]
+    fn whois_no_such_nick_reports_once() {
+        let mut e = Engine::new();
+        // 401 emits immediately; the trailing 318 does not double up.
+        let events = feed(&mut e, ":s 401 me ghost :No such nick/channel");
+        assert_eq!(events.len(), 1);
+        let Event::WhoisReceived(info) = &events[0] else {
+            panic!("expected WhoisReceived, got {:?}", events[0]);
+        };
+        assert_eq!(info.nick, "ghost");
+        assert!(info.not_found);
+        assert!(feed(&mut e, ":s 318 me ghost :End of /WHOIS list").is_empty());
     }
 
     #[test]
