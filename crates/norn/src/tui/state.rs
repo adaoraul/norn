@@ -1170,6 +1170,31 @@ impl App {
         self.actions.push(AppAction::ReloadAddons);
     }
 
+    /// The plugins folder (`<config-dir>/plugins`), if a config path is known.
+    pub fn plugins_dir(&self) -> Option<PathBuf> {
+        self.config_path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(|d| d.join("plugins"))
+    }
+
+    /// Install a bundled official plugin into the plugins folder (unless already
+    /// present), then queue a reload. Returns the written filename.
+    pub fn install_plugin(&mut self, name: &str) -> Result<String, String> {
+        let plugin = crate::addons::official::find(name)
+            .ok_or_else(|| format!("no official plugin '{name}'"))?;
+        let dir = self.plugins_dir().ok_or("no config dir to install into")?;
+        let file = format!("{}.rhai", plugin.name);
+        let path = dir.join(&file);
+        if path.exists() {
+            return Err(format!("{file} already installed"));
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(&path, plugin.source).map_err(|e| e.to_string())?;
+        self.actions.push(AppAction::ReloadAddons);
+        Ok(file)
+    }
+
     /// Connect a network by name: revive an existing idle one, or spawn a new
     /// task from its definition. Queues an [`AppAction`] for the supervisor.
     pub fn connect_network(&mut self, name: &str) {

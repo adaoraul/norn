@@ -22,8 +22,10 @@ pub enum ArgKind {
     Command,
     /// A user alias name (for `/unalias`).
     Alias,
-    /// An addon script (plugin) name.
+    /// An installed addon script (plugin) name.
     Plugin,
+    /// A bundled official plugin name (for `/plugins install`).
+    OfficialPlugin,
     /// A repeatable `key=value` option; the key completes with a trailing `=`.
     OptionKey,
     /// Freeform text (message bodies, reasons, modes) - no completion.
@@ -214,6 +216,24 @@ const PLUGINS_SUBS: &[SubDoc] = &[
         desc: "List plugin scripts with their status and version.",
         params: &[],
         examples: &["/plugins ls"],
+    },
+    SubDoc {
+        name: "available",
+        usage: "/plugins available",
+        desc: "List bundled official plugins you can install.",
+        params: &[],
+        examples: &["/plugins available"],
+    },
+    SubDoc {
+        name: "install",
+        usage: "/plugins install <name>",
+        desc: "Install a bundled official plugin into the plugins folder.",
+        params: &[req(
+            "name",
+            ArgKind::OfficialPlugin,
+            "the official plugin to install",
+        )],
+        examples: &["/plugins install autorejoin"],
     },
     SubDoc {
         name: "reload",
@@ -585,7 +605,7 @@ applied live. See `/trigger add` for the event and template grammar.",
     CommandDoc {
         name: "plugins",
         category: "Client",
-        usage: "/plugins [ls|reload|enable|disable]",
+        usage: "/plugins [ls|available|install|reload|enable|disable]",
         summary: "Open or manage the plugins",
         description: "Open the plugins manager (bare /plugins), or manage Rhai \
 plugin scripts from the input line: list them with status/version, reload after \

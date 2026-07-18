@@ -927,6 +927,39 @@ fn handle_plugins(app: &mut App, arg: &str) {
             app.actions.push(AppAction::ReloadAddons);
             app.push_active_event("reloading plugins...".to_string());
         }
+        "available" => {
+            let mut lines = vec!["available to install (/plugins install <name>):".to_string()];
+            let mut any = false;
+            for o in crate::addons::official::OFFICIAL {
+                if app
+                    .plugins
+                    .iter()
+                    .any(|p| p.name.eq_ignore_ascii_case(o.name))
+                {
+                    continue;
+                }
+                lines.push(format!("  {}  {}", o.name, o.description));
+                any = true;
+            }
+            if !any {
+                lines.push("  (all official plugins installed)".to_string());
+            }
+            for line in lines {
+                app.push_console(line);
+            }
+            app.switch_to_console();
+        }
+        "install" => {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if name.is_empty() {
+                app.push_active_event("usage: /plugins install <name>".to_string());
+                return;
+            }
+            match app.install_plugin(name) {
+                Ok(file) => app.push_active_event(format!("installed {file}")),
+                Err(err) => app.push_active_event(err),
+            }
+        }
         "enable" | "disable" => {
             let enable = sub == "enable";
             let name = rest.split_whitespace().next().unwrap_or("");
@@ -943,7 +976,7 @@ fn handle_plugins(app: &mut App, arg: &str) {
             }
         }
         other => app.push_active_event(format!(
-            "usage: /plugins ls|reload|enable|disable (got '{other}')"
+            "usage: /plugins ls|available|install|reload|enable|disable (got '{other}')"
         )),
     }
 }
@@ -1440,6 +1473,10 @@ fn kind_candidates(app: &App, kind: crate::commands::ArgKind) -> Vec<String> {
             .collect(),
         ArgKind::Alias => app.aliases.keys().cloned().collect(),
         ArgKind::Plugin => app.plugins.iter().map(|p| p.name.clone()).collect(),
+        ArgKind::OfficialPlugin => crate::addons::official::OFFICIAL
+            .iter()
+            .map(|p| p.name.to_string())
+            .collect(),
         ArgKind::OptionKey => Vec::new(), // handled at the subcommand level
         ArgKind::Free => nick_names(app), // freeform: offer nicks for mentions
     }
@@ -2280,6 +2317,26 @@ mod tests {
         assert!(app.actions.contains(&AppAction::ReloadAddons));
         handle_key(&mut app, key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn plugins_install_writes_file_and_reloads() {
+        let dir = std::env::temp_dir().join("norn-plugins-install-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = app_with_channel();
+        app.config_path = Some(dir.join("config.toml"));
+        // Install an official plugin: writes the file and queues a reload.
+        run_line(&mut app, "/plugins install autorejoin");
+        assert!(dir.join("plugins/autorejoin.rhai").exists());
+        assert!(app.actions.contains(&AppAction::ReloadAddons));
+        // Installing again is refused (already present).
+        app.actions.clear();
+        run_line(&mut app, "/plugins install autorejoin");
+        assert!(!app.actions.contains(&AppAction::ReloadAddons));
+        // An unknown official plugin is refused.
+        run_line(&mut app, "/plugins install nope");
+        assert!(!dir.join("plugins/nope.rhai").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

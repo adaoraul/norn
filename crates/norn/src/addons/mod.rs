@@ -5,6 +5,7 @@
 //! [`Triggers`] (config `[[trigger]]`) and the [`RhaiHost`] scripting backend.
 //! Both are driven behind this one boundary, so the supervisor treats them alike.
 
+pub mod official;
 mod script;
 mod triggers;
 
