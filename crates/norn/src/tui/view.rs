@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -33,6 +33,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let center = Layout::vertical([
         Constraint::Length(1), // header
+        Constraint::Length(1), // header rule
         Constraint::Min(1),    // messages
         Constraint::Length(1), // activity bar
         Constraint::Length(1), // input
@@ -41,9 +42,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_sidebar(f, cols[0], app);
     draw_header(f, center[0], app);
-    let lines_above = draw_messages(f, center[1], app);
-    draw_activity(f, center[2], app, lines_above);
-    draw_input(f, center[3], app);
+    draw_rule(f, center[1]);
+    let lines_above = draw_messages(f, center[2], app);
+    draw_activity(f, center[3], app, lines_above);
+    draw_input(f, center[4], app);
     if nick_w > 0 {
         draw_nicklist(f, cols[2], app);
     }
@@ -51,17 +53,33 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.mode == Mode::Switcher {
         draw_switcher(f, area, app);
     } else if let Some(completion) = &app.completion {
-        draw_completion(f, center[3], completion);
+        draw_completion(f, center[4], completion);
     }
 }
 
-fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
+/// A horizontal separator rule.
+fn draw_rule(f: &mut Frame, area: Rect) {
+    let rule = "─".repeat(area.width as usize);
     f.render_widget(
-        Block::default().style(Style::default().bg(theme::PANEL)),
+        Paragraph::new(Line::from(Span::styled(
+            rule,
+            Style::default().fg(theme::BORDER),
+        )))
+        .style(Style::default().bg(theme::BG)),
         area,
     );
+}
+
+fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(theme::BORDER))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let inner_w = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
-    let inner_w = area.width.saturating_sub(2) as usize;
 
     for (net_id, net) in app.networks.iter().enumerate() {
         // The network name header is the server/status buffer's entry.
@@ -69,18 +87,20 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
             .buffers
             .get(app.active)
             .is_some_and(|b| b.net == net_id && b.kind == BufferKind::Server);
-        let bar = if server_active { "▎" } else { " " };
-        let name = truncate(&net.name.to_uppercase(), inner_w.saturating_sub(1));
-        let pad = " ".repeat(inner_w.saturating_sub(1 + name.width()));
-        let header_style = if server_active {
-            Style::default().fg(theme::BRIGHT).bg(theme::ACTIVE_BG)
+        let fg = if server_active {
+            theme::BRIGHT
         } else {
-            Style::default().fg(theme::DIM2)
+            theme::DIM2
         };
-        lines.push(Line::from(vec![
-            Span::styled(bar, Style::default().fg(app.accent)),
-            Span::styled(format!("{name}{pad}"), header_style),
-        ]));
+        lines.push(sidebar_row(
+            app.accent,
+            server_active,
+            &net.name.to_uppercase(),
+            "",
+            fg,
+            theme::DIM2,
+            inner_w,
+        ));
 
         for (idx, buffer) in app.buffers.iter().enumerate() {
             if buffer.net != net_id || buffer.kind == BufferKind::Server {
@@ -96,11 +116,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 String::new()
             };
-            let bar = if active { "▎" } else { " " };
-            let name_w = inner_w.saturating_sub(1 + badge.width());
-            let name = truncate(&label, name_w);
-            let pad = " ".repeat(name_w.saturating_sub(name.width()));
-            let base_fg = if active {
+            let fg = if active {
                 theme::BRIGHT
             } else if buffer.kind == BufferKind::Query {
                 theme::nick_color(&buffer.name)
@@ -112,18 +128,40 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 theme::DIM2
             };
-            let mut style = Style::default().fg(base_fg);
-            if active {
-                style = style.bg(theme::ACTIVE_BG);
-            }
-            lines.push(Line::from(vec![
-                Span::styled(bar, Style::default().fg(app.accent)),
-                Span::styled(format!("{name}{pad}"), style),
-                Span::styled(badge, Style::default().fg(badge_fg)),
-            ]));
+            lines.push(sidebar_row(
+                app.accent, active, &label, &badge, fg, badge_fg, inner_w,
+            ));
         }
     }
-    f.render_widget(Paragraph::new(lines), inset(area));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Build one sidebar row: an accent bar, a padded label, and a right badge, with
+/// a full-width active-row background.
+#[allow(clippy::too_many_arguments)]
+fn sidebar_row(
+    accent: ratatui::style::Color,
+    active: bool,
+    label: &str,
+    badge: &str,
+    fg: ratatui::style::Color,
+    badge_fg: ratatui::style::Color,
+    inner_w: usize,
+) -> Line<'static> {
+    let name_w = inner_w.saturating_sub(1 + badge.width());
+    let name = truncate(label, name_w);
+    let pad = " ".repeat(name_w.saturating_sub(name.width()));
+    let bg = if active {
+        theme::ACTIVE_BG
+    } else {
+        theme::PANEL
+    };
+    let bar = if active { "▎" } else { " " };
+    Line::from(vec![
+        Span::styled(bar, Style::default().fg(accent).bg(bg)),
+        Span::styled(format!("{name}{pad}"), Style::default().fg(fg).bg(bg)),
+        Span::styled(badge.to_string(), Style::default().fg(badge_fg).bg(bg)),
+    ])
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -351,10 +389,14 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme::PANEL)),
-        area,
-    );
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme::BORDER))
+        .style(Style::default().bg(theme::PANEL));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let area = inner;
+
     let buffer = app.active_buffer();
     let members = buffer.sorted_members();
     let total = members.len();
@@ -613,10 +655,11 @@ mod tests {
         assert!(content.contains("orhun"));
         assert!(content.contains("hello svan"));
 
-        // The input line sits inside the center column: the sidebar area (cols
-        // 0..24) on the last row is blank, and the prompt is to its right.
+        // The input line sits inside the center column: the sidebar interior
+        // (cols 0..23, before its right border) on the last row is blank, and the
+        // prompt is to its right.
         let last = 23u16;
-        let sidebar: String = (0..24)
+        let sidebar: String = (0..23)
             .map(|x| backend.buffer()[(x, last)].symbol())
             .collect();
         assert!(

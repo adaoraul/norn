@@ -8,6 +8,8 @@ pub const BG: Color = Color::Rgb(0x12, 0x14, 0x1a);
 pub const PANEL: Color = Color::Rgb(0x0e, 0x10, 0x15);
 /// Active row background.
 pub const ACTIVE_BG: Color = Color::Rgb(0x1c, 0x21, 0x30);
+/// Panel separator rules.
+pub const BORDER: Color = Color::Rgb(0x23, 0x28, 0x3a);
 /// Modal / selection border.
 pub const BORDER_BRIGHT: Color = Color::Rgb(0x2e, 0x35, 0x50);
 
