@@ -34,6 +34,11 @@ pub const OFFICIAL: &[OfficialPlugin] = &[
         description: "rejoin a channel after being kicked",
         source: include_str!("official/autorejoin.rhai"),
     },
+    OfficialPlugin {
+        name: "seen",
+        description: "track when nicks were last seen (KV store demo)",
+        source: include_str!("official/seen.rhai"),
+    },
 ];
 
 /// Look up a bundled plugin by name.
@@ -81,5 +86,36 @@ mod tests {
         };
         let out = host.on_event(&ev, &ctx);
         assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["JOIN #norn"]));
+    }
+
+    #[test]
+    fn seen_records_and_answers() {
+        let src = find("seen").unwrap().source;
+        let mut host = RhaiHost::from_sources(&[("seen.rhai", src)], &[]);
+        let ctx = AddonCtx {
+            my_nick: "me",
+            network: "libera",
+        };
+        let msg = |nick: &str, text: &str| AddonEvent {
+            net: 0,
+            kind: AddonEventKind::Message {
+                target: "#norn".into(),
+                nick: nick.into(),
+                text: text.into(),
+                notice: false,
+                highlight: false,
+                from_self: false,
+            },
+        };
+        // Alice says something -> recorded, no reply.
+        assert!(host.on_event(&msg("alice", "hello world"), &ctx).is_empty());
+        // Query "!seen alice" -> reply with her last line.
+        let out = host.on_event(&msg("bob", "!seen alice"), &ctx);
+        assert!(matches!(&out[0], Reaction::Send { lines, .. }
+            if lines[0].contains("last seen saying: hello world")));
+        // Query for an unknown nick.
+        let out = host.on_event(&msg("bob", "!seen nobody"), &ctx);
+        assert!(matches!(&out[0], Reaction::Send { lines, .. }
+            if lines[0].contains("have not seen")));
     }
 }

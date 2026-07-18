@@ -7,11 +7,11 @@
 //! default (no filesystem or network access is registered).
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use rhai::{Dynamic, Engine, ImmutableString, Map, Scope, AST};
+use rhai::{Array, Dynamic, Engine, ImmutableString, Map, Scope, AST};
 
 use crate::session::NetworkId;
 
@@ -28,7 +28,19 @@ struct HostState {
     my_nick: String,
     reply_to: Option<String>,
     reactions: Vec<Reaction>,
+    /// Namespace (plugin stem) of the script currently running, so the KV store
+    /// closures key writes under the right plugin.
+    current_script: String,
+    /// Host-owned persistent key/value store: plugin stem -> key -> value.
+    store: HashMap<String, HashMap<String, String>>,
+    /// Where the store is persisted; `None` for in-memory (tests).
+    store_path: Option<PathBuf>,
 }
+
+/// The `store` handle scripts call methods on (`store.get`/`set`/...). Zero-sized;
+/// the real state lives in the shared `HostState`, keyed by the running plugin.
+#[derive(Clone)]
+struct Store;
 
 /// A compiled script and the hook names it defines.
 struct Script {
@@ -75,10 +87,11 @@ impl RhaiHost {
                 ));
             }
         }
-        RhaiHost::build(entries, disabled)
+        RhaiHost::build(entries, disabled, Some(dir.join("store.toml")))
     }
 
-    /// Build from in-memory `(file, source)` scripts (for tests).
+    /// Build from in-memory `(file, source)` scripts (for tests). The KV store is
+    /// in-memory only (no persistence path).
     #[cfg(test)]
     pub fn from_sources(sources: &[(&str, &str)], disabled: &[&str]) -> RhaiHost {
         let entries = sources
@@ -86,14 +99,24 @@ impl RhaiHost {
             .map(|(f, s)| (f.to_string(), Ok(s.to_string())))
             .collect();
         let disabled: HashSet<String> = disabled.iter().map(|s| s.to_string()).collect();
-        RhaiHost::build(entries, &disabled)
+        RhaiHost::build(entries, &disabled, None)
     }
 
     fn build(
         entries: Vec<(String, Result<String, String>)>,
         disabled: &HashSet<String>,
+        store_path: Option<PathBuf>,
     ) -> RhaiHost {
-        let state = Rc::new(RefCell::new(HostState::default()));
+        let mut host_state = HostState::default();
+        if let Some(path) = &store_path {
+            if let Ok(txt) = std::fs::read_to_string(path) {
+                if let Ok(map) = toml::from_str(&txt) {
+                    host_state.store = map;
+                }
+            }
+        }
+        host_state.store_path = store_path;
+        let state = Rc::new(RefCell::new(host_state));
         let engine = build_engine(state.clone());
         let mut scripts = Vec::new();
         let mut plugins = Vec::new();
@@ -216,7 +239,10 @@ impl AddonHost for RhaiHost {
             if !script.hooks.contains(hook) {
                 continue;
             }
+            // Namespace the KV store to the plugin about to run.
+            self.state.borrow_mut().current_script = stem(&script.label);
             let mut scope = Scope::new();
+            scope.push_constant("store", Store);
             if let Err(err) =
                 self.engine
                     .call_fn::<()>(&mut scope, &script.ast, hook, (map.clone(),))
@@ -388,7 +414,76 @@ fn build_engine(state: Rc<RefCell<HostState>>) -> Engine {
     engine.register_fn("nick", move || -> ImmutableString {
         st.borrow().my_nick.clone().into()
     });
+
+    // KV store: `store.get/set/del/has/keys`, namespaced per plugin and persisted
+    // by the host. Scripts never see the path or touch disk themselves.
+    engine.register_type_with_name::<Store>("Store");
+    // store.get(key) -> value ("" if unset).
+    let st = state.clone();
+    engine.register_fn(
+        "get",
+        move |_s: &mut Store, key: ImmutableString| -> ImmutableString {
+            let s = st.borrow();
+            s.store
+                .get(&s.current_script)
+                .and_then(|m| m.get(key.as_str()))
+                .cloned()
+                .unwrap_or_default()
+                .into()
+        },
+    );
+    // store.set(key, value): store a value and persist.
+    let st = state.clone();
+    engine.register_fn(
+        "set",
+        move |_s: &mut Store, key: ImmutableString, val: ImmutableString| {
+            let mut s = st.borrow_mut();
+            let ns = s.current_script.clone();
+            s.store
+                .entry(ns)
+                .or_default()
+                .insert(key.to_string(), val.to_string());
+            persist_store(&s);
+        },
+    );
+    // store.del(key): remove a key and persist.
+    let st = state.clone();
+    engine.register_fn("del", move |_s: &mut Store, key: ImmutableString| {
+        let mut s = st.borrow_mut();
+        let ns = s.current_script.clone();
+        if let Some(m) = s.store.get_mut(&ns) {
+            m.remove(key.as_str());
+        }
+        persist_store(&s);
+    });
+    // store.has(key) -> bool.
+    let st = state.clone();
+    engine.register_fn("has", move |_s: &mut Store, key: ImmutableString| -> bool {
+        let s = st.borrow();
+        s.store
+            .get(&s.current_script)
+            .is_some_and(|m| m.contains_key(key.as_str()))
+    });
+    // store.keys() -> array of this plugin's keys.
+    let st = state.clone();
+    engine.register_fn("keys", move |_s: &mut Store| -> Array {
+        let s = st.borrow();
+        s.store
+            .get(&s.current_script)
+            .map(|m| m.keys().map(|k| Dynamic::from(k.clone())).collect())
+            .unwrap_or_default()
+    });
     engine
+}
+
+/// Write the KV store to its file, if a path is set. Best effort: a write error
+/// is dropped (the in-memory map stays authoritative for the session).
+fn persist_store(s: &HostState) {
+    if let Some(path) = &s.store_path {
+        if let Ok(txt) = toml::to_string_pretty(&s.store) {
+            let _ = std::fs::write(path, txt);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +577,69 @@ mod tests {
             },
         };
         assert!(h.on_event(&kicked_other, &ctx("me")).is_empty());
+    }
+
+    #[test]
+    fn store_persists_across_events_and_namespaces_by_plugin() {
+        // `a` accumulates in its own namespace; `b` reads the SAME key but sees
+        // its own (empty) namespace, proving isolation. Both define on_message,
+        // so both run per event; scripts are ordered by name (a before b).
+        let mut h = RhaiHost::from_sources(
+            &[
+                (
+                    "a.rhai",
+                    r#"fn on_message(m) { let n = store.get("k"); store.set("k", n + "x"); reply(store.get("k")); }"#,
+                ),
+                (
+                    "b.rhai",
+                    r#"fn on_message(m) { reply("b:" + store.get("k")); }"#,
+                ),
+            ],
+            &[],
+        );
+        // First event: a -> "x"; b sees its own empty namespace -> "b:".
+        let out = h.on_event(&message("#c", "bob", "hi"), &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["PRIVMSG #c :x"]));
+        assert!(matches!(&out[1], Reaction::Send { lines, .. } if lines == &["PRIVMSG #c :b:"]));
+        // Second event: a's value persisted -> "xx"; b still isolated -> "b:".
+        let out = h.on_event(&message("#c", "bob", "hi"), &ctx("me"));
+        assert!(matches!(&out[0], Reaction::Send { lines, .. } if lines == &["PRIVMSG #c :xx"]));
+        assert!(matches!(&out[1], Reaction::Send { lines, .. } if lines == &["PRIVMSG #c :b:"]));
+    }
+
+    #[test]
+    fn store_has_del_and_missing_key() {
+        let mut h = RhaiHost::from_sources(
+            &[(
+                "t.rhai",
+                r#"fn on_message(m) {
+                       reply(store.has("k").to_string());
+                       store.set("k", "v");
+                       reply(store.has("k").to_string());
+                       store.del("k");
+                       reply(store.has("k").to_string());
+                       reply("[" + store.get("k") + "]");
+                   }"#,
+            )],
+            &[],
+        );
+        let out = h.on_event(&message("#c", "bob", "hi"), &ctx("me"));
+        let sent: Vec<&str> = out
+            .iter()
+            .filter_map(|r| match r {
+                Reaction::Send { lines, .. } => lines.first().map(|s| s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                "PRIVMSG #c :false",
+                "PRIVMSG #c :true",
+                "PRIVMSG #c :false",
+                "PRIVMSG #c :[]",
+            ]
+        );
     }
 
     #[test]
