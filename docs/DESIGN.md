@@ -40,7 +40,7 @@ Three crates, each depending only on the one below.
 - `crates/norn`: the client.
   - `session.rs` runs one independent task per network; `transport.rs` opens TCP or rustls.
   - `tui/` (or `plain.rs`) consumes tagged `UiEvent`s from one shared channel and sends `NetCommand`s down a per-network channel. Tasks share no mutable state.
-  - `config.rs`, `commands.rs`, `settings.rs`: configuration and commands.
+  - `config.rs`, `commands.rs`, `settings.rs`, `keys.rs`: configuration and the three registries (commands, settings, key bindings). The `/help` panel, `/keys`, Tab completion, the console welcome line and the plain-mode help are all generated from them; tests check that docs/USER_GUIDE.md mentions every key and setting, so the guide cannot drift.
   - `addons/`: declarative triggers and Rhai plugins behind one `AddonHost` boundary.
 
 ## Data
