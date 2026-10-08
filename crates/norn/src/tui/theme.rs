@@ -80,7 +80,6 @@ pub fn nick_color(nick: &str) -> Color {
 }
 
 /// WCAG relative luminance of an RGB color (other color kinds count as black).
-#[cfg(test)]
 fn luminance(c: Color) -> f64 {
     let Color::Rgb(r, g, b) = c else {
         return 0.0;
@@ -97,7 +96,6 @@ fn luminance(c: Color) -> f64 {
 }
 
 /// WCAG contrast ratio between two colors, from 1.0 (identical) to 21.0.
-#[cfg(test)]
 pub fn contrast(a: Color, b: Color) -> f64 {
     let (la, lb) = (luminance(a), luminance(b));
     let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };

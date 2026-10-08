@@ -27,9 +27,11 @@ engine and the TUI are built on top of it.
   `NORN_PASSWORD` environment variable.
 - **Multi-network** - connect to several networks at once, each with its own
   buffers; `auto_connect` / `auto_join` per network.
-- **TUI** (built on [ratatui](https://ratatui.rs)) - buffer switcher, nicklist,
-  nick + command completion, scrollback with on-demand `CHATHISTORY` paging,
-  themes, and modal manager screens for settings, networks, and plugins.
+- **TUI** (built on [ratatui](https://ratatui.rs)) - fuzzy buffer switcher,
+  nicklist, nick + command completion, scrollback that holds your place with
+  search and on-demand `CHATHISTORY` paging, mIRC formatting, accent themes, and
+  modal manager screens for settings, networks, and plugins. It adapts to the
+  terminal: 24-bit, 256 or 16 colours, `NO_COLOR`, and any size down to 60x10.
 - **Automation** - declarative `[[trigger]]` rules, plus an embedded, sandboxed
   **Rhai** plugin system with event hooks, a persistent KV store, presence
   accessors, and desktop notifications.

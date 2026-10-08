@@ -65,6 +65,27 @@ pub const SETTINGS: &[SettingDoc] = &[
         default: "%H:%M",
     },
     SettingDoc {
+        key: "color_mode",
+        category: "look & feel",
+        kind: SettingKind::Enum(crate::tui::color::COLOR_MODE_NAMES),
+        desc: "how many colours to use: auto follows NO_COLOR / COLORTERM / TERM",
+        default: "auto",
+    },
+    SettingDoc {
+        key: "paint_background",
+        category: "look & feel",
+        kind: SettingKind::Bool,
+        desc: "paint the window background (off lets your terminal's show through)",
+        default: "on",
+    },
+    SettingDoc {
+        key: "mirc_formatting",
+        category: "look & feel",
+        kind: SettingKind::Enum(&["render", "strip"]),
+        desc: "show mIRC bold/colour/underline in messages, or strip the codes",
+        default: "render",
+    },
+    SettingDoc {
         key: "nick_colors",
         category: "look & feel",
         kind: SettingKind::Bool,

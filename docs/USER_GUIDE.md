@@ -173,6 +173,9 @@ applies live and auto-saves.
 | `timestamp_format` | str             | `%H:%M` | How timestamps are written, as a strftime pattern (`%H:%M:%S` adds seconds, `%a %H:%M` the weekday). An invalid pattern is refused. |
 | `sidebar_width`    | int (12-48)     | `24`    | Width of the buffer sidebar in columns. A narrow terminal shrinks it so the chat keeps at least 20 columns. |
 | `nicklist_width`   | int (10-32)     | `18`    | Width of the channel nicklist in columns. The nicklist is hidden on terminals narrower than 80 columns. |
+| `color_mode`       | enum            | `auto`  | How many colours to use: `auto`, `truecolor`, `256`, `16` or `none`. `auto` follows `NO_COLOR`, then `COLORTERM`, then `TERM`. |
+| `paint_background` | bool            | `on`    | Paint the window background. Off lets your terminal's own background (or transparency) show through. |
+| `mirc_formatting`  | enum            | `render`| Show mIRC bold, italic, underline and colours in messages (`render`), or remove the codes (`strip`). |
 | `nick_colors`      | bool            | `on`    | Color nicks by a per-nick hue (off = one muted color).              |
 | `theme`            | enum            | `teal`  | Accent color: `teal`, `amber`, `green`, `blue`, `purple`, `pink`.   |
 | `nicklist`         | bool            | `on`    | Show the channel nicklist by default.                               |
@@ -323,6 +326,33 @@ A long line you are typing scrolls sideways to keep the cursor visible, with `�
 marking what is off to the left. Names too long for their column (nicks, channels,
 topics) end in `…`. Emoji and accented letters are measured and wrapped as whole
 characters, so a wrapped line never splits one.
+
+### Colours, formatting and accessibility
+
+norn is designed in 24-bit colour and adapts to what you have. With
+`color_mode = auto` it follows the [`NO_COLOR`](https://no-color.org) convention
+(any non-empty value turns colour off), then `COLORTERM` (`truecolor`/`24bit`),
+then `TERM` (`*256color` gets the 256-colour palette, anything else the 16 ANSI
+colours). Set `color_mode` yourself to override that. Without full colour the
+meaning that colour carried is kept another way: the selected row and highlights
+become reverse video, quiet text (timestamps, hints) is dimmed, and warnings and
+errors are bold. The markers (`!!` errors, `▌` mentions, `▶` search hits, `!3`
+unread mentions) are characters, so they never depended on colour. Text colours
+meet a 4.5:1 contrast ratio against the background by default.
+
+`paint_background = off` hands the background back to the terminal.
+
+Messages may carry mIRC formatting. By default norn renders bold, italic,
+underline, strikethrough, reverse and the 99 mIRC colours (plus hex colours), and
+it keeps the text readable: a colour that would be hard to read on the background
+is not applied, and a colour against a background the message chose is checked
+against that background. Set `mirc_formatting = strip` to drop the codes instead.
+Whichever you choose, mention detection, search, plugins and triggers always see
+the plain text, and control characters (such as terminal escape sequences) in a
+message are never passed to your terminal.
+
+A notice is shown as `-nick-` in the left column, so it is told apart from an
+ordinary message by its shape and not only by being dimmer.
 
 ### Pasting
 

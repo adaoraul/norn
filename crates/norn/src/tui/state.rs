@@ -95,8 +95,10 @@ impl Line {
     /// the text for events.
     pub fn searchable(&self) -> String {
         match self {
-            Line::Chat { nick, text, .. } => format!("{nick} {text}"),
-            Line::Event { text, .. } => text.clone(),
+            Line::Chat { nick, text, .. } => {
+                format!("{nick} {}", crate::format::strip(text))
+            }
+            Line::Event { text, .. } => crate::format::strip(text),
         }
     }
 }
@@ -756,6 +758,10 @@ pub struct App {
     pub paste: Vec<String>,
     /// The search in progress (`Mode::Search`).
     pub search: SearchState,
+    /// What the process environment says about colour (`NO_COLOR`, `COLORTERM`,
+    /// `TERM`); `auto` colour mode follows it. A capable terminal until the real
+    /// environment is read at startup, so tests do not depend on the machine.
+    pub color_env: crate::tui::color::ColorEnv,
     /// The first sidebar row shown, when the buffer list is taller than the
     /// screen. Written by the draw (to keep the active buffer in view) and by the
     /// mouse wheel, hence a `Cell`.
@@ -835,6 +841,7 @@ impl App {
             armed: None,
             paste: Vec::new(),
             search: SearchState::default(),
+            color_env: crate::tui::color::ColorEnv::default(),
             sidebar_top: std::cell::Cell::new(0),
             sidebar_seen: std::cell::Cell::new(usize::MAX),
             visible_lines: std::cell::Cell::new(DEFAULT_VISIBLE_LINES),
@@ -885,6 +892,12 @@ impl App {
             Some((action, at)) if at.elapsed() < CONFIRM_WINDOW => Some(action.prompt()),
             _ => None,
         }
+    }
+
+    /// The colour mode in effect: the `color_mode` setting, with `auto` resolved
+    /// from the environment.
+    pub fn color_mode(&self) -> crate::tui::color::ColorMode {
+        crate::tui::color::resolve(&self.client.color_mode, &self.color_env)
     }
 
     /// Whether commands can reach `net` right now. `Err` carries what to tell the
@@ -1038,7 +1051,9 @@ impl App {
                     Some(inner) => (inner.to_string(), true),
                     None => (msg.text.clone(), false),
                 };
-                let mention = mentions(&text, &my_nick);
+                // The line keeps its formatting codes to be rendered, but a
+                // mention is judged on what you would read.
+                let mention = mentions(&crate::format::strip(&text), &my_nick);
                 let spoke = sender.clone();
                 let line = Line::Chat {
                     // Fall back to the local receipt time when the message has no
@@ -1828,6 +1843,9 @@ impl App {
         match key {
             "timestamps" => on_off(self.client.timestamps),
             "timestamp_format" => self.client.timestamp_format.clone(),
+            "color_mode" => self.client.color_mode.clone(),
+            "paint_background" => on_off(self.client.paint_background),
+            "mirc_formatting" => self.client.mirc_formatting.clone(),
             "nick_colors" => on_off(self.client.nick_colors),
             "theme" => self.client.theme.clone(),
             "nicklist" => on_off(self.client.nicklist),
@@ -1855,6 +1873,13 @@ impl App {
             "nick_colors" => self.client.nick_colors = want_bool()?,
             "nicklist" => self.client.nicklist = want_bool()?,
             "beep_on_highlight" => self.client.beep_on_highlight = want_bool()?,
+            "color_mode" => {
+                self.client.color_mode = parse_choice(doc.kind, raw)?;
+            }
+            "mirc_formatting" => {
+                self.client.mirc_formatting = parse_choice(doc.kind, raw)?;
+            }
+            "paint_background" => self.client.paint_background = want_bool()?,
             "timestamp_format" => {
                 if !valid_timestamp_format(raw) {
                     return Err("not a valid strftime pattern (try %H:%M or %H:%M:%S)".to_string());
@@ -2506,6 +2531,19 @@ fn nick_summary(nicks: &[String]) -> String {
         out.push_str(&format!(", +{} more", nicks.len() - SHOWN));
     }
     out
+}
+
+/// Match `raw` (ignoring case) against an enum setting's listed values.
+fn parse_choice(kind: crate::settings::SettingKind, raw: &str) -> Result<String, String> {
+    let crate::settings::SettingKind::Enum(values) = kind else {
+        unreachable!("only enum settings are parsed this way")
+    };
+    let want = raw.to_ascii_lowercase();
+    if values.contains(&want.as_str()) {
+        Ok(want)
+    } else {
+        Err(format!("expected one of: {}", values.join(", ")))
+    }
 }
 
 /// Parse `raw` as a whole number within an integer setting's bounds.
@@ -3710,6 +3748,51 @@ mod tests {
         a.switch_to(0);
         assert_eq!(a.mode, Mode::Normal);
         assert!(a.search.hits.is_empty());
+    }
+
+    #[test]
+    fn a_mention_is_judged_on_the_text_you_would_read() {
+        let mut a = app();
+        // The nick is split by bold codes: still a mention of "me".
+        a.apply(engine(
+            0,
+            Event::MessageReceived(chat("#rust", "alice", "\u{02}me\u{02}: hi")),
+        ));
+        let idx = a.buffer_index(0, "#rust").unwrap();
+        assert!(a.buffers[idx].mentioned);
+        // The codes are kept on the line for rendering ...
+        match &a.buffers[idx].lines[0] {
+            Line::Chat { text, mention, .. } => {
+                assert!(text.contains('\u{02}'));
+                assert!(*mention);
+            }
+            other => panic!("expected chat, got {other:?}"),
+        }
+        // ... but search sees only the plain text.
+        a.switch_to(idx);
+        a.open_search("me: hi");
+        assert_eq!(a.search.hits.len(), 1);
+    }
+
+    #[test]
+    fn colour_and_formatting_settings_validate_their_choices() {
+        let mut a = app();
+        assert_eq!(a.setting_value("color_mode"), "auto");
+        assert_eq!(a.set_setting("color_mode", "256").as_deref(), Ok("256"));
+        assert_eq!(a.set_setting("color_mode", "NONE").as_deref(), Ok("none"));
+        let err = a.set_setting("color_mode", "rainbow").unwrap_err();
+        assert!(err.contains("auto, truecolor, 256, 16, none"), "{err}");
+        assert_eq!(a.client.color_mode, "none", "unchanged by the bad value");
+        assert_eq!(
+            a.set_setting("mirc_formatting", "strip").as_deref(),
+            Ok("strip")
+        );
+        assert!(a.set_setting("mirc_formatting", "fancy").is_err());
+        assert_eq!(
+            a.set_setting("paint_background", "off").as_deref(),
+            Ok("off")
+        );
+        assert!(!a.client.paint_background);
     }
 
     #[test]

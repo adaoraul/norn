@@ -179,9 +179,12 @@ pub fn mode_line(target: &str, by: Option<&str>, modes: &str, args: &[String]) -
 
 fn chat_line(msg: &ChatMessage) -> String {
     let who = msg.sender.as_ref().map(source_nick).unwrap_or("?");
+    // Line mode has no styling, and raw control characters would reach the
+    // terminal it prints to: show plain text.
+    let text = crate::format::strip(&msg.text);
     match msg.kind {
-        MessageKind::Privmsg => format!("[{}] <{}> {}", msg.target, who, msg.text),
-        MessageKind::Notice => format!("[{}] -{}- {}", msg.target, who, msg.text),
+        MessageKind::Privmsg => format!("[{}] <{}> {}", msg.target, who, text),
+        MessageKind::Notice => format!("[{}] -{}- {}", msg.target, who, text),
     }
 }
 
@@ -189,5 +192,28 @@ fn source_nick(source: &Source) -> &str {
     match source {
         Source::User { nick, .. } => nick,
         Source::Server(name) => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_mode_prints_plain_text_with_no_control_characters() {
+        let msg = ChatMessage {
+            time: None,
+            msgid: None,
+            account: None,
+            sender: Some(Source::User {
+                nick: "bob".into(),
+                user: None,
+                host: None,
+            }),
+            target: "#rust".into(),
+            text: "\u{02}hi\u{02} \u{03}4there\u{1b}[31m!".into(),
+            kind: MessageKind::Privmsg,
+        };
+        assert_eq!(chat_line(&msg), "[#rust] <bob> hi there[31m!");
     }
 }

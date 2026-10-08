@@ -4,6 +4,7 @@
 //! panic) and the async loop: it selects between UI events from the network
 //! tasks and key events from the terminal, redrawing when state changes.
 
+pub mod color;
 pub mod editor;
 pub mod input;
 pub mod state;
@@ -120,6 +121,8 @@ pub async fn run(
     let mut cmd_txs = cmd_txs;
     let mut guard = TerminalGuard::new(client.mouse)?;
     let mut app = App::new(networks, client, definitions, aliases, config_path);
+    // Let `color_mode = auto` see the real terminal.
+    app.color_env = color::ColorEnv::from_process();
     // Plugin scripts live next to the config file (`<config-dir>/plugins`).
     let plugins_dir: Option<PathBuf> = app
         .config_path

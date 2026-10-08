@@ -111,10 +111,10 @@ impl AddonEvent {
                     .unwrap_or("")
                     .to_string();
                 // Unwrap a CTCP ACTION to its inner text (the `/me` flag itself is
-                // not yet matched on).
-                let text = ctcp_action(&msg.text)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| msg.text.clone());
+                // not yet matched on). Plugins and triggers get plain text:
+                // no mIRC codes (which would break `highlight` and matching),
+                // and no control characters to pass on to a command they run.
+                let text = crate::format::strip(ctcp_action(&msg.text).unwrap_or(&msg.text));
                 let from_self = nick.eq_ignore_ascii_case(my_nick);
                 AddonEventKind::Message {
                     target: msg.target.clone(),
@@ -137,18 +137,18 @@ impl AddonEvent {
                 LeaveReason::Part(r) => AddonEventKind::Part {
                     channel: target.clone(),
                     nick: who.nick.clone(),
-                    reason: r.clone(),
+                    reason: crate::format::strip(r),
                 },
                 LeaveReason::Quit(r) => AddonEventKind::Quit {
                     nick: who.nick.clone(),
-                    reason: r.clone(),
+                    reason: crate::format::strip(r),
                 },
                 LeaveReason::Kicked { by, reason } => AddonEventKind::Kick {
                     channel: target.clone(),
                     is_me: who.nick.eq_ignore_ascii_case(my_nick),
                     nick: who.nick.clone(),
                     by: by.clone(),
-                    reason: reason.clone(),
+                    reason: crate::format::strip(reason),
                 },
             },
             Event::NickChanged { old, new } => AddonEventKind::NickChange {
@@ -352,6 +352,48 @@ mod tests {
                 }],
                 Reaction::Desktop { text } => vec![Reaction::Desktop { text: text.clone() }],
             }
+        }
+    }
+
+    #[test]
+    fn plugins_and_triggers_see_plain_text_without_codes_or_control_characters() {
+        use irc_engine::{ChatMessage, Event, LeaveReason, MessageKind, User};
+        let msg = ChatMessage {
+            time: None,
+            msgid: None,
+            account: None,
+            sender: Some(irc_proto::Source::User {
+                nick: "bob".into(),
+                user: None,
+                host: None,
+            }),
+            target: "#rust".into(),
+            // The nick is split by bold codes; an escape sequence rides along.
+            text: "\u{02}me\u{02}: \u{03}4hi\u{1b}[2J".into(),
+            kind: MessageKind::Privmsg,
+        };
+        let a = AddonEvent::from_engine(&Event::MessageReceived(msg), 0, "me").unwrap();
+        match a.kind {
+            AddonEventKind::Message {
+                text, highlight, ..
+            } => {
+                assert_eq!(text, "me: hi[2J");
+                assert!(highlight, "the mention is found through the codes");
+            }
+            other => panic!(
+                "expected a message, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        // Reasons are plain too.
+        let quit = Event::MemberLeft {
+            target: String::new(),
+            who: User::nick("bob"),
+            reason: LeaveReason::Quit("\u{02}gone\u{02}".into()),
+        };
+        match AddonEvent::from_engine(&quit, 0, "me").unwrap().kind {
+            AddonEventKind::Quit { reason, .. } => assert_eq!(reason, "gone"),
+            _ => panic!("expected a quit"),
         }
     }
 

@@ -8,6 +8,7 @@
 mod addons;
 mod commands;
 mod config;
+mod format;
 mod input;
 mod keys;
 mod plain;

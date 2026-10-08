@@ -99,6 +99,12 @@ fn default_port() -> u16 {
 fn default_theme() -> String {
     "teal".to_string()
 }
+fn default_color_mode() -> String {
+    "auto".to_string()
+}
+fn default_mirc_formatting() -> String {
+    "render".to_string()
+}
 fn default_sidebar_width() -> usize {
     24
 }
@@ -181,6 +187,18 @@ pub struct ClientConfig {
     /// Whether to color nicks by a per-nick hue (off = a single muted color).
     #[serde(default = "default_true")]
     pub nick_colors: bool,
+    /// How many colours to draw with: `auto` (follow `NO_COLOR`, `COLORTERM`,
+    /// `TERM`), `truecolor`, `256`, `16` or `none`.
+    #[serde(default = "default_color_mode")]
+    pub color_mode: String,
+    /// Whether to paint the window background. Off lets the terminal's own
+    /// background (and any transparency) show through.
+    #[serde(default = "default_true")]
+    pub paint_background: bool,
+    /// What to do with mIRC formatting codes in messages: `render` them or
+    /// `strip` them.
+    #[serde(default = "default_mirc_formatting")]
+    pub mirc_formatting: String,
     /// Accent theme name (see `tui::theme::accent_for`).
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -219,6 +237,9 @@ impl Default for ClientConfig {
         ClientConfig {
             timestamps: true,
             timestamp_format: default_timestamp_format(),
+            color_mode: default_color_mode(),
+            paint_background: true,
+            mirc_formatting: default_mirc_formatting(),
             nick_colors: true,
             theme: default_theme(),
             nicklist: true,

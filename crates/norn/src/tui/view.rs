@@ -15,6 +15,7 @@ use super::state::{
 use super::text::{self, truncate};
 use super::theme;
 use crate::addons::PluginStatus;
+use crate::format;
 use crate::session::ConnState;
 
 const NICK_COL: usize = 9;
@@ -132,8 +133,20 @@ fn draw_too_small(f: &mut Frame, area: Rect) {
     );
 }
 
-/// Draw the whole UI.
+/// Draw the whole UI, then reduce it to the configured colour mode: the screen is
+/// designed in 24-bit colour and [`color::apply`] adapts the finished frame, so
+/// every style (including mIRC colours) follows `color_mode` and
+/// `paint_background` without each one having to know.
 pub fn draw(f: &mut Frame, app: &App) {
+    draw_screen(f, app);
+    super::color::apply(
+        f.buffer_mut(),
+        app.color_mode(),
+        app.client.paint_background,
+    );
+}
+
+fn draw_screen(f: &mut Frame, app: &App) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
 
@@ -228,7 +241,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
                     .buffers
                     .get(app.active)
                     .is_some_and(|b| b.net == net_id && b.kind == BufferKind::Server);
-                let (glyph, glyph_fg) = state_glyph(&app.networks[net_id].state);
+                let (glyph, glyph_fg) = state_glyph(&app.networks[net_id].state, app.accent);
                 let badge = match app.lag.get(&net_id) {
                     Some(lag) if lag.as_millis() >= 1000 => format!(" {}", format_lag(*lag)),
                     _ => String::new(),
@@ -278,7 +291,8 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
                 let fg = if active {
                     theme::BRIGHT
                 } else if buffer.kind == BufferKind::Query {
-                    theme::nick_color(&buffer.name)
+                    // Respects `nick_colors`, like the nick everywhere else.
+                    nick_color(app, &buffer.name)
                 } else if buffer.joined {
                     theme::TEXT
                 } else {
@@ -490,10 +504,13 @@ fn sidebar_row(accent: ratatui::style::Color, cell: &SidebarCell, inner_w: usize
 
 /// The glyph and colour for a connection state. The shape differs per state, so
 /// the meaning does not depend on colour alone.
-fn state_glyph(state: &ConnState) -> (&'static str, ratatui::style::Color) {
+fn state_glyph(
+    state: &ConnState,
+    accent: ratatui::style::Color,
+) -> (&'static str, ratatui::style::Color) {
     match state {
         ConnState::Registered { .. } => ("●", theme::GOLD),
-        ConnState::Connecting | ConnState::Reconnecting { .. } => ("◐", theme::ACCENT),
+        ConnState::Connecting | ConnState::Reconnecting { .. } => ("◐", accent),
         ConnState::Disconnected => ("○", theme::DIM2),
         ConnState::Closed => ("✕", theme::RED),
     }
@@ -538,7 +555,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let title = truncate(&title, head_w.saturating_sub(right.width() + 1));
     // Topic gets whatever room is left after the title and the right label.
     let sub_room = head_w.saturating_sub(title.width() + 2 + right.width() + 1);
-    let sub = truncate(&buffer.topic.clone().unwrap_or_default(), sub_room);
+    // A topic often carries mIRC codes; the header shows it as plain text.
+    let topic = format::strip(buffer.topic.as_deref().unwrap_or_default());
+    let sub = truncate(&topic, sub_room);
     let used = title.width() + 2 + sub.width() + right.width();
     let pad = " ".repeat(head_w.saturating_sub(used));
     f.render_widget(
@@ -747,7 +766,14 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize, hit: bool) -> Vec<Line
             } else {
                 (
                     *time,
-                    nick.clone(),
+                    // A notice is shown as `-nick-`, the way IRC clients always
+                    // have, so it is told apart from a message by its shape and
+                    // not only by being dimmer.
+                    if *notice {
+                        format!("-{nick}-")
+                    } else {
+                        nick.clone()
+                    },
                     color,
                     if *notice {
                         Style::default().fg(theme::DIM)
@@ -761,9 +787,21 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize, hit: bool) -> Vec<Line
         }
     };
 
-    let chunks = wrap_text(&text, text_w);
+    // mIRC codes are either turned into styles or removed; either way wrapping
+    // works on the text you see, and each wrapped row is rebuilt from styled runs.
+    let runs = if app.client.mirc_formatting == "strip" {
+        vec![format::Run {
+            text: format::strip(&text),
+            format: format::Format::default(),
+        }]
+    } else {
+        format::parse(&text)
+    };
+    let plain: String = runs.iter().map(|r| r.text.as_str()).collect();
+    let chunks = wrap_text(&plain, text_w);
+    let segments = chunk_segments(&plain, &runs, &chunks);
     let mut out = Vec::with_capacity(chunks.len());
-    for (i, chunk) in chunks.iter().enumerate() {
+    for (i, row) in segments.iter().enumerate() {
         let mut spans: Vec<Span> = Vec::new();
         if i == 0 {
             if app.timestamps {
@@ -798,10 +836,112 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize, hit: bool) -> Vec<Line
         } else {
             spans.push(Span::raw(" ".repeat(pw)));
         }
-        spans.extend(styled_chunk(chunk, base, mention_nick.as_deref(), search));
+        for (segment, fmt) in row {
+            spans.extend(styled_chunk(
+                segment,
+                format_style(base, fmt),
+                mention_nick.as_deref(),
+                search,
+            ));
+        }
         out.push(Line::from(spans));
     }
     out
+}
+
+/// Split the wrapped `chunks` of `plain` back into pieces that each have one
+/// format, using the `runs` it was built from. Wrapping only ever drops the
+/// space at a line break, so the chunks can be matched back to `plain` in order.
+fn chunk_segments(
+    plain: &str,
+    runs: &[format::Run],
+    chunks: &[String],
+) -> Vec<Vec<(String, format::Format)>> {
+    // The format in effect at each byte of `plain`: run boundaries, cumulative.
+    let mut ends: Vec<(usize, format::Format)> = Vec::with_capacity(runs.len());
+    let mut at = 0;
+    for run in runs {
+        at += run.text.len();
+        ends.push((at, run.format));
+    }
+    let format_at = |pos: usize| {
+        ends.iter()
+            .find(|(end, _)| pos < *end)
+            .map_or(format::Format::default(), |(_, f)| *f)
+    };
+
+    let mut pos = 0;
+    let mut rows = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let mut row: Vec<(String, format::Format)> = Vec::new();
+        for g in chunk.graphemes(true) {
+            // A space dropped at the line break is in `plain` but not the chunk.
+            while !plain[pos..].starts_with(g) && plain[pos..].starts_with(' ') {
+                pos += 1;
+            }
+            let fmt = if plain[pos..].starts_with(g) {
+                let f = format_at(pos);
+                pos += g.len();
+                f
+            } else {
+                format::Format::default() // cannot happen; draw it plain
+            };
+            match row.last_mut() {
+                Some((text, last)) if *last == fmt => text.push_str(g),
+                _ => row.push((g.to_string(), fmt)),
+            }
+        }
+        if row.is_empty() {
+            row.push((String::new(), format::Format::default()));
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+/// `base` with a message's mIRC formatting applied. A colour that would be hard
+/// to read where it lands (black text on our dark background, say) is not used:
+/// the text keeps its normal colour, or is set to black/white against a
+/// background the message chose, so formatting can never hide text.
+fn format_style(base: Style, f: &format::Format) -> Style {
+    use ratatui::style::Color;
+    let rgb = |(r, g, b): format::Rgb| Color::Rgb(r, g, b);
+    let mut style = base;
+    for (on, modifier) in [
+        (f.bold, Modifier::BOLD),
+        (f.italic, Modifier::ITALIC),
+        (f.underline, Modifier::UNDERLINED),
+        (f.strike, Modifier::CROSSED_OUT),
+        (f.reverse, Modifier::REVERSED),
+    ] {
+        if on {
+            style = style.add_modifier(modifier);
+        }
+    }
+    const MIN_CONTRAST: f64 = 3.0;
+    match f.bg.map(rgb) {
+        Some(bg) => {
+            style = style.bg(bg);
+            let fg = f.fg.map(rgb).or(base.fg).unwrap_or(theme::TEXT);
+            style = style.fg(if theme::contrast(fg, bg) >= MIN_CONTRAST {
+                fg
+            } else if theme::contrast(Color::Rgb(255, 255, 255), bg)
+                >= theme::contrast(Color::Rgb(0, 0, 0), bg)
+            {
+                Color::Rgb(255, 255, 255)
+            } else {
+                Color::Rgb(0, 0, 0)
+            });
+        }
+        None => {
+            if let Some(fg) = f.fg.map(rgb) {
+                if theme::contrast(fg, theme::BG) >= MIN_CONTRAST {
+                    style = style.fg(fg);
+                }
+            }
+        }
+    }
+    style
 }
 
 /// Style a text chunk. A search query highlights every occurrence; otherwise a
@@ -965,7 +1105,7 @@ fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
     for m in members.into_iter().take(show) {
         let (sym, color) = match m.highest() {
             Some(p) if p.symbol() == '@' => ('@', theme::GOLD),
-            Some(p) if p.symbol() == '+' => ('+', theme::ACCENT),
+            Some(p) if p.symbol() == '+' => ('+', app.accent),
             Some(p) => (p.symbol(), theme::TEXT),
             None => (' ', nick_color(app, &m.nick)),
         };
@@ -1620,7 +1760,7 @@ fn draw_networks_list(f: &mut Frame, area: Rect, app: &App, focused: bool) {
     for (i, cfg) in app.definitions.iter().enumerate() {
         let selected = i == app.networks_ui.sel;
         let (marker, marker_fg) = match app.network_live_state(&cfg.name) {
-            Some(state) => state_glyph(&state),
+            Some(state) => state_glyph(&state, app.accent),
             None => ("·", theme::DIM2),
         };
         let bg = if selected && focused {
@@ -2181,7 +2321,7 @@ fn draw_help_detail(
     let Some(doc) = doc else {
         return;
     };
-    let lines = help_detail_lines(doc, width);
+    let lines = help_detail_lines(doc, width, app.accent);
     let max_scroll = lines.len().saturating_sub(avail);
     let scroll = app.help.detail_scroll.min(max_scroll);
     let shown: Vec<Line> = lines.into_iter().skip(scroll).take(avail).collect();
@@ -2196,7 +2336,7 @@ fn draw_help_detail(
             height: 1,
         };
         f.render_widget(
-            Paragraph::new(Span::styled("▾", Style::default().fg(theme::ACCENT))),
+            Paragraph::new(Span::styled("▾", Style::default().fg(app.accent))),
             tag,
         );
     }
@@ -2204,7 +2344,11 @@ fn draw_help_detail(
 
 /// Build the wrapped detail lines for one command: usage, description,
 /// subcommands (with their params), options, and examples.
-fn help_detail_lines(doc: &crate::commands::CommandDoc, width: usize) -> Vec<Line<'static>> {
+fn help_detail_lines(
+    doc: &crate::commands::CommandDoc,
+    width: usize,
+    accent: ratatui::style::Color,
+) -> Vec<Line<'static>> {
     use crate::commands::ArgKind;
     let mut out: Vec<Line> = Vec::new();
     let plain =
@@ -2304,7 +2448,7 @@ fn help_detail_lines(doc: &crate::commands::CommandDoc, width: usize) -> Vec<Lin
         out.push(plain("EXAMPLES".to_string(), theme::GOLD));
         for ex in doc.examples {
             for l in wrap_text(ex, width.saturating_sub(2)) {
-                out.push(plain(format!("  {l}"), theme::ACCENT));
+                out.push(plain(format!("  {l}"), accent));
             }
         }
     }
@@ -3500,6 +3644,280 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An app showing one channel message with the given raw text.
+    fn app_showing(text: &str) -> App {
+        let mut app = one_net_app();
+        engine(&mut app, Event::MessageReceived(chat("#rust", "bob", text)));
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        app
+    }
+
+    /// The first cell of the screen where `needle` starts. Only for rows made of
+    /// single-width characters, where the character index is the column.
+    fn cell_of<'a>(
+        buf: &'a ratatui::buffer::Buffer,
+        text: &str,
+        needle: &str,
+    ) -> &'a ratatui::buffer::Cell {
+        for (y, row) in text.lines().enumerate() {
+            if let Some(byte) = row.find(needle) {
+                let x = row[..byte].chars().count();
+                return &buf[(x as u16, y as u16)];
+            }
+        }
+        panic!("{needle:?} is not on screen:\n{text}");
+    }
+
+    #[test]
+    fn mirc_formatting_is_rendered_as_styles_not_stray_characters() {
+        let app = app_showing("plain \u{02}bold\u{02} \u{03}4red\u{03} \u{1f}under\u{1f} end");
+        let (buf, text) = draw_text(&app, 100, 24);
+        let row = row_with(&text, "plain");
+        assert!(
+            row.contains("plain bold red under end"),
+            "codes are gone: {row}"
+        );
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(cell_of(&buf, &text, "bold")
+            .modifier
+            .contains(Modifier::BOLD));
+        assert!(!cell_of(&buf, &text, "plain")
+            .modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(
+            cell_of(&buf, &text, "red").fg,
+            ratatui::style::Color::Rgb(0xff, 0x00, 0x00)
+        );
+        assert!(cell_of(&buf, &text, "under")
+            .modifier
+            .contains(Modifier::UNDERLINED));
+        assert!(!cell_of(&buf, &text, "end")
+            .modifier
+            .contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn formatting_carries_across_wrapped_rows() {
+        let long = format!("\u{02}{}", "word ".repeat(40)); // bold, never turned off
+        let app = app_showing(&long);
+        let (buf, text) = draw_text(&app, 80, 24);
+        let rows: Vec<usize> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("word"))
+            .map(|(y, _)| y)
+            .collect();
+        assert!(rows.len() >= 3, "the message wrapped: {text}");
+        for y in rows {
+            let x = text.lines().nth(y).unwrap().find("word").unwrap();
+            let x = text.lines().nth(y).unwrap()[..x].chars().count();
+            assert!(
+                buf[(x as u16, y as u16)].modifier.contains(Modifier::BOLD),
+                "row {y} lost the bold"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_colours_are_not_applied() {
+        // Black on our dark background would vanish; the text keeps its colour.
+        let app = app_showing("\u{03}1black text");
+        let (buf, text) = draw_text(&app, 100, 24);
+        let cell = cell_of(&buf, &text, "black text");
+        assert_eq!(cell.fg, theme::TEXT, "fell back to the normal colour");
+        // But black on a background the message chose is fine: that is readable.
+        let app = app_showing("\u{03}1,0boxed");
+        let (buf, text) = draw_text(&app, 100, 24);
+        let cell = cell_of(&buf, &text, "boxed");
+        assert_eq!(cell.fg, ratatui::style::Color::Rgb(0, 0, 0));
+        assert_eq!(cell.bg, ratatui::style::Color::Rgb(255, 255, 255));
+        // Text whose own colour clashes with the background it picked is fixed.
+        let app = app_showing("\u{03}0,0clash");
+        let (buf, text) = draw_text(&app, 100, 24);
+        let cell = cell_of(&buf, &text, "clash");
+        assert!(
+            theme::contrast(cell.fg, cell.bg) >= 3.0,
+            "{:?} on {:?}",
+            cell.fg,
+            cell.bg
+        );
+    }
+
+    #[test]
+    fn strip_mode_draws_plain_text_with_no_styles_from_the_message() {
+        let mut app = app_showing("a \u{02}b\u{02} \u{03}4c");
+        app.client.mirc_formatting = "strip".into();
+        let (buf, text) = draw_text(&app, 100, 24);
+        assert!(row_with(&text, "a b c").contains("a b c"));
+        // Every cell of the message has the plain text style: no bold, no colour.
+        let y = text.lines().position(|l| l.contains("a b c")).unwrap();
+        let row = text.lines().nth(y).unwrap();
+        // A column, not a byte offset: the sidebar's glyphs are multi-byte.
+        let x0 = row[..row.find("a b c").unwrap()].chars().count();
+        for dx in 0..5u16 {
+            let cell = &buf[(x0 as u16 + dx, y as u16)];
+            assert!(!cell.modifier.contains(Modifier::BOLD), "{}", cell.symbol());
+            assert_eq!(cell.fg, theme::TEXT, "{}", cell.symbol());
+        }
+    }
+
+    #[test]
+    fn terminal_escape_sequences_in_messages_never_reach_the_screen() {
+        for text in [
+            "evil \u{1b}[2J\u{1b}[31mred\u{1b}]0;title\u{07}",
+            "bell \u{07} nul \u{00} del \u{7f} c1 \u{9b}31m",
+        ] {
+            for mode in ["render", "strip"] {
+                let mut app = app_showing(text);
+                app.client.mirc_formatting = mode.into();
+                let (buf, _) = draw_text(&app, 100, 24);
+                for cell in buf.content() {
+                    assert!(
+                        !cell.symbol().chars().any(char::is_control),
+                        "{mode}: control char in a cell: {:?}",
+                        cell.symbol()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn notices_are_shown_as_nick_in_dashes() {
+        let mut app = one_net_app();
+        let mut notice = chat("#rust", "bob", "server restarting");
+        notice.kind = irc_engine::MessageKind::Notice;
+        engine(&mut app, Event::MessageReceived(notice));
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        let (_, text) = draw_text(&app, 100, 24);
+        assert!(
+            row_with(&text, "server restarting").contains("-bob- │"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn selection_and_dimming_survive_without_colour() {
+        let mut app = app_showing("hello");
+        app.client.color_mode = "none".into();
+        let (buf, _) = draw_text(&app, 100, 24);
+        assert!(
+            buf.content().iter().all(|c| {
+                matches!(c.fg, ratatui::style::Color::Reset)
+                    && matches!(c.bg, ratatui::style::Color::Reset)
+            }),
+            "no colour anywhere"
+        );
+        assert!(
+            buf.content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::REVERSED)),
+            "the active row is reverse video"
+        );
+        assert!(
+            buf.content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::DIM)),
+            "timestamps are dimmed"
+        );
+    }
+
+    #[test]
+    fn colour_modes_limit_the_palette_the_screen_uses() {
+        use ratatui::style::Color;
+        let mut app = app_showing("\u{03}4red \u{03}12blue");
+        app.client.color_mode = "256".into();
+        let (buf, _) = draw_text(&app, 100, 24);
+        assert!(buf
+            .content()
+            .iter()
+            .all(|c| !matches!(c.fg, Color::Rgb(..)) && !matches!(c.bg, Color::Rgb(..))));
+        assert!(
+            buf.content()
+                .iter()
+                .any(|c| matches!(c.fg, Color::Indexed(_))),
+            "indexed colours are used"
+        );
+        app.client.color_mode = "16".into();
+        let (buf, _) = draw_text(&app, 100, 24);
+        assert!(buf.content().iter().all(|c| {
+            !matches!(c.fg, Color::Rgb(..) | Color::Indexed(_))
+                && !matches!(c.bg, Color::Rgb(..) | Color::Indexed(_))
+        }));
+        // And truecolor leaves the design alone.
+        app.client.color_mode = "truecolor".into();
+        let (buf, _) = draw_text(&app, 100, 24);
+        assert!(buf.content().iter().any(|c| matches!(c.fg, Color::Rgb(..))));
+    }
+
+    #[test]
+    fn auto_colour_follows_no_color_and_the_terminal() {
+        use crate::tui::color::ColorMode;
+        let mut app = one_net_app();
+        assert_eq!(app.color_mode(), ColorMode::TrueColor, "a capable terminal");
+        app.color_env.no_color = true;
+        assert_eq!(app.color_mode(), ColorMode::None, "NO_COLOR wins in auto");
+        app.client.color_mode = "truecolor".into();
+        assert_eq!(app.color_mode(), ColorMode::TrueColor, "unless asked");
+        app.client.color_mode = "auto".into();
+        app.color_env.no_color = false;
+        app.color_env.colorterm = String::new();
+        app.color_env.term = "xterm-256color".into();
+        assert_eq!(app.color_mode(), ColorMode::Ansi256);
+    }
+
+    #[test]
+    fn not_painting_the_background_leaves_the_terminals_own() {
+        use ratatui::style::Color;
+        let mut app = app_showing("hello");
+        let (buf, _) = draw_text(&app, 100, 24);
+        assert!(buf.content().iter().any(|c| c.bg == theme::BG));
+        app.client.paint_background = false;
+        let (buf, _) = draw_text(&app, 100, 24);
+        assert!(
+            buf.content()
+                .iter()
+                .all(|c| c.bg != theme::BG && c.bg != theme::PANEL),
+            "neither the window nor the panel paint remains"
+        );
+        assert!(buf.content().iter().any(|c| c.bg == Color::Reset));
+    }
+
+    #[test]
+    fn accents_are_used_consistently() {
+        let mut app = app_in_channel();
+        engine(
+            &mut app,
+            Event::NamesLoaded {
+                target: "#rust".into(),
+                members: vec![irc_engine::Member {
+                    nick: "vic".into(),
+                    prefixes: vec![irc_engine::MemberPrefix::Voice],
+                    away: false,
+                }],
+            },
+        );
+        app.client.theme = "amber".into();
+        app.accent = theme::accent_for("amber");
+        let (buf, text) = draw_text(&app, 120, 24);
+        assert_eq!(
+            cell_of(&buf, &text, "+vic").fg,
+            theme::accent_for("amber"),
+            "voice follows the chosen accent, not a fixed teal"
+        );
+        // A query's sidebar label obeys nick_colors like every other nick.
+        let mut app = one_net_app();
+        engine(
+            &mut app,
+            Event::MessageReceived(chat("svan", "bob", "psst")),
+        );
+        app.client.nick_colors = false;
+        let (buf, text) = draw_text(&app, 100, 24);
+        assert_eq!(cell_of(&buf, &text, "@ bob").fg, theme::DIM);
     }
 
     #[test]
