@@ -9,6 +9,7 @@ mod addons;
 mod commands;
 mod config;
 mod input;
+mod keys;
 mod plain;
 mod render;
 mod session;

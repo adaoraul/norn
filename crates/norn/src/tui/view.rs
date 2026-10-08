@@ -113,6 +113,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
     let inner_w = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
 
+    // The digit that reaches each buffer with Alt+N (the console is Alt+0).
+    let numbered = numbered_buffers(app);
+    let number_of = |idx: usize| numbered.iter().position(|&b| b == idx).map(|p| p + 1);
+
     for row in sidebar_rows(app) {
         match row {
             // The global console is the first row, above every network.
@@ -125,6 +129,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
                     app.accent,
                     &SidebarCell {
                         active,
+                        num: Some(0),
                         lead: None,
                         label: "norn",
                         fg: if active { theme::BRIGHT } else { theme::DIM2 },
@@ -146,10 +151,15 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
                     Some(lag) if lag.as_millis() >= 1000 => format!(" {}", format_lag(*lag)),
                     _ => String::new(),
                 };
+                let server_idx = app
+                    .buffers
+                    .iter()
+                    .position(|b| b.net == net_id && b.kind == BufferKind::Server);
                 lines.push(sidebar_row(
                     app.accent,
                     &SidebarCell {
                         active,
+                        num: server_idx.and_then(number_of),
                         lead: Some((glyph, glyph_fg)),
                         label: &app.networks[net_id].name.to_uppercase(),
                         fg: if active { theme::BRIGHT } else { theme::DIM2 },
@@ -197,6 +207,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
                     app.accent,
                     &SidebarCell {
                         active,
+                        num: number_of(idx),
                         lead: None,
                         label: &label,
                         fg,
@@ -212,6 +223,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
                     app.accent,
                     &SidebarCell {
                         active: false,
+                        num: None,
                         lead: Some(("○", theme::DIM2)),
                         label: &app.definitions[def].name.to_uppercase(),
                         fg: theme::DIM2,
@@ -272,6 +284,8 @@ pub fn sidebar_rows(app: &App) -> Vec<SidebarRow> {
 struct SidebarCell<'a> {
     /// Whether this is the active buffer (accent bar and highlight).
     active: bool,
+    /// The Alt+N digit that jumps here (`0` for the console), if it has one.
+    num: Option<usize>,
     /// An optional leading glyph and its colour (connection state).
     lead: Option<(&'a str, ratatui::style::Color)>,
     /// The row's text.
@@ -284,6 +298,24 @@ struct SidebarCell<'a> {
     badge_style: Style,
 }
 
+/// The buffers Alt+1..9 reach, in the order the sidebar lists them: each live
+/// network's status buffer, then its channels and queries. The console is Alt+0
+/// and idle (unconnected) networks have no buffer to jump to.
+pub fn numbered_buffers(app: &App) -> Vec<usize> {
+    sidebar_rows(app)
+        .into_iter()
+        .filter_map(|row| match row {
+            SidebarRow::Network(net_id) => app
+                .buffers
+                .iter()
+                .position(|b| b.net == net_id && b.kind == BufferKind::Server),
+            SidebarRow::Buffer(idx) => Some(idx),
+            SidebarRow::Console | SidebarRow::Idle(_) => None,
+        })
+        .take(9)
+        .collect()
+}
+
 /// Build one sidebar row: an accent bar, an optional state glyph, a padded
 /// label, and a right badge, with a full-width active-row background.
 fn sidebar_row(accent: ratatui::style::Color, cell: &SidebarCell, inner_w: usize) -> Line<'static> {
@@ -293,13 +325,20 @@ fn sidebar_row(accent: ratatui::style::Color, cell: &SidebarCell, inner_w: usize
         theme::PANEL
     };
     let bar = if cell.active { "▎" } else { " " };
-    // Layout: accent bar (1) + a space + [glyph + space] + label + padding + badge.
+    // Layout: accent bar (1) + jump digit (1) + a space + [glyph + space] + label
+    // + padding + badge.
     let lead_w = cell.lead.map_or(0, |(g, _)| g.width() + 1);
-    let name_w = inner_w.saturating_sub(2 + lead_w + cell.badge.width());
+    let name_w = inner_w.saturating_sub(3 + lead_w + cell.badge.width());
     let name = truncate(cell.label, name_w);
     let pad = " ".repeat(name_w.saturating_sub(name.width()));
+    // The jump digit sits in the cell after the bar, where a plain space was.
+    let digit = match cell.num {
+        Some(n) if n <= 9 => char::from_digit(n as u32, 10).unwrap_or(' ').to_string(),
+        _ => " ".to_string(),
+    };
     let mut spans = vec![
         Span::styled(bar, Style::default().fg(accent).bg(bg)),
+        Span::styled(digit, Style::default().fg(theme::DIM2).bg(bg)),
         Span::styled(" ", Style::default().bg(bg)),
     ];
     if let Some((glyph, glyph_fg)) = cell.lead {
@@ -826,7 +865,11 @@ fn draw_switcher(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::BRIGHT),
         ),
     ])];
-    for (i, &idx) in matches.iter().enumerate() {
+    // Room for the query line above and the hint line below; scroll the list so
+    // the selection is always on screen.
+    let visible = (h as usize).saturating_sub(2).max(1);
+    let start = (app.switcher.sel + 1).saturating_sub(visible);
+    for (i, &idx) in matches.iter().enumerate().skip(start).take(visible) {
         let b = &app.buffers[idx];
         let net_name = app
             .networks
@@ -845,7 +888,27 @@ fn draw_switcher(f: &mut Frame, area: Rect, app: &App) {
         };
         lines.push(Line::from(Span::styled(format!(" {label}"), style)));
     }
-    f.render_widget(Paragraph::new(lines), inset(rect));
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no matching buffer",
+            Style::default().fg(theme::DIM2),
+        )));
+    }
+    let list_area = inset(rect);
+    f.render_widget(Paragraph::new(lines), list_area);
+    if h >= 3 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " type to filter · ↑↓ · Enter switch · Esc cancel",
+                Style::default().fg(theme::DIM2),
+            ))),
+            Rect {
+                y: list_area.y + h - 1,
+                height: 1,
+                ..list_area
+            },
+        );
+    }
 }
 
 /// The `/settings` panel: a categorized, typed, filterable list of client
@@ -1145,9 +1208,9 @@ fn draw_networks(f: &mut Frame, area: Rect, app: &App) {
     let hint = if app.networks_ui.editing.is_some() {
         "type · Enter saves · Esc cancels"
     } else if list_focused {
-        "↑↓ select · → edit · c connect · d disconnect · x delete · Esc closes"
+        "↑↓ select · → edit · c connect · d disconnect · x delete (twice) · Esc closes"
     } else {
-        "↑↓ field · Enter edit · Space toggle · ← back · Esc closes"
+        "↑↓ field · Enter edit · Space toggle · ← / Esc back"
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1321,7 +1384,7 @@ fn draw_plugins(f: &mut Frame, area: Rect, app: &App) {
     let width = inner.width as usize;
     // Header: title + hint on the left, install count on the right.
     let left = "plugins";
-    let hint = "  Space load/unload · Esc closes";
+    let hint = "  Space load/unload · c config · Esc closes";
     let right = format!("{} installed", app.plugins.len());
     let pad = width.saturating_sub(left.width() + hint.width() + right.width());
     f.render_widget(
@@ -1815,6 +1878,44 @@ fn help_detail_lines(doc: &crate::commands::CommandDoc, width: usize) -> Vec<Lin
             out.push(plain(format!("{pad}{l}"), theme::DIM));
         }
     };
+
+    // Reference tables generated from their registries, so the help can never
+    // list a key or setting that does not exist (or miss one that does).
+    if doc.name == "keys" {
+        let mut context = "";
+        for k in crate::keys::KEYS {
+            if k.context != context {
+                context = k.context;
+                out.push(Line::from(""));
+                out.push(plain(context.to_uppercase(), theme::GOLD));
+            }
+            let text = format!("{:<22} {}", k.keys, k.action);
+            for (i, l) in wrap_text(&text, width.saturating_sub(2))
+                .into_iter()
+                .enumerate()
+            {
+                let pad = if i == 0 {
+                    "  "
+                } else {
+                    "                          "
+                };
+                out.push(plain(format!("{pad}{l}"), theme::BRIGHT2));
+            }
+        }
+    }
+    if doc.name == "set" {
+        out.push(Line::from(""));
+        out.push(plain("SETTINGS".to_string(), theme::GOLD));
+        for s in crate::settings::SETTINGS {
+            out.push(plain(
+                format!("  {}  ({}, default {})", s.key, s.kind.label(), s.default),
+                theme::BRIGHT2,
+            ));
+            for l in wrap_text(s.desc, width.saturating_sub(4)) {
+                out.push(plain(format!("    {l}"), theme::DIM));
+            }
+        }
+    }
 
     if !doc.subcommands.is_empty() {
         out.push(Line::from(""));
@@ -2391,6 +2492,125 @@ mod tests {
         });
         let (_, text) = draw_text(&app, 100, 20);
         assert!(row_with(&text, "[Act:").contains("libera/#quiet"));
+    }
+
+    #[test]
+    fn the_sidebar_shows_the_alt_digit_beside_each_buffer() {
+        let mut app = one_net_app();
+        engine(&mut app, Event::MessageReceived(chat("#rust", "bob", "hi")));
+        engine(&mut app, Event::MessageReceived(chat("bob", "bob", "psst")));
+        let (_, text) = draw_text(&app, 80, 20);
+        let sidebar = |needle: &str| -> String {
+            row_with(&text, needle).chars().take(23).collect::<String>()
+        };
+        // The digit is the second cell (after the accent bar, which is `▎` on
+        // the active row). 0 = console, then the network (1), then its buffers
+        // in listed order.
+        let digit = |needle: &str| sidebar(needle).chars().nth(1);
+        assert_eq!(digit("norn"), Some('0'), "{text}");
+        assert_eq!(digit("LIBERA"), Some('1'), "{text}");
+        assert_eq!(digit("#rust"), Some('2'), "{text}");
+        assert_eq!(digit("bob"), Some('3'), "{text}");
+    }
+
+    #[test]
+    fn numbered_buffers_skip_the_console_and_idle_networks_and_stop_at_nine() {
+        let mut app = one_net_app();
+        for i in 0..12 {
+            engine(
+                &mut app,
+                Event::MessageReceived(chat(&format!("#c{i}"), "bob", "hi")),
+            );
+        }
+        let numbered = numbered_buffers(&app);
+        assert_eq!(numbered.len(), 9);
+        assert_eq!(app.buffers[numbered[0]].kind, BufferKind::Server);
+        assert!(numbered
+            .iter()
+            .all(|&i| app.buffers[i].kind != BufferKind::Status));
+    }
+
+    #[test]
+    fn welcome_text_points_at_the_keys() {
+        let app = one_net_app();
+        let console: Vec<String> = app.buffers[0]
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                BufLine::Event { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let keys_line = console.iter().find(|l| l.starts_with("keys")).unwrap();
+        assert!(keys_line.contains("F1 keys"), "{keys_line}");
+        assert!(keys_line.contains("Ctrl+K switch buffers"), "{keys_line}");
+    }
+
+    #[test]
+    fn help_detail_lists_every_key_and_every_setting_from_the_registries() {
+        let mut app = one_net_app();
+        app.open_help("keys");
+        // Scroll through the whole detail pane, collecting what was drawn.
+        let mut seen = String::new();
+        for scroll in (0..200).step_by(10) {
+            app.help.detail_scroll = scroll;
+            seen.push_str(&draw_text(&app, 120, 40).1);
+        }
+        for k in crate::keys::KEYS {
+            assert!(seen.contains(k.keys), "help is missing the key {}", k.keys);
+        }
+        app.open_help("set");
+        let mut seen = String::new();
+        for scroll in (0..200).step_by(10) {
+            app.help.detail_scroll = scroll;
+            seen.push_str(&draw_text(&app, 120, 40).1);
+        }
+        for s in crate::settings::SETTINGS {
+            assert!(
+                seen.contains(s.key),
+                "help is missing the setting {}",
+                s.key
+            );
+        }
+    }
+
+    #[test]
+    fn switcher_and_panel_footers_show_their_keys() {
+        let mut app = one_net_app();
+        app.mode = Mode::Switcher;
+        let (_, text) = draw_text(&app, 100, 30);
+        assert!(text.contains("type to filter"), "{text}");
+        assert!(text.contains("Esc cancel"), "{text}");
+
+        let mut app = one_net_app();
+        app.open_plugins();
+        let (_, text) = draw_text(&app, 100, 30);
+        assert!(text.contains("c config"), "plugins hint: {text}");
+
+        let mut app = one_net_app();
+        app.add_network_definition();
+        app.mode = Mode::Networks;
+        let (_, text) = draw_text(&app, 100, 30);
+        assert!(text.contains("← / Esc back"), "networks form hint: {text}");
+    }
+
+    #[test]
+    fn the_switcher_keeps_the_selection_on_screen() {
+        let mut app = one_net_app();
+        for i in 0..30 {
+            engine(
+                &mut app,
+                Event::MessageReceived(chat(&format!("#room{i:02}"), "bob", "hi")),
+            );
+        }
+        app.mode = Mode::Switcher;
+        app.switcher.sel = 25;
+        let (_, text) = draw_text(&app, 100, 30);
+        // Row 25 of the list is the 26th buffer: console, status, then #room00...
+        assert!(
+            text.contains("#room23"),
+            "selection scrolled into view: {text}"
+        );
     }
 
     #[test]

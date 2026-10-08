@@ -2200,6 +2200,7 @@ fn welcome_lines(no_networks: bool, defined: &[NetworkConfig]) -> Vec<String> {
         "/help      browse every command (Tab also completes as you type)".to_string(),
         "/settings  configure the client (theme, timestamps, aliases, ...)".to_string(),
         "/networks  add, edit, connect, and disconnect networks".to_string(),
+        format!("keys      {}", crate::keys::welcome_line()),
     ];
     if no_networks && defined.is_empty() {
         lines.push("no networks yet — open /networks and press Enter on the add row,".to_string());

@@ -6,7 +6,7 @@ use super::state::{
     check_dialable, network_field_value, App, AppAction, BufferKind, Completion, Confirm, Mode,
     NetFieldKind, NetworksFocus, Switcher, NETWORK_FIELDS,
 };
-use super::view::{sidebar_rows, SidebarRow};
+use super::view::{numbered_buffers, sidebar_rows, SidebarRow};
 use crate::session::NetCommand;
 
 /// Width of the sidebar column.
@@ -151,6 +151,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
             app.mode = Mode::Switcher;
             app.switcher = Switcher::default();
         }
+        KeyCode::F(1) => app.open_help("keys"),
         KeyCode::F(2) => app.open_settings(),
         KeyCode::F(3) => app.open_networks(),
         KeyCode::F(4) => app.open_plugins(),
@@ -158,9 +159,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
         KeyCode::Left if alt => switch_relative(app, -1),
         KeyCode::Right if alt => switch_relative(app, 1),
         KeyCode::Char(c) if alt && c.is_ascii_digit() => {
+            // The digit shown beside a buffer in the sidebar; 0 is the console.
             let n = c.to_digit(10).unwrap() as usize;
-            if n >= 1 {
-                app.switch_to(n - 1);
+            let target = if n == 0 {
+                app.buffers
+                    .iter()
+                    .position(|b| b.kind == BufferKind::Status)
+            } else {
+                numbered_buffers(app).get(n - 1).copied()
+            };
+            if let Some(idx) = target {
+                app.switch_to(idx);
             }
         }
         KeyCode::Esc => app.completion = None,
@@ -604,22 +613,49 @@ fn handle_networks_edit(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Buffer indices matching the switcher query.
+/// Buffer indices matching the switcher query, best match first. The query is
+/// matched fuzzily against `network name`, so a few letters of each (`lrs` for
+/// `libera #rust`) are enough.
 pub fn switcher_matches(app: &App) -> Vec<usize> {
     let q = app.switcher.query.to_lowercase();
-    app.buffers
+    let mut scored: Vec<(u8, usize)> = app
+        .buffers
         .iter()
         .enumerate()
-        .filter(|(_, b)| {
-            let label = if b.kind == BufferKind::Server {
-                format!("{} status", app.networks[b.net].name)
-            } else {
-                b.name.clone()
+        .filter_map(|(i, b)| {
+            let net = app
+                .networks
+                .get(b.net)
+                .map(|n| n.name.as_str())
+                .unwrap_or("");
+            let label = match b.kind {
+                BufferKind::Server => format!("{net} status"),
+                BufferKind::Status => b.name.clone(),
+                _ => format!("{net} {}", b.name),
             };
-            label.to_lowercase().contains(&q)
+            fuzzy_score(&label.to_lowercase(), &q).map(|score| (score, i))
         })
-        .map(|(i, _)| i)
-        .collect()
+        .collect();
+    // Stable: equally good matches keep their sidebar order.
+    scored.sort_by_key(|&(score, i)| (score, i));
+    scored.into_iter().map(|(_, i)| i).collect()
+}
+
+/// How well `query` matches `label` (both lowercase): `Some(0)` is best, `None`
+/// is no match. Ranks a prefix above a word start, above a substring, above a
+/// scattered subsequence. An empty query matches everything equally.
+fn fuzzy_score(label: &str, query: &str) -> Option<u8> {
+    if query.is_empty() || label.starts_with(query) {
+        return Some(0);
+    }
+    if label.split([' ', '#', '/']).any(|w| w.starts_with(query)) {
+        return Some(1);
+    }
+    if label.contains(query) {
+        return Some(2);
+    }
+    let mut rest = label.chars();
+    query.chars().all(|c| rest.any(|l| l == c)).then_some(3)
 }
 
 fn switch_relative(app: &mut App, delta: isize) {
@@ -651,6 +687,7 @@ const STRUCTURAL: &[&str] = &[
     "unalias",
     "trigger",
     "plugins",
+    "keys",
 ];
 
 /// Max alias-expansion recursion depth (guards cyclic aliases).
@@ -756,6 +793,10 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
             }
             "help" | "h" => {
                 app.open_help(arg);
+                return Vec::new();
+            }
+            "keys" => {
+                app.open_help("keys");
                 return Vec::new();
             }
             _ => {}
@@ -1584,6 +1625,10 @@ fn arg_candidates(
 
     // No subcommands: positional parameters.
     match doc.params.get(token_idx - 1) {
+        // The value depends on which setting was just typed.
+        Some(param) if param.kind == crate::commands::ArgKind::SettingValue => {
+            (setting_value_candidates(tokens.get(1).copied()), " ")
+        }
         Some(param) => (kind_candidates(app, param.kind), suffix_for(param.kind)),
         None => (Vec::new(), " "),
     }
@@ -1610,7 +1655,6 @@ fn sub_param_candidates(
 fn kind_candidates(app: &App, kind: crate::commands::ArgKind) -> Vec<String> {
     use crate::commands::ArgKind;
     match kind {
-        ArgKind::Enum(values) => values.iter().map(|s| s.to_string()).collect(),
         ArgKind::Nick => nick_names(app),
         ArgKind::Channel => channel_names(app),
         ArgKind::Network => network_names(app),
@@ -1625,7 +1669,28 @@ fn kind_candidates(app: &App, kind: crate::commands::ArgKind) -> Vec<String> {
             .map(|p| p.name.to_string())
             .collect(),
         ArgKind::OptionKey => Vec::new(), // handled at the subcommand level
+        ArgKind::Setting => crate::settings::SETTINGS
+            .iter()
+            .map(|s| s.key.to_string())
+            .collect(),
+        // Needs the setting typed before it; see `arg_candidates`.
+        ArgKind::SettingValue => Vec::new(),
         ArgKind::Free => nick_names(app), // freeform: offer nicks for mentions
+    }
+}
+
+/// The values worth offering for `key`, straight from the settings registry:
+/// `on`/`off` for a bool, the listed values for an enum, nothing for free text
+/// and numbers.
+fn setting_value_candidates(key: Option<&str>) -> Vec<String> {
+    use crate::settings::SettingKind;
+    let Some(doc) = key.and_then(crate::settings::find) else {
+        return Vec::new();
+    };
+    match doc.kind {
+        SettingKind::Bool => vec!["on".to_string(), "off".to_string()],
+        SettingKind::Enum(values) => values.iter().map(|v| v.to_string()).collect(),
+        SettingKind::Int { .. } | SettingKind::Str => Vec::new(),
     }
 }
 
@@ -2575,6 +2640,108 @@ mod tests {
             net: 0,
             kind: crate::session::UiEventKind::Engine(event),
         });
+    }
+
+    #[test]
+    fn set_completes_keys_and_values_from_the_settings_registry() {
+        let mut app = app_with_channel();
+        assert_eq!(tab_after(&mut app, "/set mou"), "/set mouse ");
+        let mut app = app_with_channel();
+        assert_eq!(
+            tab_after(&mut app, "/set beep_o"),
+            "/set beep_on_highlight "
+        );
+        // A bool offers on/off; an enum offers its own values; free text nothing.
+        let mut app = app_with_channel();
+        assert_eq!(tab_after(&mut app, "/set mouse o"), "/set mouse off ");
+        let mut app = app_with_channel();
+        assert_eq!(tab_after(&mut app, "/set theme am"), "/set theme amber ");
+        let mut app = app_with_channel();
+        assert_eq!(tab_after(&mut app, "/set idle_secs 3"), "/set idle_secs 3");
+    }
+
+    #[test]
+    fn every_setting_key_is_offered_by_set_completion() {
+        use crate::tui::state::Completion;
+        let mut app = app_with_channel();
+        for c in "/set ".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Tab));
+        let Some(Completion { matches, .. }) = &app.completion else {
+            panic!("no completion for /set ");
+        };
+        for doc in crate::settings::SETTINGS {
+            assert!(matches.iter().any(|m| m == doc.key), "{} missing", doc.key);
+        }
+    }
+
+    #[test]
+    fn f1_and_slash_keys_open_help_on_the_key_list() {
+        for open in ["f1", "/keys"] {
+            let mut app = app_with_channel();
+            if open == "f1" {
+                handle_key(&mut app, key(KeyCode::F(1)));
+            } else {
+                run_line(&mut app, open);
+            }
+            assert_eq!(app.mode, Mode::Help, "{open}");
+            let selected = crate::commands::help_commands(&app.help.query)
+                .get(app.help.sel)
+                .map(|c| c.name);
+            assert_eq!(selected, Some("keys"), "{open}");
+        }
+    }
+
+    #[test]
+    fn alt_digits_follow_the_numbers_shown_in_the_sidebar() {
+        let alt = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        let mut app = app_with_channel(); // console, network "net", #rust
+                                          // 1 = the network's status buffer, 2 = #rust; 0 = the console.
+        handle_key(&mut app, alt('1'));
+        assert_eq!(app.active_buffer().kind, BufferKind::Server);
+        handle_key(&mut app, alt('2'));
+        assert_eq!(app.active_buffer().name, "#rust");
+        handle_key(&mut app, alt('0'));
+        assert_eq!(app.active_buffer().kind, BufferKind::Status);
+        // A number with no buffer does nothing.
+        handle_key(&mut app, alt('9'));
+        assert_eq!(app.active_buffer().kind, BufferKind::Status);
+    }
+
+    #[test]
+    fn fuzzy_score_ranks_prefix_then_word_start_then_substring_then_scatter() {
+        assert_eq!(fuzzy_score("libera #rust", ""), Some(0));
+        assert_eq!(fuzzy_score("libera #rust", "lib"), Some(0));
+        assert_eq!(fuzzy_score("libera #rust", "rus"), Some(1));
+        assert_eq!(fuzzy_score("libera #rust", "ust"), Some(2));
+        assert_eq!(fuzzy_score("libera #rust", "lrs"), Some(3));
+        assert_eq!(fuzzy_score("libera #rust", "xyz"), None);
+        // Order matters for a scatter match.
+        assert_eq!(fuzzy_score("libera #rust", "sl"), None);
+    }
+
+    #[test]
+    fn switcher_matches_fuzzily_and_best_first() {
+        let mut app = app_with_channel(); // buffers: norn, "net status", "net #rust"
+        let names = |app: &App| -> Vec<String> {
+            switcher_matches(app)
+                .into_iter()
+                .map(|i| app.buffers[i].name.clone())
+                .collect()
+        };
+        app.switcher.query = "nrs".into(); // scattered: n(et) ... r(u)s(t)
+        assert_eq!(names(&app), vec!["#rust"]);
+        // A scattered query matches anything it is a subsequence of: "nr" also
+        // fits "norn", and ties keep the sidebar order.
+        app.switcher.query = "nr".into();
+        assert_eq!(names(&app), vec!["norn", "#rust"]);
+        app.switcher.query = "rust".into(); // word start
+        assert_eq!(names(&app), vec!["#rust"]);
+        app.switcher.query = "net".into(); // prefix of both network buffers
+        assert_eq!(names(&app).len(), 2);
+        app.switcher.query = String::new();
+        assert_eq!(names(&app).len(), 3, "an empty query lists everything");
     }
 
     fn ctrl_c() -> KeyEvent {

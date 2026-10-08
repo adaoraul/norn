@@ -65,10 +65,23 @@ impl Translated {
     }
 }
 
-/// Short help listing the available commands.
-pub const HELP: &str = "commands: /join /part /msg /query /nick /names /me /topic \
-/whois /away /kick /mode /notice /invite /raw · client: /set /network ls|add|rm|show \
-/connect /disconnect /reconnect /clear /alias /unalias /help /quit";
+/// The commands [`translate`] understands. Plain mode has no client commands
+/// (`/set`, `/network`, ...): those belong to the TUI.
+const TRANSLATED: &[&str] = &[
+    "join", "part", "msg", "me", "nick", "names", "raw", "whois", "topic", "away", "kick", "mode",
+    "notice", "invite", "help", "quit",
+];
+
+/// Short help listing the commands available here, taken from the command
+/// knowledge base so it cannot go stale.
+pub fn help_text() -> String {
+    let names: Vec<String> = crate::commands::COMMANDS
+        .iter()
+        .filter(|c| TRANSLATED.contains(&c.name))
+        .map(|c| format!("/{}", c.name))
+        .collect();
+    format!("commands: {}", names.join(" "))
+}
 
 /// Translate one input line for the given current target.
 pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
@@ -228,7 +241,7 @@ pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
             }
         }
         "help" | "h" => Translated {
-            feedback: Some(HELP.to_string()),
+            feedback: Some(help_text()),
             ..Default::default()
         },
         "quit" => {
@@ -246,7 +259,30 @@ pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
 
 #[cfg(test)]
 mod tests {
-    use super::translate;
+    use super::{help_text, translate};
+
+    #[test]
+    fn help_text_lists_exactly_the_commands_translate_handles() {
+        let help = help_text();
+        for name in super::TRANSLATED {
+            assert!(
+                crate::commands::find(name).is_some(),
+                "/{name} is not in the command knowledge base"
+            );
+            assert!(help.contains(&format!("/{name}")), "{help}");
+            // And translate really does handle it (never "unknown command").
+            let mut current = Some("#c".to_string());
+            let t = translate(&format!("/{name}"), &mut current);
+            assert!(
+                !t.feedback
+                    .as_deref()
+                    .is_some_and(|f| f.contains("unknown command")),
+                "/{name} is listed but unknown to translate"
+            );
+        }
+        // Client commands are not offered in plain mode.
+        assert!(!help.contains("/set") && !help.contains("/network"));
+    }
 
     #[test]
     fn plain_text_needs_a_target() {

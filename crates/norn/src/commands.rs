@@ -5,13 +5,9 @@
 //! detail views) and by Tab-completion. Defining a command's shape here means
 //! help text and completion candidates never drift apart.
 
-use crate::tui::theme;
-
 /// What kind of value an argument accepts. Drives completion candidates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgKind {
-    /// One of a fixed set of values (e.g. `on`/`off`).
-    Enum(&'static [&'static str]),
     /// A nick from the active channel.
     Nick,
     /// A channel (an open channel buffer).
@@ -28,6 +24,11 @@ pub enum ArgKind {
     OfficialPlugin,
     /// A repeatable `key=value` option; the key completes with a trailing `=`.
     OptionKey,
+    /// A client setting name, from the settings registry (for `/set`).
+    Setting,
+    /// The value for the setting named by the previous argument: `on`/`off`
+    /// for a bool, the listed values for an enum, nothing for free text.
+    SettingValue,
     /// Freeform text (message bodies, reasons, modes) - no completion.
     Free,
 }
@@ -101,8 +102,6 @@ const fn opt(name: &'static str, kind: ArgKind, desc: &'static str) -> ParamDoc 
         kind,
     }
 }
-
-const ON_OFF: &[&str] = &["on", "off"];
 
 /// The `/network add` options (repeatable `key=value`).
 const NETWORK_ADD_OPTS: &[ParamDoc] = &[
@@ -262,34 +261,6 @@ const PLUGINS_SUBS: &[SubDoc] = &[
         desc: "Open a plugin's settings editor (for plugins that declare CONFIG).",
         params: &[req("name", ArgKind::Plugin, "the plugin to configure")],
         examples: &["/plugins config autoop"],
-    },
-];
-
-const SET_SUBS: &[SubDoc] = &[
-    SubDoc {
-        name: "timestamps",
-        usage: "/set timestamps on|off",
-        desc: "Show message timestamps.",
-        params: &[req("value", ArgKind::Enum(ON_OFF), "on or off")],
-        examples: &["/set timestamps off"],
-    },
-    SubDoc {
-        name: "nicklist",
-        usage: "/set nicklist on|off",
-        desc: "Show the channel nicklist by default.",
-        params: &[req("value", ArgKind::Enum(ON_OFF), "on or off")],
-        examples: &["/set nicklist on"],
-    },
-    SubDoc {
-        name: "theme",
-        usage: "/set theme <name>",
-        desc: "Accent color theme.",
-        params: &[req(
-            "value",
-            ArgKind::Enum(theme::THEME_NAMES),
-            "a theme name",
-        )],
-        examples: &["/set theme amber"],
     },
 ];
 
@@ -555,10 +526,14 @@ revive it.",
         usage: "/set [key value]",
         summary: "View or change settings",
         description: "With no arguments, list the current settings; with a key \
-and value, change one (applied live and auto-saved).",
+and value, change one (applied live and auto-saved). Every setting is listed \
+below, generated from the same table the settings screen uses.",
         aliases: &[],
-        params: &[],
-        subcommands: SET_SUBS,
+        params: &[
+            opt("key", ArgKind::Setting, "the setting to change"),
+            opt("value", ArgKind::SettingValue, "its new value"),
+        ],
+        subcommands: &[],
         examples: &["/set", "/set theme amber", "/set timestamps off"],
     },
     CommandDoc {
@@ -656,6 +631,18 @@ send/notify/nick.",
         params: &[req("line", ArgKind::Free, "the raw IRC line")],
         subcommands: &[],
         examples: &["/raw WHOIS bob", "/raw PRIVMSG #rust :hi"],
+    },
+    CommandDoc {
+        name: "keys",
+        category: "Client",
+        usage: "/keys",
+        summary: "Show the keyboard shortcuts",
+        description: "Every key norn reacts to, in chat and in each panel. F1 \
+opens the same list.",
+        aliases: &[],
+        params: &[],
+        subcommands: &[],
+        examples: &["/keys"],
     },
     CommandDoc {
         name: "help",

@@ -244,6 +244,7 @@ locally so your side of the conversation is always visible.
 | `/plugins [ls\|available\|install\|reload\|enable\|disable\|config]` | Open or manage Rhai plugins. |
 | `/clear`                    | Clear the active buffer's scrollback.                    |
 | `/raw <line>` (`/quote`)    | Send a raw IRC line verbatim.                            |
+| `/keys`                     | Show the keyboard shortcuts (same as `F1`).              |
 | `/help [command]` (`/h`)    | Open the help panel.                                     |
 | `/quit [reason]`            | Disconnect all networks and exit; the reason is sent as the QUIT message. |
 
@@ -254,13 +255,15 @@ locally so your side of the conversation is always visible.
 | Key                 | Action                                                        |
 | ------------------- | ------------------------------------------------------------- |
 | `Ctrl+C`            | Quit (disconnect all and exit). Press twice within 2 seconds; any other key cancels. |
-| `Ctrl+K`            | Open the buffer switcher (type to filter, arrows, Enter).     |
+| `Ctrl+K`            | Open the buffer switcher (fuzzy: a few letters of the network and channel, e.g. `lrs` for `libera #rust`). |
+| `F1`                | Show the list of keys (also `/keys`).                         |
 | `F2`                | Open the settings screen.                                     |
 | `F3`                | Open the networks manager.                                    |
 | `F4`                | Open the plugins manager.                                     |
 | `F9`                | Toggle the nicklist.                                          |
 | `Alt+Left` / `Alt+Right` | Previous / next buffer.                                  |
-| `Alt+1` .. `Alt+9`  | Switch to buffer N.                                           |
+| `Alt+1..9`          | Jump to the buffer with that number (the digit beside it in the sidebar). |
+| `Alt+0`             | Jump to the console.                                          |
 | `Tab`               | Autocomplete nicks / commands / arguments (repeat to cycle).  |
 | `Esc`               | Clear the completion menu.                                    |
 | `Enter`             | Send the message or run the command.                          |
@@ -269,7 +272,11 @@ locally so your side of the conversation is always visible.
 | `Up` / `Down`       | Recall previous / next input from history.                    |
 | `PageUp` / `PageDown` | Scroll the buffer (fetches `CHATHISTORY` when you reach the top). |
 
-The help panel opens with `/help` (there is no dedicated key for it).
+The command help opens with `/help`; `F1` (or `/keys`) opens it on the list of
+keys, which is generated from the same table as this section.
+
+The sidebar shows the `Alt+` digit beside each buffer (1-9, in the order listed;
+the console is 0), so you never have to count.
 
 ### In the manager screens
 
@@ -279,17 +286,17 @@ The help panel opens with `/help` (there is no dedicated key for it).
   (toggle a bool, cycle an enum, or type a value), `Delete` to remove an alias
   (press it twice), `Esc` to close.
 - **Networks** (`F3`): `Up`/`Down` to move, `Enter`/`Right` to edit or create,
-  `c` to connect, `d` to disconnect, `x` to remove (press it twice), `Esc` to
-  close.
+  `c` to connect, `d` to disconnect, `x` to remove (press it twice), `Esc` to go
+  back from the form or close the manager.
+- **Plugins** (`F4`): `Up`/`Down` to move, `Space`/`Enter` to enable/disable, `c`
+  to open the config editor, `Esc` to close.
+- **Help** (`/help`, `F1`): type to filter, `Up`/`Down` to move, `Enter` to insert
+  the command into the input, `Right`/`Left` to move between the list and detail
+  panes, `Esc` to close.
 
 Removing a network or an alias asks for a second press of the same key on the
 same item (the prompt is shown in the panel); moving to another row or pressing
 any other key cancels it, and it lapses after 2 seconds.
-- **Plugins** (`F4`): `Up`/`Down` to move, `Space`/`Enter` to enable/disable, `c`
-  to open the config editor, `Esc` to close.
-- **Help** (`/help`): type to filter, `Up`/`Down` to move, `Enter` to insert the
-  command into the input, `Right`/`Left` to move between the list and detail
-  panes, `Esc` to close.
 
 ## Features
 

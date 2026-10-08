@@ -42,7 +42,7 @@ pub async fn run(
                         if result.quit {
                             quit.store(true, Ordering::SeqCst);
                             for tx in &cmd_txs {
-                                let _ = tx.send(NetCommand::Quit(Some("norn".to_string())));
+                                let _ = tx.send(NetCommand::Quit(result.quit_reason.clone()));
                             }
                             break;
                         }
