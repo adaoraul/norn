@@ -2,14 +2,14 @@
 id: "norn-a4k4me"
 title: "norn TUI review fixes"
 kind: "epic"
-status: "todo"
+status: "done"
 priority: "p2"
 tags: []
 blocked_by: []
 refs: ["docs/DESIGN.md", "crates/norn/src/tui/"]
 created: "2026-10-08T08:46:58Z"
-updated: "2026-10-08T08:46:58Z"
-closed: ~
+updated: "2026-10-08T15:42:22Z"
+closed: "2026-10-08T15:42:22Z"
 started_by: ~
 ---
 
@@ -29,3 +29,4 @@ plan: i-would-like-us-virtual-steele-a0056f
 
 ## Log
 - 2026-10-08T08:46Z claude: created
+- 2026-10-08T15:42Z adaoraul: done
