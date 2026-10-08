@@ -301,6 +301,21 @@ from the server (cannot send to a channel, nick in use, not a channel operator,
 banned, invite-only, ...) show the same way, in the channel they concern. The
 message of the day and other server text go to the network's status buffer.
 
+What the interface tells you at a glance:
+
+- **Sidebar.** Each network is led by a state glyph: `●` connected, `◐` connecting
+  or reconnecting, `○` disconnected, `✕` closed. A slow link (a PING round trip
+  over a second) adds the lag after the name. A channel's unread count is plain
+  (`3`); if you were mentioned it becomes bold gold with a `!` (`!3`). Channels
+  you have left or been kicked from are dimmed.
+- **Header.** `network · #channel +modes`, then the topic. A channel you are no
+  longer in shows `(not joined)`.
+- **Activity bar.** Your nick, `[away]` when you are marked away, the current lag,
+  and the buffers with unread messages (`[Act: #rust, !#norn]`). With more than
+  one network each name carries its network (`libera/#rust`).
+- **Chat lines.** A message that mentions you has a gold `▌` bar in the gutter
+  where other lines have `│`, so it is easy to find while scrolling.
+
 A netsplit shows one line per affected channel (`netsplit a.net b.net: 14 left
 (alice, bob, carol, +11 more)`) and removes those people from the nicklist; the
 matching `netjoin` line adds them back. Mode changes appear as `bob sets mode

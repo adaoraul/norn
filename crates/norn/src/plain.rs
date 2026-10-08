@@ -72,6 +72,8 @@ fn print_event(event: &UiEvent, names: &[String]) {
             }
         }
         UiEventKind::Info(text) => println!("[{net}] {text}"),
+        // Latency is shown in the TUI's status areas; line mode has none.
+        UiEventKind::Lag(_) => {}
         UiEventKind::ConnState(state) => {
             let text = match state {
                 ConnState::Connecting => "connecting...".to_string(),

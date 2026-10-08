@@ -51,6 +51,8 @@ pub fn render(event: &Event) -> Vec<String> {
         Event::Motd(lines) if lines.is_empty() => vec!["-- no message of the day".to_string()],
         Event::Motd(lines) => lines.iter().map(|l| format!("-- motd: {l}")).collect(),
         Event::ServerInfo(text) => vec![format!("-- {text}")],
+        // Latency bookkeeping, not something to print.
+        Event::Pong { .. } => Vec::new(),
         Event::ModeChanged {
             target,
             by,

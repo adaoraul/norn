@@ -166,6 +166,11 @@ pub struct Buffer {
     pub scroll: usize,
     /// Maximum lines retained (the `scrollback_lines` client setting).
     pub max_lines: usize,
+    /// A channel's flag modes, e.g. `+nt` (empty when unknown or none).
+    pub modes: String,
+    /// Whether we are in this channel. False after we part or are kicked; the
+    /// buffer stays so the scrollback can still be read.
+    pub joined: bool,
 }
 
 impl Buffer {
@@ -184,6 +189,8 @@ impl Buffer {
             history_exhausted: false,
             scroll: 0,
             max_lines,
+            modes: String::new(),
+            joined: true,
         }
     }
 
@@ -530,6 +537,8 @@ pub struct App {
     /// Networks whose server echoes our own messages (`echo-message`); on the
     /// rest we echo locally.
     pub echo_nets: HashSet<NetworkId>,
+    /// The latest PING round-trip time per network.
+    pub lag: std::collections::HashMap<NetworkId, std::time::Duration>,
 }
 
 impl App {
@@ -594,6 +603,7 @@ impl App {
             pending_switch: None,
             pending_names: HashSet::new(),
             echo_nets: HashSet::new(),
+            lag: std::collections::HashMap::new(),
         }
     }
 
@@ -692,6 +702,9 @@ impl App {
                 self.buffers[i].push(event_line(text));
             }
             UiEventKind::Engine(engine_event) => self.apply_engine(event.net, engine_event),
+            UiEventKind::Lag(lag) => {
+                self.lag.insert(event.net, lag);
+            }
         }
     }
 
@@ -712,6 +725,10 @@ impl App {
             ConnState::Disconnected => "disconnected".to_string(),
             ConnState::Closed => "connection closed".to_string(),
         };
+        // A measurement from a dead connection says nothing about the next one.
+        if !matches!(state, ConnState::Registered { .. }) {
+            self.lag.remove(&net);
+        }
         self.networks[net].state = state;
         let i = self.server_buffer(net);
         self.buffers[i].push(event_line(text));
@@ -872,6 +889,9 @@ impl App {
                     .networks
                     .get(net)
                     .is_some_and(|m| m.my_nick.eq_ignore_ascii_case(&who.nick));
+                if ours {
+                    self.buffers[idx].joined = true;
+                }
                 if ours
                     && self
                         .pending_switch
@@ -914,6 +934,15 @@ impl App {
                     self.buffers[idx]
                         .members
                         .retain(|m| !m.nick.eq_ignore_ascii_case(&who.nick));
+                    // Leaving (or being kicked) ourselves keeps the buffer but
+                    // marks it as no longer joined.
+                    let me = self
+                        .networks
+                        .get(net)
+                        .is_some_and(|m| m.my_nick.eq_ignore_ascii_case(&who.nick));
+                    if me {
+                        self.buffers[idx].joined = false;
+                    }
                     self.buffers[idx].push(event_line(text));
                 }
             }
@@ -1050,6 +1079,10 @@ impl App {
                         }
                     }
                 }
+                if self.buffers[idx].kind == BufferKind::Channel {
+                    let current = std::mem::take(&mut self.buffers[idx].modes);
+                    self.buffers[idx].modes = apply_flag_modes(&current, &modes);
+                }
                 self.buffers[idx].push(event_line(text));
             }
             Event::ChannelModes { target, modes } => {
@@ -1057,6 +1090,11 @@ impl App {
                     Some(i) => i,
                     None => self.server_buffer(net),
                 };
+                if self.buffers[idx].kind == BufferKind::Channel {
+                    // "+ntk secret": the flags are the first word.
+                    let flags = modes.split_whitespace().next().unwrap_or("");
+                    self.buffers[idx].modes = apply_flag_modes("", flags);
+                }
                 self.buffers[idx].push(event_line(format!("modes for {target}: {modes}")));
             }
             // A split is one line per affected channel, not one quit per user.
@@ -2025,6 +2063,33 @@ pub(crate) fn mentions(text: &str, nick: &str) -> bool {
         .any(|word| word == nick)
 }
 
+/// Fold a mode string into a channel's displayed flag set. Only flag modes are
+/// tracked: membership prefixes (`o v h a q`) and list modes (`b e I`) are not
+/// channel state, and arguments (key, limit) are dropped, leaving just `k`/`l`.
+fn apply_flag_modes(current: &str, change: &str) -> String {
+    let mut flags: Vec<char> = current.chars().filter(|c| *c != '+').collect();
+    let mut adding = true;
+    for c in change.chars() {
+        match c {
+            '+' => adding = true,
+            '-' => adding = false,
+            'o' | 'v' | 'h' | 'a' | 'q' | 'b' | 'e' | 'I' => {}
+            c if adding => {
+                if !flags.contains(&c) {
+                    flags.push(c);
+                }
+            }
+            c => flags.retain(|f| *f != c),
+        }
+    }
+    flags.sort_unstable();
+    if flags.is_empty() {
+        String::new()
+    } else {
+        format!("+{}", flags.into_iter().collect::<String>())
+    }
+}
+
 /// "alice, bob, carol, +11 more": a short list for a bulk event.
 fn nick_summary(nicks: &[String]) -> String {
     const SHOWN: usize = 3;
@@ -2973,6 +3038,70 @@ mod tests {
             event_texts(&a.buffers[rust]),
             vec!["netjoin irc.a: 2 back (a, b)"]
         );
+    }
+
+    #[test]
+    fn flag_modes_accumulate_and_ignore_prefixes_and_lists() {
+        assert_eq!(apply_flag_modes("", "+nt"), "+nt");
+        assert_eq!(apply_flag_modes("+nt", "+k-t"), "+kn");
+        // Op/voice and ban lists are not channel state.
+        assert_eq!(apply_flag_modes("+n", "+ov-b"), "+n");
+        assert_eq!(apply_flag_modes("+n", "-n"), "");
+    }
+
+    #[test]
+    fn lag_is_recorded_and_forgotten_when_the_connection_drops() {
+        let mut a = app();
+        a.apply(UiEvent {
+            net: 0,
+            kind: UiEventKind::Lag(std::time::Duration::from_millis(120)),
+        });
+        assert_eq!(a.lag.get(&0), Some(&std::time::Duration::from_millis(120)));
+        a.apply(UiEvent {
+            net: 0,
+            kind: UiEventKind::ConnState(ConnState::Reconnecting {
+                delay: std::time::Duration::from_secs(1),
+            }),
+        });
+        assert!(!a.lag.contains_key(&0));
+    }
+
+    #[test]
+    fn parting_marks_the_channel_not_joined_until_we_rejoin() {
+        let mut a = app();
+        let rust = join_channel(&mut a, "#rust", &["me", "bob"]);
+        assert!(a.buffers[rust].joined);
+        // Someone else leaving does not change our own membership.
+        a.apply(engine(
+            0,
+            Event::MemberLeft {
+                target: "#rust".into(),
+                who: irc_engine::User::nick("bob"),
+                reason: LeaveReason::Part(String::new()),
+            },
+        ));
+        assert!(a.buffers[rust].joined);
+        a.apply(engine(
+            0,
+            Event::MemberLeft {
+                target: "#rust".into(),
+                who: irc_engine::User::nick("me"),
+                reason: LeaveReason::Kicked {
+                    by: "op".into(),
+                    reason: "bye".into(),
+                },
+            },
+        ));
+        assert!(!a.buffers[rust].joined);
+        a.apply(engine(
+            0,
+            Event::MemberJoined {
+                target: "#rust".into(),
+                who: irc_engine::User::nick("me"),
+                account: None,
+            },
+        ));
+        assert!(a.buffers[rust].joined);
     }
 
     #[test]

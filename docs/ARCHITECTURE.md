@@ -103,6 +103,7 @@ pub enum Event {
     ModeChanged { target: String, by: Option<String>, modes: String,
                   args: Vec<String>, prefix_changes: Vec<PrefixChange> },
     ChannelModes { target: String, modes: String },
+    Pong { token: String },            // caller owns the clock and times the round trip
     Disconnected(DisconnectReason),
 }
 ```

@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use irc_engine::{
     BringupMachine, ChatHistoryRequest, ChatMessage, Connection, Engine, Event, MessageKind,
@@ -26,6 +26,8 @@ pub type NetworkId = usize;
 
 /// How much scrollback to request when we join a channel.
 const HISTORY_LIMIT: usize = 50;
+/// How often we time a PING round trip to the server.
+const LAG_INTERVAL: Duration = Duration::from_secs(30);
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -66,6 +68,8 @@ pub enum UiEventKind {
     ConnState(ConnState),
     /// A human-readable notice.
     Info(String),
+    /// The latest PING round-trip time to the server.
+    Lag(Duration),
 }
 
 /// A command from the UI to a network task.
@@ -223,6 +227,11 @@ async fn run_once(
     // Auto-identify is a one-shot fallback per connection.
     let mut identified = false;
 
+    // Round-trip timing: the first tick fires at once, so lag shows up soon
+    // after registering instead of half a minute later.
+    let mut probe = LagProbe::default();
+    let mut lag_tick = tokio::time::interval(LAG_INTERVAL);
+
     loop {
         tokio::select! {
             incoming = conn.recv() => {
@@ -230,12 +239,16 @@ async fn run_once(
                     Some(msg) => {
                         on_message(
                             id, msg, &mut engine, &mut conn, &mut my_nick, settings,
-                            authenticated, &mut identified, ui_tx,
+                            authenticated, &mut identified, &mut probe, ui_tx,
                         )
                         .await?
                     }
                     None => return Ok(RunOutcome::Dropped), // server closed
                 }
+            }
+            _ = lag_tick.tick() => {
+                let line = probe.next_ping(Instant::now());
+                conn.send(&line).await?;
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
@@ -276,6 +289,7 @@ async fn on_message<S>(
     settings: &NetworkSettings,
     authenticated: bool,
     identified: &mut bool,
+    probe: &mut LagProbe,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> std::io::Result<()>
 where
@@ -295,7 +309,19 @@ where
                 // Seed away state for members already gone (away-notify only
                 // reports live changes, not the state at join time).
                 conn.send(&format!("WHO {target}")).await?;
+                // Ask for the channel's current modes for the header.
+                conn.send(&format!("MODE {target}")).await?;
             }
+        }
+        // Our own PING came back: report the round trip, not the PONG itself.
+        if let Event::Pong { token } = &event {
+            if let Some(lag) = probe.reply(token, Instant::now()) {
+                let _ = ui_tx.send(UiEvent {
+                    net: id,
+                    kind: UiEventKind::Lag(lag),
+                });
+            }
+            continue;
         }
         // Follow our own nick across /nick and forced changes, so later joins
         // are still recognised as ours.
@@ -330,6 +356,37 @@ where
     Ok(())
 }
 
+/// Times PING/PONG round trips. Pure bookkeeping (the caller supplies the
+/// clock), so the engine stays sans-I/O and this stays testable.
+#[derive(Debug, Default)]
+struct LagProbe {
+    seq: u64,
+    outstanding: Option<(String, Instant)>,
+}
+
+impl LagProbe {
+    /// Start a probe at `now`; returns the line to send. An unanswered earlier
+    /// probe is dropped (a late reply to it is simply ignored).
+    fn next_ping(&mut self, now: Instant) -> String {
+        self.seq += 1;
+        let token = format!("norn-{}", self.seq);
+        self.outstanding = Some((token.clone(), now));
+        format!("PING :{token}")
+    }
+
+    /// Match a PONG token against the outstanding probe. `Some(round trip)`
+    /// when it is ours, `None` for anything else (including a stale token).
+    fn reply(&mut self, token: &str, now: Instant) -> Option<Duration> {
+        let (expected, sent) = self.outstanding.as_ref()?;
+        if expected != token {
+            return None;
+        }
+        let lag = now.saturating_duration_since(*sent);
+        self.outstanding = None;
+        Some(lag)
+    }
+}
+
 /// Whether a message is a NickServ NOTICE asking us to identify.
 fn is_identify_prompt(chat: &ChatMessage) -> bool {
     if chat.kind != MessageKind::Notice {
@@ -360,6 +417,29 @@ mod tests {
             text: text.into(),
             kind: MessageKind::Notice,
         }
+    }
+
+    #[test]
+    fn lag_probe_times_the_matching_reply() {
+        let mut probe = LagProbe::default();
+        let t0 = Instant::now();
+        assert_eq!(probe.next_ping(t0), "PING :norn-1");
+        let lag = probe.reply("norn-1", t0 + Duration::from_millis(250));
+        assert_eq!(lag, Some(Duration::from_millis(250)));
+        // Answered once; a duplicate reply is not a second measurement.
+        assert_eq!(probe.reply("norn-1", t0 + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn lag_probe_ignores_foreign_and_stale_tokens() {
+        let mut probe = LagProbe::default();
+        let t0 = Instant::now();
+        probe.next_ping(t0);
+        assert_eq!(probe.reply("something-else", t0), None);
+        // A new probe supersedes the unanswered one.
+        assert_eq!(probe.next_ping(t0), "PING :norn-2");
+        assert_eq!(probe.reply("norn-1", t0), None);
+        assert!(probe.reply("norn-2", t0).is_some());
     }
 
     #[test]

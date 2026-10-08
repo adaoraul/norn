@@ -121,31 +121,41 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
                     .buffers
                     .get(app.active)
                     .is_some_and(|b| b.kind == BufferKind::Status);
-                let fg = if active { theme::BRIGHT } else { theme::DIM2 };
                 lines.push(sidebar_row(
                     app.accent,
-                    active,
-                    "norn",
-                    "",
-                    fg,
-                    theme::DIM2,
+                    &SidebarCell {
+                        active,
+                        lead: None,
+                        label: "norn",
+                        fg: if active { theme::BRIGHT } else { theme::DIM2 },
+                        badge: String::new(),
+                        badge_style: Style::default(),
+                    },
                     inner_w,
                 ));
             }
-            // The network name header is the server/status buffer's entry.
+            // The network header is the server buffer's entry, led by a glyph
+            // for the connection state and followed by the lag when it is high.
             SidebarRow::Network(net_id) => {
                 let active = app
                     .buffers
                     .get(app.active)
                     .is_some_and(|b| b.net == net_id && b.kind == BufferKind::Server);
-                let fg = if active { theme::BRIGHT } else { theme::DIM2 };
+                let (glyph, glyph_fg) = state_glyph(&app.networks[net_id].state);
+                let badge = match app.lag.get(&net_id) {
+                    Some(lag) if lag.as_millis() >= 1000 => format!(" {}", format_lag(*lag)),
+                    _ => String::new(),
+                };
                 lines.push(sidebar_row(
                     app.accent,
-                    active,
-                    &app.networks[net_id].name.to_uppercase(),
-                    "",
-                    fg,
-                    theme::DIM2,
+                    &SidebarCell {
+                        active,
+                        lead: Some((glyph, glyph_fg)),
+                        label: &app.networks[net_id].name.to_uppercase(),
+                        fg: if active { theme::BRIGHT } else { theme::DIM2 },
+                        badge,
+                        badge_style: Style::default().fg(theme::GOLD),
+                    },
                     inner_w,
                 ));
             }
@@ -156,36 +166,58 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
                     BufferKind::Query => format!("@ {}", buffer.name),
                     _ => buffer.name.clone(),
                 };
-                let badge = if buffer.unread > 0 {
-                    format!(" {}", buffer.unread)
+                // A mention reads `!N` in bold gold; plain unread is just `N`.
+                // The `!` carries the meaning, so it survives without colour.
+                let (badge, badge_style) = if buffer.unread == 0 {
+                    (String::new(), Style::default())
+                } else if buffer.mentioned {
+                    (
+                        format!(" !{}", buffer.unread),
+                        Style::default()
+                            .fg(theme::GOLD)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
-                    String::new()
+                    (
+                        format!(" {}", buffer.unread),
+                        Style::default().fg(theme::TEXT),
+                    )
                 };
                 let fg = if active {
                     theme::BRIGHT
                 } else if buffer.kind == BufferKind::Query {
                     theme::nick_color(&buffer.name)
-                } else {
+                } else if buffer.joined {
                     theme::TEXT
-                };
-                let badge_fg = if buffer.mentioned || buffer.unread > 2 {
-                    theme::GOLD
                 } else {
+                    // Parted/kicked: still readable, but visibly not live.
                     theme::DIM2
                 };
                 lines.push(sidebar_row(
-                    app.accent, active, &label, &badge, fg, badge_fg, inner_w,
+                    app.accent,
+                    &SidebarCell {
+                        active,
+                        lead: None,
+                        label: &label,
+                        fg,
+                        badge,
+                        badge_style,
+                    },
+                    inner_w,
                 ));
             }
             // A defined network with no live connection: dim, click to connect.
             SidebarRow::Idle(def) => {
                 lines.push(sidebar_row(
                     app.accent,
-                    false,
-                    &app.definitions[def].name.to_uppercase(),
-                    " ○",
-                    theme::DIM2,
-                    theme::DIM2,
+                    &SidebarCell {
+                        active: false,
+                        lead: Some(("○", theme::DIM2)),
+                        label: &app.definitions[def].name.to_uppercase(),
+                        fg: theme::DIM2,
+                        badge: String::new(),
+                        badge_style: Style::default(),
+                    },
                     inner_w,
                 ));
             }
@@ -236,41 +268,94 @@ pub fn sidebar_rows(app: &App) -> Vec<SidebarRow> {
     rows
 }
 
-/// Build one sidebar row: an accent bar, a padded label, and a right badge, with
-/// a full-width active-row background.
-#[allow(clippy::too_many_arguments)]
-fn sidebar_row(
-    accent: ratatui::style::Color,
+/// What one sidebar row shows.
+struct SidebarCell<'a> {
+    /// Whether this is the active buffer (accent bar and highlight).
     active: bool,
-    label: &str,
-    badge: &str,
+    /// An optional leading glyph and its colour (connection state).
+    lead: Option<(&'a str, ratatui::style::Color)>,
+    /// The row's text.
+    label: &'a str,
+    /// The label colour.
     fg: ratatui::style::Color,
-    badge_fg: ratatui::style::Color,
-    inner_w: usize,
-) -> Line<'static> {
-    // Layout: accent bar (1) + a space + label + padding + badge.
-    let name_w = inner_w.saturating_sub(2 + badge.width());
-    let name = truncate(label, name_w);
-    let pad = " ".repeat(name_w.saturating_sub(name.width()));
-    let bg = if active {
+    /// Right-aligned text (unread count, lag); empty for none.
+    badge: String,
+    /// How the badge is drawn.
+    badge_style: Style,
+}
+
+/// Build one sidebar row: an accent bar, an optional state glyph, a padded
+/// label, and a right badge, with a full-width active-row background.
+fn sidebar_row(accent: ratatui::style::Color, cell: &SidebarCell, inner_w: usize) -> Line<'static> {
+    let bg = if cell.active {
         theme::ACTIVE_BG
     } else {
         theme::PANEL
     };
-    let bar = if active { "▎" } else { " " };
-    Line::from(vec![
+    let bar = if cell.active { "▎" } else { " " };
+    // Layout: accent bar (1) + a space + [glyph + space] + label + padding + badge.
+    let lead_w = cell.lead.map_or(0, |(g, _)| g.width() + 1);
+    let name_w = inner_w.saturating_sub(2 + lead_w + cell.badge.width());
+    let name = truncate(cell.label, name_w);
+    let pad = " ".repeat(name_w.saturating_sub(name.width()));
+    let mut spans = vec![
         Span::styled(bar, Style::default().fg(accent).bg(bg)),
-        Span::styled(format!(" {name}{pad}"), Style::default().fg(fg).bg(bg)),
-        Span::styled(badge.to_string(), Style::default().fg(badge_fg).bg(bg)),
-    ])
+        Span::styled(" ", Style::default().bg(bg)),
+    ];
+    if let Some((glyph, glyph_fg)) = cell.lead {
+        spans.push(Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(glyph_fg).bg(bg),
+        ));
+    }
+    spans.push(Span::styled(
+        format!("{name}{pad}"),
+        Style::default().fg(cell.fg).bg(bg),
+    ));
+    spans.push(Span::styled(cell.badge.clone(), cell.badge_style.bg(bg)));
+    Line::from(spans)
+}
+
+/// The glyph and colour for a connection state. The shape differs per state, so
+/// the meaning does not depend on colour alone.
+fn state_glyph(state: &ConnState) -> (&'static str, ratatui::style::Color) {
+    match state {
+        ConnState::Registered { .. } => ("●", theme::GOLD),
+        ConnState::Connecting | ConnState::Reconnecting { .. } => ("◐", theme::ACCENT),
+        ConnState::Disconnected => ("○", theme::DIM2),
+        ConnState::Closed => ("✕", theme::RED),
+    }
+}
+
+/// A round-trip time for display: `0.3s`, `2.1s`, `15s`.
+fn format_lag(lag: std::time::Duration) -> String {
+    let secs = lag.as_secs_f64();
+    if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{secs:.0}s")
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let buffer = app.active_buffer();
-    let title = match buffer.kind {
-        BufferKind::Server => app.networks[buffer.net].name.clone(),
-        _ => buffer.name.clone(),
+    // `network · #channel +nt`, so the network is never ambiguous when several
+    // are open; the console and status buffers stand alone.
+    let net_name = app.networks.get(buffer.net).map(|n| n.name.as_str());
+    let mut title = match (buffer.kind, net_name) {
+        (BufferKind::Server, Some(net)) => net.to_string(),
+        (BufferKind::Status, _) | (_, None) => buffer.name.clone(),
+        (_, Some(net)) => format!("{net} · {}", buffer.name),
     };
+    if buffer.kind == BufferKind::Channel {
+        if !buffer.modes.is_empty() {
+            title.push(' ');
+            title.push_str(&buffer.modes);
+        }
+        if !buffer.joined {
+            title.push_str(" (not joined)");
+        }
+    }
     let right = if buffer.kind == BufferKind::Channel {
         format!("{} nicks · F9", buffer.members.len())
     } else {
@@ -425,7 +510,13 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
                 pad_left(&gutter_nick, NICK_COL),
                 Style::default().fg(nick_color),
             ));
-            spans.push(Span::styled(" │ ", Style::default().fg(theme::FAINT)));
+            // A line that mentions us gets a gold bar in the gutter, so it can
+            // be found while scrolling without relying on the highlight colour.
+            if mention_nick.is_some() {
+                spans.push(Span::styled(" ▌ ", Style::default().fg(theme::GOLD)));
+            } else {
+                spans.push(Span::styled(" │ ", Style::default().fg(theme::FAINT)));
+            }
         } else {
             spans.push(Span::raw(" ".repeat(pw)));
         }
@@ -580,21 +671,55 @@ fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_activity(f: &mut Frame, area: Rect, app: &App, lines_above: usize) {
-    let act: Vec<&str> = app
-        .buffers
-        .iter()
-        .filter(|b| b.unread > 0)
-        .map(|b| b.name.as_str())
-        .collect();
+    let buffer = app.active_buffer();
     let mut spans = vec![Span::styled(
         format!(" {} ", app.my_nick()),
         Style::default().fg(theme::BRIGHT2),
     )];
-    if !act.is_empty() {
+    let meta = app.networks.get(buffer.net);
+    if meta.is_some_and(|m| m.away) {
+        spans.push(Span::styled("[away] ", Style::default().fg(theme::GOLD)));
+    }
+    if let Some(lag) = app.lag.get(&buffer.net) {
         spans.push(Span::styled(
-            format!("[Act: {}]", act.join(", ")),
-            Style::default().fg(theme::GOLD),
+            format!("lag {} ", format_lag(*lag)),
+            Style::default().fg(theme::DIM2),
         ));
+    }
+    // Buffers with unread messages. With several networks the name carries the
+    // network (`libera/#rust`); a mention gets a `!`, so it stands out without
+    // relying on colour.
+    let qualify = app.networks.len() > 1;
+    let active: Vec<(String, bool)> = app
+        .buffers
+        .iter()
+        .filter(|b| b.unread > 0)
+        .map(|b| {
+            let name = match app.networks.get(b.net) {
+                Some(n) if qualify => format!("{}/{}", n.name, b.name),
+                _ => b.name.clone(),
+            };
+            (name, b.mentioned)
+        })
+        .collect();
+    if !active.is_empty() {
+        spans.push(Span::styled("[Act: ", Style::default().fg(theme::TEXT)));
+        for (i, (name, mentioned)) in active.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(", ", Style::default().fg(theme::TEXT)));
+            }
+            if *mentioned {
+                spans.push(Span::styled(
+                    format!("!{name}"),
+                    Style::default()
+                        .fg(theme::GOLD)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(name.clone(), Style::default().fg(theme::TEXT)));
+            }
+        }
+        spans.push(Span::styled("]", Style::default().fg(theme::TEXT)));
     }
 
     let mut left_line = Line::from(spans);
@@ -1063,9 +1188,7 @@ fn draw_networks_list(f: &mut Frame, area: Rect, app: &App, focused: bool) {
     for (i, cfg) in app.definitions.iter().enumerate() {
         let selected = i == app.networks_ui.sel;
         let (marker, marker_fg) = match app.network_live_state(&cfg.name) {
-            Some(ConnState::Registered { .. }) => ("●", theme::GOLD),
-            Some(ConnState::Connecting | ConnState::Reconnecting { .. }) => ("◐", theme::ACCENT),
-            Some(_) => ("○", theme::DIM2),
+            Some(state) => state_glyph(&state),
             None => ("·", theme::DIM2),
         };
         let bg = if selected && focused {
@@ -2112,6 +2235,176 @@ mod tests {
             Default::default(),
             None,
         )
+    }
+
+    fn draw_text(app: &App, w: u16, h: u16) -> (ratatui::buffer::Buffer, String) {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text = buffer_text(&buf);
+        (buf, text)
+    }
+
+    fn engine(app: &mut App, event: Event) {
+        app.apply(UiEvent {
+            net: 0,
+            kind: UiEventKind::Engine(event),
+        });
+    }
+
+    /// The text of the first screen row containing `needle`.
+    fn row_with<'a>(text: &'a str, needle: &str) -> &'a str {
+        text.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no row containing {needle:?} in:\n{text}"))
+    }
+
+    #[test]
+    fn sidebar_network_row_shows_a_state_glyph_per_state() {
+        let mut app = one_net_app();
+        let (_, text) = draw_text(&app, 80, 20);
+        assert!(row_with(&text, "LIBERA").contains("● LIBERA"), "registered");
+        app.networks[0].state = ConnState::Connecting;
+        let (_, text) = draw_text(&app, 80, 20);
+        assert!(row_with(&text, "LIBERA").contains("◐ LIBERA"), "connecting");
+        app.networks[0].state = ConnState::Disconnected;
+        let (_, text) = draw_text(&app, 80, 20);
+        assert!(
+            row_with(&text, "LIBERA").contains("○ LIBERA"),
+            "disconnected"
+        );
+        app.networks[0].state = ConnState::Closed;
+        let (_, text) = draw_text(&app, 80, 20);
+        assert!(row_with(&text, "LIBERA").contains("✕ LIBERA"), "closed");
+    }
+
+    #[test]
+    fn lag_is_shown_in_the_sidebar_only_when_high_and_always_in_the_activity_bar() {
+        let mut app = one_net_app();
+        app.lag.insert(0, std::time::Duration::from_millis(300));
+        let (_, text) = draw_text(&app, 80, 20);
+        assert!(
+            !row_with(&text, "LIBERA").contains("0.3s"),
+            "low lag stays quiet"
+        );
+        assert!(text.contains("lag 0.3s"), "activity bar has it: {text}");
+        app.lag.insert(0, std::time::Duration::from_millis(2100));
+        let (_, text) = draw_text(&app, 80, 20);
+        assert!(
+            row_with(&text, "LIBERA").contains("2.1s"),
+            "high lag is flagged"
+        );
+    }
+
+    #[test]
+    fn unread_badges_tell_mentions_from_plain_unread() {
+        let mut app = one_net_app();
+        engine(&mut app, Event::MessageReceived(chat("#quiet", "a", "hi")));
+        engine(&mut app, Event::MessageReceived(chat("#quiet", "a", "hi")));
+        engine(&mut app, Event::MessageReceived(chat("#quiet", "a", "hi")));
+        engine(
+            &mut app,
+            Event::MessageReceived(chat("#loud", "b", "hey svan")),
+        );
+        let (buf, text) = draw_text(&app, 80, 20);
+        // Three ordinary messages are just a count; one mention gets the `!`.
+        // (Only the sidebar's 23 columns: the rest of the row is the chat pane.)
+        let sidebar = |needle: &str| -> String {
+            row_with(&text, needle).chars().take(23).collect::<String>()
+        };
+        assert!(sidebar("#quiet").trim_end().ends_with(" 3"), "{text}");
+        assert!(sidebar("#loud").contains("!1"), "{text}");
+        // The mention badge is bold gold.
+        let y = text.lines().position(|l| l.contains("#loud")).unwrap() as u16;
+        let x = (0..buf.area.width)
+            .find(|x| buf[(*x, y)].symbol() == "!")
+            .unwrap();
+        assert_eq!(buf[(x, y)].fg, theme::GOLD);
+        assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn header_names_the_network_modes_and_membership() {
+        let mut app = one_net_app();
+        engine(
+            &mut app,
+            Event::NamesLoaded {
+                target: "#rust".into(),
+                members: Vec::new(),
+            },
+        );
+        engine(
+            &mut app,
+            Event::ChannelModes {
+                target: "#rust".into(),
+                modes: "+ntk secret".into(),
+            },
+        );
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        let (_, text) = draw_text(&app, 100, 20);
+        let header = text.lines().next().unwrap();
+        assert!(header.contains("libera · #rust +knt"), "{header}");
+        assert!(!header.contains("not joined"));
+        // Parting ourselves keeps the buffer but says so.
+        engine(
+            &mut app,
+            Event::MemberLeft {
+                target: "#rust".into(),
+                who: irc_engine::User::nick("svan"),
+                reason: irc_engine::LeaveReason::Part(String::new()),
+            },
+        );
+        let (_, text) = draw_text(&app, 100, 20);
+        assert!(text.lines().next().unwrap().contains("(not joined)"));
+    }
+
+    #[test]
+    fn activity_bar_qualifies_names_and_marks_mentions() {
+        let mut app = one_net_app();
+        engine(&mut app, Event::MessageReceived(chat("#quiet", "a", "hi")));
+        engine(
+            &mut app,
+            Event::MessageReceived(chat("#loud", "b", "hey svan")),
+        );
+        app.networks[0].away = true;
+        let (_, text) = draw_text(&app, 100, 20);
+        let bar = row_with(&text, "[Act:");
+        assert!(bar.contains("[away]"), "{bar}");
+        assert!(bar.contains("[Act: #quiet, !#loud]"), "{bar}");
+        // A second network makes the names carry their network.
+        app.networks.push(NetworkMeta {
+            name: "oftc".into(),
+            my_nick: "svan".into(),
+            state: ConnState::Disconnected,
+            away: false,
+            account: None,
+        });
+        let (_, text) = draw_text(&app, 100, 20);
+        assert!(row_with(&text, "[Act:").contains("libera/#quiet"));
+    }
+
+    #[test]
+    fn mention_lines_get_a_gold_gutter_bar() {
+        let mut app = one_net_app();
+        engine(
+            &mut app,
+            Event::MessageReceived(chat("#rust", "bob", "hey svan")),
+        );
+        engine(
+            &mut app,
+            Event::MessageReceived(chat("#rust", "bob", "plain")),
+        );
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        let (buf, text) = draw_text(&app, 100, 20);
+        assert!(row_with(&text, "hey svan").contains("▌"), "{text}");
+        assert!(!row_with(&text, "plain").contains("▌"));
+        let y = text.lines().position(|l| l.contains("hey svan")).unwrap() as u16;
+        let x = (0..buf.area.width)
+            .find(|x| buf[(*x, y)].symbol() == "▌")
+            .unwrap();
+        assert_eq!(buf[(x, y)].fg, theme::GOLD);
     }
 
     #[test]

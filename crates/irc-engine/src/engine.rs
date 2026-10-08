@@ -110,6 +110,15 @@ impl Engine {
         if self.handle_server_numeric(msg, events) {
             return;
         }
+        // PONG: `:server PONG <server> :<token>`. The token is the last param.
+        if matches!(&msg.command, Command::Named(name) if name == "PONG") {
+            if let Some(token) = msg.params.last() {
+                events.push(Event::Pong {
+                    token: token.clone(),
+                });
+            }
+            return;
+        }
         // Standard replies (rule 15) take precedence over chat interpretation.
         if let Some(reply) = StandardReply::from_message(msg) {
             events.push(Event::StandardReply(reply));
@@ -1064,6 +1073,24 @@ mod tests {
         };
         assert_eq!(prefix_changes[0].nick, "carol");
         assert!(!prefix_changes[0].granted);
+    }
+
+    #[test]
+    fn pong_carries_its_token_back() {
+        let mut e = Engine::new();
+        assert_eq!(
+            feed(&mut e, ":irc.example PONG irc.example :norn-7"),
+            vec![Event::Pong {
+                token: "norn-7".into()
+            }]
+        );
+        // A bare `PONG :token` (no server param) works too.
+        assert_eq!(
+            feed(&mut e, "PONG :norn-8"),
+            vec![Event::Pong {
+                token: "norn-8".into()
+            }]
+        );
     }
 
     #[test]

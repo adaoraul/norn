@@ -272,6 +272,12 @@ pub enum Event {
         /// The membership-prefix changes this implies (op, voice, ...).
         prefix_changes: Vec<PrefixChange>,
     },
+    /// The server answered one of our `PING`s. The caller owns the clock: it
+    /// matches `token` against the ping it sent and times the round trip.
+    Pong {
+        /// The token echoed back.
+        token: String,
+    },
     /// A channel's current modes, from the reply to a bare `MODE #chan`.
     ChannelModes {
         /// The channel.
