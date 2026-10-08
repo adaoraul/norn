@@ -203,8 +203,10 @@ pub async fn run(
 
         if app.should_quit {
             quit.store(true, Ordering::SeqCst);
+            // No reason given: the network task falls back to its default.
+            let reason = app.quit_reason.take();
             for tx in &cmd_txs {
-                let _ = tx.send(NetCommand::Quit(Some("norn".to_string())));
+                let _ = tx.send(NetCommand::Quit(reason.clone()));
             }
             break;
         }

@@ -3,9 +3,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::state::{
-    network_field_value, App, AppAction, BufferKind, Completion, Mode, NetFieldKind, NetworksFocus,
-    Switcher, NETWORK_FIELDS,
+    check_dialable, network_field_value, App, AppAction, BufferKind, Completion, Mode,
+    NetFieldKind, NetworksFocus, Switcher, NETWORK_FIELDS,
 };
+use super::view::{sidebar_rows, SidebarRow};
 use crate::session::NetCommand;
 
 /// Width of the sidebar column.
@@ -22,9 +23,7 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) 
             // Sidebar and nicklist span the full height; out-of-range rows map to
             // None, so no vertical guard is needed.
             if event.column < SIDEBAR_W {
-                if let Some(idx) = sidebar_buffer_at(app, event.row) {
-                    app.switch_to(idx);
-                }
+                click_sidebar_row(app, event.row);
             } else if app.nicklist_visible
                 && app.active_buffer().kind == BufferKind::Channel
                 && event.column >= width.saturating_sub(NICKLIST_W)
@@ -42,38 +41,38 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) 
     Vec::new()
 }
 
-/// Which buffer index is at sidebar row `y` (matches `view::draw_sidebar`).
-/// Row 0 is the console; each network header row selects that network's server
-/// buffer, followed by its channels/queries.
-fn sidebar_buffer_at(app: &App, y: u16) -> Option<usize> {
-    let mut row = 0u16;
-    // Row 0: the global console.
-    if y == row {
-        return app
-            .buffers
-            .iter()
-            .position(|b| b.kind == BufferKind::Status);
-    }
-    row += 1;
-    for net_id in 0..app.networks.len() {
-        if row == y {
-            return app
+/// Act on a click at sidebar row `y`, using the same rows the sidebar draws:
+/// switch to a buffer, or connect an idle network.
+fn click_sidebar_row(app: &mut App, y: u16) {
+    let Some(row) = sidebar_rows(app).get(y as usize).copied() else {
+        return;
+    };
+    match row {
+        SidebarRow::Console => {
+            if let Some(idx) = app
                 .buffers
                 .iter()
-                .position(|b| b.net == net_id && b.kind == BufferKind::Server);
+                .position(|b| b.kind == BufferKind::Status)
+            {
+                app.switch_to(idx);
+            }
         }
-        row += 1;
-        for (idx, buffer) in app.buffers.iter().enumerate() {
-            if buffer.net != net_id || buffer.kind == BufferKind::Server {
-                continue;
+        SidebarRow::Network(net_id) => {
+            if let Some(idx) = app
+                .buffers
+                .iter()
+                .position(|b| b.net == net_id && b.kind == BufferKind::Server)
+            {
+                app.switch_to(idx);
             }
-            if row == y {
-                return Some(idx);
+        }
+        SidebarRow::Buffer(idx) => app.switch_to(idx),
+        SidebarRow::Idle(def) => {
+            if let Some(name) = app.definitions.get(def).map(|d| d.name.clone()) {
+                app.connect_network(&name);
             }
-            row += 1;
         }
     }
-    None
 }
 
 /// Which nick is at nicklist row `y` (row 0 is the count header).
@@ -511,10 +510,17 @@ fn adjust_selected_network_field(app: &mut App) {
 /// Connect the network on the selected list row.
 fn connect_selected_network(app: &mut App) {
     let sel = app.networks_ui.sel;
-    if let Some(name) = app.definitions.get(sel).map(|c| c.name.clone()) {
-        app.connect_network(&name);
-        app.networks_ui.msg = Some(format!("connecting to {name}..."));
+    let Some(config) = app.definitions.get(sel) else {
+        return;
+    };
+    let name = config.name.clone();
+    // Report a blocker in the panel itself, where the user is looking.
+    if let Err(err) = check_dialable(config) {
+        app.networks_ui.msg = Some(err);
+        return;
     }
+    app.connect_network(&name);
+    app.networks_ui.msg = Some(format!("connecting to {name}..."));
 }
 
 /// Disconnect the network on the selected list row.
@@ -740,14 +746,56 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
         return Vec::new();
     }
 
-    let mut current = target;
+    let mut current = target.clone();
     let result = crate::input::translate(text, &mut current);
     if let Some(feedback) = result.feedback {
         app.push_active_event(feedback);
     }
     if result.quit {
         app.should_quit = true;
+        app.quit_reason = result.quit_reason;
         return Vec::new();
+    }
+    if result.lines.is_empty() {
+        return Vec::new();
+    }
+
+    // Lines for a network that cannot take them would vanish without a trace.
+    let net = app.active_buffer().net;
+    if let Err(why) = app.send_ready(net) {
+        app.push_active_event(why);
+        return Vec::new();
+    }
+
+    let verb = text
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match verb.as_str() {
+        // /join shows the channel once the server confirms we are in it.
+        "join" | "j" => {
+            if let Some(channel) = current.filter(|c| Some(c) != target.as_ref()) {
+                app.pending_switch = Some((net, channel));
+            }
+        }
+        // /names prints the list instead of only refreshing the nicklist.
+        "names" => {
+            let channel = text
+                .split_whitespace()
+                .nth(1)
+                .map(str::to_string)
+                .or(target);
+            if let Some(channel) = channel {
+                app.pending_names
+                    .insert((net, channel.to_ascii_lowercase()));
+            }
+        }
+        _ => {}
+    }
+    for out in &result.outgoing {
+        app.echo_local(net, out);
     }
     result.lines.into_iter().map(NetCommand::Raw).collect()
 }
@@ -1644,7 +1692,7 @@ mod tests {
         let nets = vec![NetworkMeta {
             name: "net".into(),
             my_nick: "me".into(),
-            state: ConnState::Connecting,
+            state: ConnState::Registered { nick: "me".into() },
             away: false,
             account: None,
         }];
@@ -2447,6 +2495,151 @@ mod tests {
         run_line(&mut app, "/plugins install nope");
         assert!(!dir.join("plugins/nope.rhai").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn last_event_text(app: &App) -> String {
+        app.active_buffer()
+            .lines
+            .iter()
+            .rev()
+            .find_map(|l| match l {
+                crate::tui::state::Line::Event { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn engine_event(app: &mut App, event: irc_engine::Event) {
+        app.apply(crate::session::UiEvent {
+            net: 0,
+            kind: crate::session::UiEventKind::Engine(event),
+        });
+    }
+
+    #[test]
+    fn irc_command_on_the_console_explains_itself() {
+        let mut app = app_with_channel();
+        app.switch_to(0);
+        let out = run_line(&mut app, "/join #x");
+        assert!(out.is_empty());
+        assert!(last_event_text(&app).contains("not on a network"));
+    }
+
+    #[test]
+    fn irc_command_on_an_unconnected_network_explains_itself() {
+        let mut app = app_with_channel();
+        app.networks[0].state = ConnState::Disconnected;
+        let out = run_line(&mut app, "hello");
+        assert!(out.is_empty());
+        assert!(last_event_text(&app).contains("net is not connected (/connect net)"));
+    }
+
+    #[test]
+    fn quit_keeps_its_reason() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/quit gone fishing");
+        assert!(app.should_quit);
+        assert_eq!(app.quit_reason.as_deref(), Some("gone fishing"));
+        let mut bare = app_with_channel();
+        run_line(&mut bare, "/quit");
+        assert_eq!(bare.quit_reason, None);
+    }
+
+    #[test]
+    fn join_switches_to_the_channel_once_the_server_confirms() {
+        let mut app = app_with_channel();
+        let out = run_line(&mut app, "/join #new");
+        assert_eq!(out, vec![NetCommand::Raw("JOIN #new".to_string())]);
+        assert_eq!(app.active_buffer().name, "#rust", "not before the JOIN");
+        engine_event(
+            &mut app,
+            irc_engine::Event::MemberJoined {
+                target: "#new".into(),
+                who: irc_engine::User::nick("me"),
+                account: None,
+            },
+        );
+        assert_eq!(app.active_buffer().name, "#new");
+    }
+
+    #[test]
+    fn msg_echoes_locally_only_without_echo_message() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/msg bob hi there");
+        // Local echo opens bob's query in the background and shows the line.
+        assert_eq!(app.active_buffer().name, "#rust");
+        let bob = app.buffers.iter().find(|b| b.name == "bob").unwrap();
+        assert!(matches!(
+            bob.lines.last(),
+            Some(crate::tui::state::Line::Chat { nick, text, .. }) if nick == "me" && text == "hi there"
+        ));
+
+        let mut echoing = app_with_channel();
+        echoing.echo_nets.insert(0);
+        run_line(&mut echoing, "/msg bob hi there");
+        assert!(echoing.buffers.iter().all(|b| b.name != "bob"));
+    }
+
+    #[test]
+    fn plain_text_is_echoed_locally_without_counting_unread() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "hello");
+        let chan = app.active_buffer();
+        assert_eq!(chan.unread, 0);
+        assert!(matches!(
+            chan.lines.last(),
+            Some(crate::tui::state::Line::Chat { nick, text, .. }) if nick == "me" && text == "hello"
+        ));
+    }
+
+    #[test]
+    fn names_prints_the_member_list_without_creating_a_buffer() {
+        let mut app = app_with_channel();
+        let before = app.buffers.len();
+        run_line(&mut app, "/names #elsewhere");
+        engine_event(
+            &mut app,
+            irc_engine::Event::NamesLoaded {
+                target: "#elsewhere".into(),
+                members: vec![
+                    irc_engine::Member {
+                        nick: "ann".into(),
+                        prefixes: vec![irc_engine::MemberPrefix::Op],
+                        away: false,
+                    },
+                    nick_member("ben"),
+                ],
+            },
+        );
+        assert_eq!(last_event_text(&app), "names #elsewhere (2): @ann ben");
+        assert_eq!(app.buffers.len(), before);
+    }
+
+    #[test]
+    fn connecting_a_network_with_no_host_is_refused() {
+        let mut app = app_with_channel();
+        // The /networks "add" row creates a definition with an empty host.
+        app.add_network_definition();
+        run_line(&mut app, "/connect new-network");
+        assert_eq!(app.networks.len(), 1, "no slot allocated");
+        assert!(app.actions.is_empty());
+        assert!(last_event_text(&app).contains("no host yet"));
+    }
+
+    #[test]
+    fn idle_definitions_show_in_the_sidebar_and_connect_on_click() {
+        use crate::tui::view::{sidebar_rows, SidebarRow};
+        let mut app = app_with_channel();
+        run_line(
+            &mut app,
+            "/network add libera host=irc.libera.chat nick=svan",
+        );
+        let rows = sidebar_rows(&app);
+        assert_eq!(rows.last(), Some(&SidebarRow::Idle(0)));
+        // Rows: console, net, #rust, then the idle definition.
+        let click = MouseEventKind::Down(MouseButton::Left);
+        handle_mouse(&mut app, mouse(click, 5, 3), 100, 24);
+        assert_eq!(app.networks.len(), 2, "clicking dialled the definition");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! TUI application state and engine-event routing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::Local;
@@ -507,6 +507,17 @@ pub struct App {
     pub bell: bool,
     /// Set when the app should exit.
     pub should_quit: bool,
+    /// The reason given to `/quit`, sent with the QUIT line.
+    pub quit_reason: Option<String>,
+    /// A channel we just asked to join; the buffer becomes active once our own
+    /// JOIN arrives.
+    pub pending_switch: Option<(NetworkId, String)>,
+    /// Channels whose next NAMES reply was asked for by `/names` and should be
+    /// printed (lowercased).
+    pub pending_names: HashSet<(NetworkId, String)>,
+    /// Networks whose server echoes our own messages (`echo-message`); on the
+    /// rest we echo locally.
+    pub echo_nets: HashSet<NetworkId>,
 }
 
 impl App {
@@ -521,7 +532,7 @@ impl App {
     ) -> Self {
         let cap = client.scrollback_lines;
         let mut console = Buffer::new(CONSOLE, "norn", BufferKind::Status, cap);
-        for line in welcome_lines(networks.is_empty()) {
+        for line in welcome_lines(networks.is_empty(), &definitions) {
             console.lines.push(event_line(line));
         }
         let mut buffers = vec![console];
@@ -567,7 +578,54 @@ impl App {
             dirty: true,
             bell: false,
             should_quit: false,
+            quit_reason: None,
+            pending_switch: None,
+            pending_names: HashSet::new(),
+            echo_nets: HashSet::new(),
         }
+    }
+
+    /// Whether commands can reach `net` right now. `Err` carries what to tell the
+    /// user (the console belongs to no network; an unregistered network drops
+    /// every line).
+    pub fn send_ready(&self, net: NetworkId) -> Result<(), String> {
+        let Some(meta) = self.networks.get(net) else {
+            return Err("not on a network; switch to one first, or /connect <name>".to_string());
+        };
+        match meta.state {
+            ConnState::Registered { .. } => Ok(()),
+            ConnState::Connecting => Err(format!("{} is still connecting", meta.name)),
+            _ => Err(format!("{0} is not connected (/connect {0})", meta.name)),
+        }
+    }
+
+    /// Show a message we sent in its buffer when the server will not echo it
+    /// back. Never counts as unread.
+    pub fn echo_local(&mut self, net: NetworkId, out: &crate::input::Outgoing) {
+        if self.echo_nets.contains(&net) {
+            return;
+        }
+        let kind = if is_channel_name(&out.target) {
+            BufferKind::Channel
+        } else {
+            BufferKind::Query
+        };
+        let idx = self.ensure_buffer(net, &out.target, kind);
+        let nick = self
+            .networks
+            .get(net)
+            .map(|m| m.my_nick.clone())
+            .unwrap_or_default();
+        self.buffers[idx].push(Line::Chat {
+            time: Some(now_hm()),
+            nick,
+            text: out.text.clone(),
+            notice: out.notice,
+            mention: false,
+            action: out.action,
+            msgid: None,
+        });
+        self.dirty = true;
     }
 
     /// The active buffer.
@@ -660,6 +718,10 @@ impl App {
                 // A message to us personally opens a query with the sender.
                 let (target, kind) = if msg.target.eq_ignore_ascii_case(&my_nick) {
                     (sender.clone(), BufferKind::Query)
+                } else if sender.eq_ignore_ascii_case(&my_nick) && !is_channel_name(&msg.target) {
+                    // The echo of a message we sent to a nick belongs in that
+                    // nick's query, not a channel buffer named after them.
+                    (msg.target.clone(), BufferKind::Query)
                 } else {
                     (msg.target.clone(), BufferKind::Channel)
                 };
@@ -728,8 +790,39 @@ impl App {
                 }
             }
             Event::NamesLoaded { target, members } => {
-                let idx = self.ensure_buffer(net, &target, BufferKind::Channel);
+                let asked = self
+                    .pending_names
+                    .remove(&(net, target.to_ascii_lowercase()));
+                if asked {
+                    let list: Vec<String> = members
+                        .iter()
+                        .map(|m| {
+                            let prefix = m.highest().map(|p| p.symbol().to_string());
+                            format!("{}{}", prefix.unwrap_or_default(), m.nick)
+                        })
+                        .collect();
+                    let text = format!("names {target} ({}): {}", list.len(), list.join(" "));
+                    let at = if self.buffers[self.active].net == net {
+                        self.active
+                    } else {
+                        self.server_buffer(net)
+                    };
+                    self.buffers[at].push(event_line(text));
+                }
+                // A NAMES for a channel we are not in must not conjure a buffer.
+                let idx = match self.buffer_index(net, &target) {
+                    Some(i) => i,
+                    None if asked => return,
+                    None => self.ensure_buffer(net, &target, BufferKind::Channel),
+                };
                 self.buffers[idx].members = members;
+            }
+            Event::CapabilitiesChanged { enabled, .. } => {
+                if enabled.contains("echo-message") {
+                    self.echo_nets.insert(net);
+                } else {
+                    self.echo_nets.remove(&net);
+                }
             }
             Event::TopicChanged {
                 target,
@@ -762,6 +855,20 @@ impl App {
                     });
                 }
                 self.buffers[idx].push(event_line(format!("{} joined {target}", who.nick)));
+                // Our own JOIN completes a /join: show that channel.
+                let ours = self
+                    .networks
+                    .get(net)
+                    .is_some_and(|m| m.my_nick.eq_ignore_ascii_case(&who.nick));
+                if ours
+                    && self
+                        .pending_switch
+                        .as_ref()
+                        .is_some_and(|(n, c)| *n == net && c.eq_ignore_ascii_case(&target))
+                {
+                    self.pending_switch = None;
+                    self.switch_to(idx);
+                }
             }
             Event::MemberLeft {
                 target,
@@ -1433,6 +1540,10 @@ impl App {
             self.push_active_event(format!("no network '{name}' (define it with /network add)"));
             return;
         };
+        if let Err(err) = check_dialable(&config) {
+            self.push_active_event(err);
+            return;
+        }
         let id = self.networks.len();
         self.networks.push(NetworkMeta {
             name: config.name.clone(),
@@ -1775,18 +1886,45 @@ pub(crate) fn mentions(text: &str, nick: &str) -> bool {
         .any(|word| word == nick)
 }
 
+/// Why a network definition cannot be dialled yet, if it cannot.
+pub fn check_dialable(config: &NetworkConfig) -> Result<(), String> {
+    if config.host.trim().is_empty() {
+        return Err(format!(
+            "{0} has no host yet; set one in /networks before connecting",
+            config.name
+        ));
+    }
+    if config.nick.trim().is_empty() {
+        return Err(format!(
+            "{0} has no nick yet; set one in /networks before connecting",
+            config.name
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `name` is a channel (vs a nick) by its leading character.
+pub fn is_channel_name(name: &str) -> bool {
+    name.starts_with(['#', '&', '+', '!'])
+}
+
 /// The console's opening lines. Point the user at the discoverable commands;
 /// when nothing is configured yet, also show the quickest path to a connection.
-fn welcome_lines(no_networks: bool) -> Vec<String> {
+fn welcome_lines(no_networks: bool, defined: &[NetworkConfig]) -> Vec<String> {
     let mut lines = vec![
         "welcome to norn".to_string(),
         "/help      browse every command (Tab also completes as you type)".to_string(),
         "/settings  configure the client (theme, timestamps, aliases, ...)".to_string(),
         "/networks  add, edit, connect, and disconnect networks".to_string(),
     ];
-    if no_networks {
+    if no_networks && defined.is_empty() {
         lines.push("no networks yet — open /networks and press Enter on the add row,".to_string());
         lines.push("or run /network add <name> host=<server> nick=<you> then /connect".to_string());
+    } else if no_networks {
+        lines.push(format!(
+            "{} network(s) defined but not connected — click one in the sidebar, or /connect <name>",
+            defined.len()
+        ));
     }
     lines
 }

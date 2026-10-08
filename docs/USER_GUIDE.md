@@ -178,6 +178,11 @@ Type commands in the input line prefixed with `/`. `/help` opens a searchable
 panel; `/help <command>` jumps to a command's details. Aliases are shown in
 parentheses.
 
+IRC commands act on the active buffer's network. On the console, or on a network
+that is not connected, norn tells you so instead of dropping the line. If the
+server does not echo your own messages back (no `echo-message`), norn shows them
+locally so your side of the conversation is always visible.
+
 ### Chat
 
 | Command                 | Summary                                                        |
@@ -191,9 +196,9 @@ parentheses.
 
 | Command                    | Summary                                            |
 | -------------------------- | -------------------------------------------------- |
-| `/join #channel` (`/j`)    | Join a channel and make it current.                |
+| `/join #channel` (`/j`)    | Join a channel; it becomes active once the server confirms. |
 | `/part [#channel]`         | Leave a channel (current if omitted).              |
-| `/names [#channel]`        | List a channel's members.                          |
+| `/names [#channel]`        | Print a channel's members in the active buffer.    |
 | `/topic [text]`            | View the topic, or set it with text.               |
 | `/kick <nick> [reason]`    | Kick a user from the current channel (needs ops).  |
 | `/mode <args>`             | Apply channel or user modes (e.g. `+o bob`).       |
@@ -231,7 +236,7 @@ parentheses.
 | `/clear`                    | Clear the active buffer's scrollback.                    |
 | `/raw <line>` (`/quote`)    | Send a raw IRC line verbatim.                            |
 | `/help [command]` (`/h`)    | Open the help panel.                                     |
-| `/quit [reason]`            | Disconnect all networks and exit.                       |
+| `/quit [reason]`            | Disconnect all networks and exit; the reason is sent as the QUIT message. |
 
 ## Keybindings
 
@@ -280,7 +285,9 @@ The sidebar lists the global console, then each network's status buffer, then it
 channels and query (PM) buffers. Commands act on the active buffer's network.
 Move around with `Alt+Left`/`Alt+Right`, `Alt+1..9`, or the `Ctrl+K` fuzzy
 switcher. `/join`, `/query`, `/part`, and `/close` open and close buffers. The
-console and network status buffers cannot be closed.
+console and network status buffers cannot be closed. Networks you have defined
+but not connected appear at the bottom of the sidebar, dimmed with a `○`; click
+one to connect it.
 
 Channel buffers show joins, parts, kicks, quits and nick changes (a quit or nick
 change appears in every channel you share with that person, and in their query

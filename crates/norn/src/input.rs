@@ -14,12 +14,42 @@ pub struct Translated {
     pub feedback: Option<String>,
     /// Whether the user asked to quit.
     pub quit: bool,
+    /// The reason given to `/quit`, if any.
+    pub quit_reason: Option<String>,
+    /// Chat the user is sending, so a client can echo it locally when the
+    /// server does not (no `echo-message`).
+    pub outgoing: Vec<Outgoing>,
+}
+
+/// One outgoing chat message, as the user typed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outgoing {
+    /// The channel or nick it is sent to.
+    pub target: String,
+    /// The message text (for an action, without the CTCP wrapper).
+    pub text: String,
+    /// Whether it is a `/me` action.
+    pub action: bool,
+    /// Whether it is a NOTICE.
+    pub notice: bool,
 }
 
 impl Translated {
     fn lines(lines: Vec<String>) -> Self {
         Translated {
             lines,
+            ..Default::default()
+        }
+    }
+    fn chat(line: String, target: &str, text: &str, action: bool, notice: bool) -> Self {
+        Translated {
+            lines: vec![line],
+            outgoing: vec![Outgoing {
+                target: target.to_string(),
+                text: text.to_string(),
+                action,
+                notice,
+            }],
             ..Default::default()
         }
     }
@@ -45,7 +75,13 @@ pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
 
     let Some(rest) = input.strip_prefix('/') else {
         return match current {
-            Some(target) => Translated::lines(vec![format!("PRIVMSG {target} :{input}")]),
+            Some(target) => Translated::chat(
+                format!("PRIVMSG {target} :{input}"),
+                target,
+                input,
+                false,
+                false,
+            ),
             None => Translated::feedback("no target; use /join #channel or /msg <target> <text>"),
         };
     };
@@ -82,13 +118,23 @@ pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
                 Translated::feedback("usage: /msg <target> <text>")
             } else {
                 *current = Some(target.to_string());
-                Translated::lines(vec![format!("PRIVMSG {target} :{text}")])
+                Translated::chat(
+                    format!("PRIVMSG {target} :{text}"),
+                    target,
+                    text,
+                    false,
+                    false,
+                )
             }
         }
         "me" => match current {
-            Some(target) if !arg.is_empty() => {
-                Translated::lines(vec![format!("PRIVMSG {target} :\u{1}ACTION {arg}\u{1}")])
-            }
+            Some(target) if !arg.is_empty() => Translated::chat(
+                format!("PRIVMSG {target} :\u{1}ACTION {arg}\u{1}"),
+                target,
+                arg,
+                true,
+                false,
+            ),
             Some(_) => Translated::feedback("usage: /me <action>"),
             None => Translated::feedback("no target for /me"),
         },
@@ -157,7 +203,13 @@ pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
             if target.is_empty() || text.is_empty() {
                 Translated::feedback("usage: /notice <target> <text>")
             } else {
-                Translated::lines(vec![format!("NOTICE {target} :{text}")])
+                Translated::chat(
+                    format!("NOTICE {target} :{text}"),
+                    target,
+                    text,
+                    false,
+                    true,
+                )
             }
         }
         "invite" => {
@@ -177,6 +229,7 @@ pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
             Translated {
                 lines: vec![format!("QUIT :{reason}")],
                 quit: true,
+                quit_reason: (!arg.is_empty()).then(|| arg.to_string()),
                 ..Default::default()
             }
         }

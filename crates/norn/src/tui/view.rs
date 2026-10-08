@@ -113,78 +113,127 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
     let inner_w = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
 
-    // The global console is the first row, above every network.
-    let console_active = app
-        .buffers
-        .get(app.active)
-        .is_some_and(|b| b.kind == BufferKind::Status);
-    lines.push(sidebar_row(
-        app.accent,
-        console_active,
-        "norn",
-        "",
-        if console_active {
-            theme::BRIGHT
-        } else {
-            theme::DIM2
-        },
-        theme::DIM2,
-        inner_w,
-    ));
-
-    for (net_id, net) in app.networks.iter().enumerate() {
-        // The network name header is the server/status buffer's entry.
-        let server_active = app
-            .buffers
-            .get(app.active)
-            .is_some_and(|b| b.net == net_id && b.kind == BufferKind::Server);
-        let fg = if server_active {
-            theme::BRIGHT
-        } else {
-            theme::DIM2
-        };
-        lines.push(sidebar_row(
-            app.accent,
-            server_active,
-            &net.name.to_uppercase(),
-            "",
-            fg,
-            theme::DIM2,
-            inner_w,
-        ));
-
-        for (idx, buffer) in app.buffers.iter().enumerate() {
-            if buffer.net != net_id || buffer.kind == BufferKind::Server {
-                continue;
+    for row in sidebar_rows(app) {
+        match row {
+            // The global console is the first row, above every network.
+            SidebarRow::Console => {
+                let active = app
+                    .buffers
+                    .get(app.active)
+                    .is_some_and(|b| b.kind == BufferKind::Status);
+                let fg = if active { theme::BRIGHT } else { theme::DIM2 };
+                lines.push(sidebar_row(
+                    app.accent,
+                    active,
+                    "norn",
+                    "",
+                    fg,
+                    theme::DIM2,
+                    inner_w,
+                ));
             }
-            let active = idx == app.active;
-            let label = match buffer.kind {
-                BufferKind::Query => format!("@ {}", buffer.name),
-                _ => buffer.name.clone(),
-            };
-            let badge = if buffer.unread > 0 {
-                format!(" {}", buffer.unread)
-            } else {
-                String::new()
-            };
-            let fg = if active {
-                theme::BRIGHT
-            } else if buffer.kind == BufferKind::Query {
-                theme::nick_color(&buffer.name)
-            } else {
-                theme::TEXT
-            };
-            let badge_fg = if buffer.mentioned || buffer.unread > 2 {
-                theme::GOLD
-            } else {
-                theme::DIM2
-            };
-            lines.push(sidebar_row(
-                app.accent, active, &label, &badge, fg, badge_fg, inner_w,
-            ));
+            // The network name header is the server/status buffer's entry.
+            SidebarRow::Network(net_id) => {
+                let active = app
+                    .buffers
+                    .get(app.active)
+                    .is_some_and(|b| b.net == net_id && b.kind == BufferKind::Server);
+                let fg = if active { theme::BRIGHT } else { theme::DIM2 };
+                lines.push(sidebar_row(
+                    app.accent,
+                    active,
+                    &app.networks[net_id].name.to_uppercase(),
+                    "",
+                    fg,
+                    theme::DIM2,
+                    inner_w,
+                ));
+            }
+            SidebarRow::Buffer(idx) => {
+                let buffer = &app.buffers[idx];
+                let active = idx == app.active;
+                let label = match buffer.kind {
+                    BufferKind::Query => format!("@ {}", buffer.name),
+                    _ => buffer.name.clone(),
+                };
+                let badge = if buffer.unread > 0 {
+                    format!(" {}", buffer.unread)
+                } else {
+                    String::new()
+                };
+                let fg = if active {
+                    theme::BRIGHT
+                } else if buffer.kind == BufferKind::Query {
+                    theme::nick_color(&buffer.name)
+                } else {
+                    theme::TEXT
+                };
+                let badge_fg = if buffer.mentioned || buffer.unread > 2 {
+                    theme::GOLD
+                } else {
+                    theme::DIM2
+                };
+                lines.push(sidebar_row(
+                    app.accent, active, &label, &badge, fg, badge_fg, inner_w,
+                ));
+            }
+            // A defined network with no live connection: dim, click to connect.
+            SidebarRow::Idle(def) => {
+                lines.push(sidebar_row(
+                    app.accent,
+                    false,
+                    &app.definitions[def].name.to_uppercase(),
+                    " ○",
+                    theme::DIM2,
+                    theme::DIM2,
+                    inner_w,
+                ));
+            }
         }
     }
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One row of the sidebar, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarRow {
+    /// The global console.
+    Console,
+    /// A live network's header (its server buffer).
+    Network(usize),
+    /// A channel or query buffer, by index into `App.buffers`.
+    Buffer(usize),
+    /// A defined network with no live connection, by index into
+    /// `App.definitions`.
+    Idle(usize),
+}
+
+/// The sidebar's rows, top to bottom. Drawing and mouse hit-testing both use
+/// this, so a click always lands on the row the user sees.
+pub fn sidebar_rows(app: &App) -> Vec<SidebarRow> {
+    let mut rows = vec![SidebarRow::Console];
+    for net_id in 0..app.networks.len() {
+        rows.push(SidebarRow::Network(net_id));
+        rows.extend(
+            app.buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.net == net_id && b.kind != BufferKind::Server)
+                .map(|(idx, _)| SidebarRow::Buffer(idx)),
+        );
+    }
+    rows.extend(
+        app.definitions
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                !app.networks
+                    .iter()
+                    .any(|n| n.name.eq_ignore_ascii_case(&d.name))
+            })
+            .map(|(i, _)| SidebarRow::Idle(i)),
+    );
+    rows
 }
 
 /// Build one sidebar row: an accent bar, a padded label, and a right badge, with

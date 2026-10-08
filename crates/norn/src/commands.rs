@@ -301,7 +301,7 @@ pub const COMMANDS: &[CommandDoc] = &[
         usage: "/msg <target> <text>",
         summary: "Send a private message",
         description: "Send a message to a user or channel without switching to \
-its buffer. The target becomes the current target for following plain text.",
+its buffer; the conversation opens in the background.",
         aliases: &["m"],
         params: &[
             req("target", ArgKind::Nick, "nick or channel to message"),
@@ -353,7 +353,7 @@ auto-reply to.",
         category: "Channel",
         usage: "/join #channel",
         summary: "Join a channel",
-        description: "Join a channel and make it the current target.",
+        description: "Join a channel; its buffer becomes active once the server confirms.",
         aliases: &["j"],
         params: &[req("channel", ArgKind::Channel, "the channel to join")],
         subcommands: &[],
