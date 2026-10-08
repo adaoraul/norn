@@ -22,6 +22,7 @@ rhai = "1.24"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 unicode-width = "0.2"
+unicode-segmentation = "1"
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process"] }

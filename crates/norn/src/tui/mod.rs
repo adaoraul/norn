@@ -7,6 +7,7 @@
 pub mod editor;
 pub mod input;
 pub mod state;
+pub mod text;
 pub mod theme;
 pub mod view;
 

@@ -99,6 +99,12 @@ fn default_port() -> u16 {
 fn default_theme() -> String {
     "teal".to_string()
 }
+fn default_sidebar_width() -> usize {
+    24
+}
+fn default_nicklist_width() -> usize {
+    18
+}
 fn default_timestamp_format() -> String {
     crate::tui::state::DEFAULT_TIMESTAMP_FORMAT.to_string()
 }
@@ -181,6 +187,12 @@ pub struct ClientConfig {
     /// Whether the channel nicklist is shown by default.
     #[serde(default = "default_true")]
     pub nicklist: bool,
+    /// Width of the buffer sidebar, in columns.
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: usize,
+    /// Width of the channel nicklist, in columns.
+    #[serde(default = "default_nicklist_width")]
+    pub nicklist_width: usize,
     /// The character inserted after a nick completed at the start of a line
     /// (followed by a space), e.g. `":"` -> `nick: `.
     #[serde(default = "default_completion_char")]
@@ -210,6 +222,8 @@ impl Default for ClientConfig {
             nick_colors: true,
             theme: default_theme(),
             nicklist: true,
+            sidebar_width: default_sidebar_width(),
+            nicklist_width: default_nicklist_width(),
             completion_char: default_completion_char(),
             beep_on_highlight: false,
             scrollback_lines: default_scrollback(),

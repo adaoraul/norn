@@ -171,6 +171,8 @@ applies live and auto-saves.
 | ------------------ | --------------- | ------- | ------------------------------------------------------------------- |
 | `timestamps`       | bool            | `on`    | Show a timestamp in front of each message.                          |
 | `timestamp_format` | str             | `%H:%M` | How timestamps are written, as a strftime pattern (`%H:%M:%S` adds seconds, `%a %H:%M` the weekday). An invalid pattern is refused. |
+| `sidebar_width`    | int (12-48)     | `24`    | Width of the buffer sidebar in columns. A narrow terminal shrinks it so the chat keeps at least 20 columns. |
+| `nicklist_width`   | int (10-32)     | `18`    | Width of the channel nicklist in columns. The nicklist is hidden on terminals narrower than 80 columns. |
 | `nick_colors`      | bool            | `on`    | Color nicks by a per-nick hue (off = one muted color).              |
 | `theme`            | enum            | `teal`  | Accent color: `teal`, `amber`, `green`, `blue`, `purple`, `pink`.   |
 | `nicklist`         | bool            | `on`    | Show the channel nicklist by default.                               |
@@ -307,6 +309,20 @@ leaves the search where you are. Only lines still in memory are searched (see
 
 Timestamps follow `timestamp_format`, and a line of the form `── Thu 8 Oct 2026 ──`
 marks where the date changes (shown while timestamps are on).
+
+### Small and narrow terminals
+
+norn needs at least 60 columns by 10 rows; smaller than that it shows
+`terminal too small` instead of a broken screen. Below 80 columns the nicklist is
+hidden to leave room for the conversation (`F9` and `nicklist_width` still apply on
+a wider terminal). If there are more buffers than rows, the sidebar scrolls to keep
+the active one in view, shows `▲`/`▼` on its edge when more are hidden, and scrolls
+with the mouse wheel; clicks always hit the row you see.
+
+A long line you are typing scrolls sideways to keep the cursor visible, with `…`
+marking what is off to the left. Names too long for their column (nicks, channels,
+topics) end in `…`. Emoji and accented letters are measured and wrapped as whole
+characters, so a wrapped line never splits one.
 
 ### Pasting
 

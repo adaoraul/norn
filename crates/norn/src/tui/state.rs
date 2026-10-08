@@ -756,6 +756,13 @@ pub struct App {
     pub paste: Vec<String>,
     /// The search in progress (`Mode::Search`).
     pub search: SearchState,
+    /// The first sidebar row shown, when the buffer list is taller than the
+    /// screen. Written by the draw (to keep the active buffer in view) and by the
+    /// mouse wheel, hence a `Cell`.
+    pub sidebar_top: std::cell::Cell<usize>,
+    /// The buffer that was active when the sidebar last scrolled to show it, so
+    /// the wheel can scroll away from it without the next draw snapping back.
+    pub sidebar_seen: std::cell::Cell<usize>,
     /// How many whole lines the message pane showed when last drawn. Written by
     /// the view (hence the `Cell`), read when paging so a page is what the user
     /// just saw, however much the lines wrap.
@@ -828,6 +835,8 @@ impl App {
             armed: None,
             paste: Vec::new(),
             search: SearchState::default(),
+            sidebar_top: std::cell::Cell::new(0),
+            sidebar_seen: std::cell::Cell::new(usize::MAX),
             visible_lines: std::cell::Cell::new(DEFAULT_VISIBLE_LINES),
         }
     }
@@ -1825,6 +1834,8 @@ impl App {
             "completion_char" => self.client.completion_char.clone(),
             "beep_on_highlight" => on_off(self.client.beep_on_highlight),
             "mouse" => on_off(self.client.mouse),
+            "sidebar_width" => self.client.sidebar_width.to_string(),
+            "nicklist_width" => self.client.nicklist_width.to_string(),
             "scrollback_lines" => self.client.scrollback_lines.to_string(),
             "idle_secs" => self.client.idle_secs.to_string(),
             _ => String::new(),
@@ -1835,7 +1846,7 @@ impl App {
     /// `/settings` screen). Returns the applied value on success, or a message on
     /// invalid input. Applies live and auto-saves via [`Self::apply_client_change`].
     pub fn set_setting(&mut self, key: &str, raw: &str) -> Result<String, String> {
-        use crate::settings::{self, SettingKind};
+        use crate::settings;
         let doc = settings::find(key).ok_or_else(|| format!("unknown setting '{key}'"))?;
         let raw = raw.trim();
         let want_bool = || parse_bool(raw).ok_or_else(|| format!("expected on/off, got '{raw}'"));
@@ -1876,29 +1887,12 @@ impl App {
                 self.client.completion_char = raw.to_string();
             }
             "scrollback_lines" => {
-                let SettingKind::Int { min, max } = doc.kind else {
-                    unreachable!("scrollback_lines is an int setting")
-                };
-                let n: usize = raw
-                    .parse()
-                    .map_err(|_| format!("expected a number, got '{raw}'"))?;
-                if !(min..=max).contains(&n) {
-                    return Err(format!("must be between {min} and {max}"));
-                }
+                let n = parse_bounded(doc.kind, raw)?;
                 self.set_scrollback(n);
             }
-            "idle_secs" => {
-                let SettingKind::Int { min, max } = doc.kind else {
-                    unreachable!("idle_secs is an int setting")
-                };
-                let n: usize = raw
-                    .parse()
-                    .map_err(|_| format!("expected a number, got '{raw}'"))?;
-                if !(min..=max).contains(&n) {
-                    return Err(format!("must be between {min} and {max}"));
-                }
-                self.client.idle_secs = n;
-            }
+            "idle_secs" => self.client.idle_secs = parse_bounded(doc.kind, raw)?,
+            "sidebar_width" => self.client.sidebar_width = parse_bounded(doc.kind, raw)?,
+            "nicklist_width" => self.client.nicklist_width = parse_bounded(doc.kind, raw)?,
             other => return Err(format!("unknown setting '{other}'")),
         }
         self.apply_client_change();
@@ -2512,6 +2506,20 @@ fn nick_summary(nicks: &[String]) -> String {
         out.push_str(&format!(", +{} more", nicks.len() - SHOWN));
     }
     out
+}
+
+/// Parse `raw` as a whole number within an integer setting's bounds.
+fn parse_bounded(kind: crate::settings::SettingKind, raw: &str) -> Result<usize, String> {
+    let crate::settings::SettingKind::Int { min, max } = kind else {
+        unreachable!("only integer settings are parsed this way")
+    };
+    let n: usize = raw
+        .parse()
+        .map_err(|_| format!("expected a number, got '{raw}'"))?;
+    if !(min..=max).contains(&n) {
+        return Err(format!("must be between {min} and {max}"));
+    }
+    Ok(n)
 }
 
 /// Why a network definition cannot be dialled yet, if it cannot.

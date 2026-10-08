@@ -7,28 +7,30 @@ use super::state::{
     check_dialable, network_field_value, App, AppAction, BufferKind, Completion, Confirm, Mode,
     NetFieldKind, NetworksFocus, Switcher, NETWORK_FIELDS, WHEEL_LINES,
 };
-use super::view::{numbered_buffers, sidebar_rows, SidebarRow};
+use super::view::{layout, numbered_buffers, sidebar_rows, SidebarRow};
 use crate::session::NetCommand;
-
-/// Width of the sidebar column.
-const SIDEBAR_W: u16 = 24;
-/// Width of the nicklist column.
-const NICKLIST_W: u16 = 18;
+use ratatui::layout::Rect;
 
 /// Handle a mouse event: click the sidebar to switch buffers, click a nick to
-/// open a query, or scroll the message view. Returns any commands to send (a
-/// scroll to the top may request older history).
-pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) -> Vec<NetCommand> {
+/// open a query, or scroll (the sidebar when the pointer is over it, otherwise
+/// the message view). The panes are found with [`layout`], the same function the
+/// drawing uses, so a click lands on what is drawn there at any size or width
+/// setting. Returns any commands to send (a scroll to the top may request older
+/// history).
+pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, height: u16) -> Vec<NetCommand> {
+    let panes = layout(app, Rect::new(0, 0, width, height));
+    if panes.too_small {
+        return Vec::new();
+    }
+    let over_sidebar = event.column < panes.sidebar.right();
+    let over_nicklist = panes.nicklist.is_some_and(|r| event.column >= r.x);
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // Sidebar and nicklist span the full height; out-of-range rows map to
             // None, so no vertical guard is needed.
-            if event.column < SIDEBAR_W {
+            if over_sidebar {
                 click_sidebar_row(app, event.row);
-            } else if app.nicklist_visible
-                && app.active_buffer().kind == BufferKind::Channel
-                && event.column >= width.saturating_sub(NICKLIST_W)
-            {
+            } else if over_nicklist {
                 if let Some(nick) = nicklist_nick_at(app, event.row) {
                     let net = app.active_buffer().net;
                     app.open_query(net, &nick);
@@ -37,17 +39,39 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) 
         }
         // A wheel notch is a few lines, like a terminal's own scrollback; the
         // keyboard pages are screenfuls.
-        MouseEventKind::ScrollUp => return app.scroll_by(WHEEL_LINES).into_iter().collect(),
-        MouseEventKind::ScrollDown => return app.scroll_by(-WHEEL_LINES).into_iter().collect(),
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let up = event.kind == MouseEventKind::ScrollUp;
+            if over_sidebar {
+                scroll_sidebar(
+                    app,
+                    if up { -WHEEL_LINES } else { WHEEL_LINES },
+                    panes.sidebar,
+                );
+            } else {
+                let lines = if up { WHEEL_LINES } else { -WHEEL_LINES };
+                return app.scroll_by(lines).into_iter().collect();
+            }
+        }
         _ => {}
     }
     Vec::new()
 }
 
+/// Scroll the sidebar's window onto its rows by `delta` (positive = down). Does
+/// nothing when every row already fits.
+fn scroll_sidebar(app: &App, delta: isize, sidebar: Rect) {
+    let rows = sidebar_rows(app).len();
+    let max = rows.saturating_sub(sidebar.height as usize);
+    let top = (app.sidebar_top.get() as isize + delta).clamp(0, max as isize);
+    app.sidebar_top.set(top as usize);
+}
+
 /// Act on a click at sidebar row `y`, using the same rows the sidebar draws:
-/// switch to a buffer, or connect an idle network.
+/// switch to a buffer, or connect an idle network. `y` counts from the top of
+/// the screen; the sidebar may be scrolled, so the row is `y` below its top.
 fn click_sidebar_row(app: &mut App, y: u16) {
-    let Some(row) = sidebar_rows(app).get(y as usize).copied() else {
+    let index = app.sidebar_top.get() + y as usize;
+    let Some(row) = sidebar_rows(app).get(index).copied() else {
         return;
     };
     match row {

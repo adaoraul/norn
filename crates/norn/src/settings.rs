@@ -86,6 +86,20 @@ pub const SETTINGS: &[SettingDoc] = &[
         default: "on",
     },
     SettingDoc {
+        key: "sidebar_width",
+        category: "look & feel",
+        kind: SettingKind::Int { min: 12, max: 48 },
+        desc: "width of the buffer sidebar in columns (narrow terminals shrink it)",
+        default: "24",
+    },
+    SettingDoc {
+        key: "nicklist_width",
+        category: "look & feel",
+        kind: SettingKind::Int { min: 10, max: 32 },
+        desc: "width of the channel nicklist in columns (hidden below 80 columns)",
+        default: "18",
+    },
+    SettingDoc {
         key: "completion_char",
         category: "behavior",
         kind: SettingKind::Str,

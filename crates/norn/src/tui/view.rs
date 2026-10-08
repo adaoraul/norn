@@ -5,12 +5,14 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::state::{
     network_field_value, App, BufferKind, Line as BufLine, Mode, NetFieldKind, NetworksFocus,
     SettingsRow, NETWORK_FIELDS,
 };
+use super::text::{self, truncate};
 use super::theme;
 use crate::addons::PluginStatus;
 use crate::session::ConnState;
@@ -27,49 +29,128 @@ fn nick_color(app: &App, nick: &str) -> ratatui::style::Color {
     }
 }
 
-/// Draw the whole UI.
-pub fn draw(f: &mut Frame, app: &App) {
-    let area = f.area();
-    f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
+/// The smallest terminal norn draws its normal layout in.
+pub const MIN_WIDTH: u16 = 60;
+/// See [`MIN_WIDTH`].
+pub const MIN_HEIGHT: u16 = 10;
+/// The nicklist is hidden on terminals narrower than this, so the conversation
+/// keeps the room.
+const NICKLIST_MIN_TERM_WIDTH: u16 = 80;
+/// The chat column is never squeezed below this by the side panes.
+const MIN_CENTER: u16 = 20;
 
-    // Sidebar and nicklist run the full height; the input area lives inside the
-    // center column.
-    let nick_w = if app.nicklist_visible && app.active_buffer().kind == BufferKind::Channel {
-        18
+/// Where everything goes. Both drawing and mouse hit-testing use this, so a click
+/// always lands on what is drawn there, at any terminal size and any configured
+/// pane width.
+#[derive(Debug, Clone, Copy)]
+pub struct Panes {
+    /// Smaller than [`MIN_WIDTH`] x [`MIN_HEIGHT`]: draw a notice instead.
+    pub too_small: bool,
+    /// The buffer list, full height.
+    pub sidebar: Rect,
+    /// The member list, full height; `None` when hidden.
+    pub nicklist: Option<Rect>,
+    /// The buffer title and topic.
+    pub header: Rect,
+    /// The rule under the header.
+    pub rule: Rect,
+    /// The messages.
+    pub messages: Rect,
+    /// The activity bar.
+    pub activity: Rect,
+    /// The input line.
+    pub input: Rect,
+}
+
+/// Lay the screen out in `area` for the current state.
+pub fn layout(app: &App, area: Rect) -> Panes {
+    let too_small = area.width < MIN_WIDTH || area.height < MIN_HEIGHT;
+    // The nicklist only appears in a channel, when asked for, and with room.
+    let show_nicklist = app.nicklist_visible
+        && app.active_buffer().kind == BufferKind::Channel
+        && area.width >= NICKLIST_MIN_TERM_WIDTH;
+    let nick_w = if show_nicklist {
+        app.client.nicklist_width.clamp(10, 32) as u16
     } else {
         0
     };
-    let cols = Layout::horizontal([
-        Constraint::Length(24),
-        Constraint::Min(10),
-        Constraint::Length(nick_w),
-    ])
-    .split(area);
+    // A wide sidebar yields before the chat column gets cramped.
+    let sidebar_w = (app.client.sidebar_width.clamp(12, 48) as u16)
+        .min(area.width.saturating_sub(nick_w + MIN_CENTER));
 
-    // Indent the center content from the panes (the design has inner padding).
-    let center_area = Rect {
-        x: cols[1].x + 1,
-        y: cols[1].y,
-        width: cols[1].width.saturating_sub(2),
-        height: cols[1].height,
+    let sidebar = Rect {
+        width: sidebar_w,
+        ..area
     };
-    let center = Layout::vertical([
+    let nicklist = show_nicklist.then_some(Rect {
+        x: area.right().saturating_sub(nick_w),
+        width: nick_w,
+        ..area
+    });
+    // The chat column is inset by a cell on each side (the design has padding).
+    let center = Rect {
+        x: area.x + sidebar_w + 1,
+        y: area.y,
+        width: area
+            .width
+            .saturating_sub(sidebar_w + nick_w)
+            .saturating_sub(2),
+        height: area.height,
+    };
+    let rows = Layout::vertical([
         Constraint::Length(1), // header
         Constraint::Length(1), // header rule
         Constraint::Min(1),    // messages
         Constraint::Length(1), // activity bar
         Constraint::Length(1), // input
     ])
-    .split(center_area);
+    .split(center);
+    Panes {
+        too_small,
+        sidebar,
+        nicklist,
+        header: rows[0],
+        rule: rows[1],
+        messages: rows[2],
+        activity: rows[3],
+        input: rows[4],
+    }
+}
 
-    draw_sidebar(f, cols[0], app);
-    draw_header(f, center[0], app);
-    draw_rule(f, center[1]);
-    let lines_above = draw_messages(f, center[2], app);
-    draw_activity(f, center[3], app, lines_above);
-    draw_input(f, center[4], app);
-    if nick_w > 0 {
-        draw_nicklist(f, cols[2], app);
+/// The notice shown when the terminal is too small to lay anything out.
+fn draw_too_small(f: &mut Frame, area: Rect) {
+    let text = format!(
+        "terminal too small ({}x{}); norn needs at least {}x{}",
+        area.width, area.height, MIN_WIDTH, MIN_HEIGHT
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate(&text, area.width as usize),
+            Style::default().fg(theme::GOLD),
+        ))),
+        area,
+    );
+}
+
+/// Draw the whole UI.
+pub fn draw(f: &mut Frame, app: &App) {
+    let area = f.area();
+    f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
+
+    let panes = layout(app, area);
+    if panes.too_small {
+        draw_too_small(f, area);
+        return;
+    }
+
+    draw_sidebar(f, panes.sidebar, app);
+    draw_header(f, panes.header, app);
+    draw_rule(f, panes.rule);
+    let lines_above = draw_messages(f, panes.messages, app);
+    draw_activity(f, panes.activity, app, lines_above);
+    draw_input(f, panes.input, app);
+    if let Some(nicklist) = panes.nicklist {
+        draw_nicklist(f, nicklist, app);
     }
 
     if app.mode == Mode::Switcher {
@@ -85,7 +166,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else if app.mode == Mode::PluginConfig {
         draw_plugin_config(f, area, app);
     } else if let Some(completion) = &app.completion {
-        draw_completion(f, center[4], completion);
+        draw_completion(f, panes.input, completion);
     }
 }
 
@@ -117,7 +198,8 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
     let numbered = numbered_buffers(app);
     let number_of = |idx: usize| numbered.iter().position(|&b| b == idx).map(|p| p + 1);
 
-    for row in sidebar_rows(app) {
+    let rows = sidebar_rows(app);
+    for &row in &rows {
         match row {
             // The global console is the first row, above every network.
             SidebarRow::Console => {
@@ -235,7 +317,58 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    f.render_widget(Paragraph::new(lines), inner);
+
+    // More rows than fit: show a window onto them that keeps the active buffer in
+    // view (when it changes), and that the mouse wheel can move.
+    let height = inner.height as usize;
+    let mut top = app.sidebar_top.get();
+    if app.sidebar_seen.get() != app.active {
+        app.sidebar_seen.set(app.active);
+        if let Some(active) = active_sidebar_row(app, &rows) {
+            if active < top {
+                top = active;
+            } else if height > 0 && active >= top + height {
+                top = active + 1 - height;
+            }
+        }
+    }
+    top = top.min(rows.len().saturating_sub(height));
+    app.sidebar_top.set(top);
+    let hidden_above = top > 0;
+    let hidden_below = top + height < rows.len();
+    let shown: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
+    f.render_widget(Paragraph::new(shown), inner);
+
+    // Arrows on the border say there is more above or below.
+    let edge_x = area.right().saturating_sub(1);
+    let mut arrow = |glyph: &'static str, y: u16| {
+        f.render_widget(
+            Paragraph::new(Span::styled(glyph, Style::default().fg(app.accent))),
+            Rect {
+                x: edge_x,
+                y,
+                width: 1,
+                height: 1,
+            },
+        );
+    };
+    if hidden_above && height > 0 {
+        arrow("▲", inner.y);
+    }
+    if hidden_below && height > 0 {
+        arrow("▼", inner.y + inner.height - 1);
+    }
+}
+
+/// The sidebar row of the active buffer, if it has one.
+fn active_sidebar_row(app: &App, rows: &[SidebarRow]) -> Option<usize> {
+    let active = app.buffers.get(app.active)?;
+    rows.iter().position(|row| match *row {
+        SidebarRow::Console => active.kind == BufferKind::Status,
+        SidebarRow::Network(net) => active.net == net && active.kind == BufferKind::Server,
+        SidebarRow::Buffer(idx) => idx == app.active,
+        SidebarRow::Idle(_) => false,
+    })
 }
 
 /// One row of the sidebar, in display order.
@@ -401,6 +534,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
     let head_w = area.width as usize;
+    // The title yields to the right label (and ends in `…`) before it runs off.
+    let title = truncate(&title, head_w.saturating_sub(right.width() + 1));
     // Topic gets whatever room is left after the title and the right label.
     let sub_room = head_w.saturating_sub(title.width() + 2 + right.width() + 1);
     let sub = truncate(&buffer.topic.clone().unwrap_or_default(), sub_room);
@@ -761,21 +896,23 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut cur = String::new();
     let mut cur_w = 0usize;
     for word in body.split(' ') {
-        let ww = word.width();
+        let ww = text::width(word);
         if ww > width {
             if cur_w > 0 {
                 out.push(std::mem::take(&mut cur));
                 cur_w = 0;
             }
+            // Break a word that cannot fit on a line anywhere, but never inside
+            // a grapheme cluster (an emoji or an accented letter stays whole).
             let mut piece_w = 0;
-            for ch in word.chars() {
-                let cw = ch.to_string().width();
-                if piece_w + cw > width {
+            for g in word.graphemes(true) {
+                let gw = text::width(g);
+                if piece_w + gw > width && piece_w > 0 {
                     out.push(std::mem::take(&mut cur));
                     piece_w = 0;
                 }
-                cur.push(ch);
-                piece_w += cw;
+                cur.push_str(g);
+                piece_w += gw;
             }
             cur_w = piece_w;
             continue;
@@ -838,7 +975,9 @@ fn draw_nicklist(f: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::default().fg(color)
         };
-        lines.push(Line::from(Span::styled(format!("{sym}{}", m.nick), style)));
+        // A nick longer than the pane ends in `…` rather than running off it.
+        let label = truncate(&format!("{sym}{}", m.nick), inset(area).width as usize);
+        lines.push(Line::from(Span::styled(label, style)));
     }
     if overflow > 0 {
         lines.push(Line::from(Span::styled(
@@ -939,67 +1078,118 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
             format!("{}/{}", s.cur + 1, s.hits.len())
         };
         let prompt = "search: ";
+        // Leave the count its room; the query scrolls if it is long.
+        let room = (area.width as usize)
+            .saturating_sub(prompt.width() + count.width() + 3)
+            .max(4);
+        let (shown, cursor_col) = scrolled_input(&s.query, s.query.len(), room);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(prompt, Style::default().fg(theme::GOLD)),
-                Span::styled(s.query.clone(), Style::default().fg(theme::BRIGHT)),
+                Span::styled(shown, Style::default().fg(theme::BRIGHT)),
                 Span::styled(format!("   {count}"), Style::default().fg(theme::DIM2)),
             ])),
             area,
         );
-        let x = area.x + (prompt.width() + s.query.width()) as u16;
+        let x = area.x + (prompt.width() + cursor_col) as u16;
         f.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
         return;
     }
     let buffer = app.active_buffer();
+    // A very long channel name must not push the text you type off the line.
+    let name_cap = (area.width as usize / 3).max(4);
     let prompt = match buffer.kind {
         BufferKind::Server => "> ".to_string(),
-        _ => format!("{} > ", buffer.name),
+        _ => format!("{} > ", truncate(&buffer.name, name_cap)),
     };
+    let room = (area.width as usize).saturating_sub(prompt.width());
+    let (shown, cursor_col) = scrolled_input(&app.input, app.cursor, room);
     let line = Line::from(vec![
         Span::styled(prompt.clone(), Style::default().fg(theme::DIM2)),
-        Span::styled(app.input.clone(), Style::default().fg(theme::BRIGHT)),
+        Span::styled(shown, Style::default().fg(theme::BRIGHT)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 
     if app.mode == Mode::Normal {
-        let x = area.x + (prompt.width() + app.input[..app.cursor].width()) as u16;
+        let x = area.x + (prompt.width() + cursor_col) as u16;
         f.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
     }
 }
 
+/// The part of a one-line input to show in `room` cells, and the cell the cursor
+/// is in (counted from the start of that part). Text that fits is shown whole;
+/// longer text scrolls sideways to keep the cursor in view, with a leading `…`
+/// marking what is off to the left.
+fn scrolled_input(input: &str, cursor: usize, room: usize) -> (String, usize) {
+    let cursor = super::editor::clamp(input, cursor);
+    let before = text::width(&input[..cursor]);
+    if before < room {
+        return (input.to_string(), before);
+    }
+    // One cell for the `…`, one for the cursor itself.
+    let start = text::scroll_start(input, cursor, room.saturating_sub(2));
+    let shown = format!("{}{}", text::ELLIPSIS, &input[start..]);
+    (shown, 1 + text::width(&input[start..cursor]))
+}
+
+/// The first item to show so the selected one is on screen, centered where there
+/// is room: for a list of `len` items shown `visible` at a time.
+fn scroll_window(selected: usize, len: usize, visible: usize) -> usize {
+    if len <= visible {
+        0
+    } else {
+        selected.saturating_sub(visible / 2).min(len - visible)
+    }
+}
+
 fn draw_completion(f: &mut Frame, input_area: Rect, completion: &super::state::Completion) {
-    let h = (completion.matches.len() as u16).min(6);
+    const MAX_ROWS: usize = 6;
+    let total = completion.matches.len();
+    let h = total.min(MAX_ROWS) as u16;
     if h == 0 {
         return;
     }
+    // More candidates than rows: the last row says where the selection is.
+    let overflow = total > MAX_ROWS;
+    let item_rows = if overflow { MAX_ROWS - 1 } else { total };
     let w = completion
         .matches
         .iter()
-        .map(|m| m.width() as u16)
+        .map(|m| text::width(m) as u16)
         .max()
         .unwrap_or(4)
+        .max(if overflow { 9 } else { 0 })
         + 2;
     let area = Rect {
         x: input_area.x + 2,
         y: input_area.y.saturating_sub(h),
-        width: w.min(input_area.width),
+        width: w.min(input_area.width.saturating_sub(2)),
         height: h,
     };
     f.render_widget(Clear, area);
-    let lines: Vec<Line> = completion
+    let start = scroll_window(completion.idx, total, item_rows);
+    let mut lines: Vec<Line> = completion
         .matches
         .iter()
         .enumerate()
+        .skip(start)
+        .take(item_rows)
         .map(|(i, m)| {
             let style = if i == completion.idx {
                 Style::default().fg(theme::BRIGHT).bg(theme::BORDER_BRIGHT)
             } else {
                 Style::default().fg(theme::TEXT)
             };
-            Line::from(Span::styled(format!(" {m}"), style))
+            let label = truncate(m, (area.width as usize).saturating_sub(1));
+            Line::from(Span::styled(format!(" {label}"), style))
         })
         .collect();
+    if overflow {
+        lines.push(Line::from(Span::styled(
+            format!(" {}/{total}", completion.idx + 1),
+            Style::default().fg(theme::DIM2),
+        )));
+    }
     f.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme::ACTIVE_BG)),
         area,
@@ -1032,7 +1222,7 @@ fn draw_switcher(f: &mut Frame, area: Rect, app: &App) {
     // Room for the query line above and the hint line below; scroll the list so
     // the selection is always on screen.
     let visible = (h as usize).saturating_sub(2).max(1);
-    let start = (app.switcher.sel + 1).saturating_sub(visible);
+    let start = scroll_window(app.switcher.sel, matches.len(), visible);
     for (i, &idx) in matches.iter().enumerate().skip(start).take(visible) {
         let b = &app.buffers[idx];
         let net_name = app
@@ -1050,6 +1240,7 @@ fn draw_switcher(f: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::default().fg(theme::TEXT)
         };
+        let label = truncate(&label, (w as usize).saturating_sub(4));
         lines.push(Line::from(Span::styled(format!(" {label}"), style)));
     }
     if matches.is_empty() {
@@ -1197,11 +1388,7 @@ fn draw_settings_body(f: &mut Frame, area: Rect, app: &App, rows: &[SettingsRow]
             Style::default().fg(theme::DIM2),
         )));
     }
-    let scroll = if body.len() <= list_h {
-        0
-    } else {
-        sel_line.saturating_sub(list_h / 2).min(body.len() - list_h)
-    };
+    let scroll = scroll_window(sel_line, body.len(), list_h);
     let shown: Vec<Line> = body.into_iter().skip(scroll).take(list_h).collect();
     f.render_widget(Paragraph::new(shown), area);
 }
@@ -1618,11 +1805,7 @@ fn draw_plugins_body(f: &mut Frame, area: Rect, app: &App) {
         }
         body.push(plugin_row_line(app, plugin, i == sel, width));
     }
-    let scroll = if body.len() <= list_h {
-        0
-    } else {
-        sel_line.saturating_sub(list_h / 2).min(body.len() - list_h)
-    };
+    let scroll = scroll_window(sel_line, body.len(), list_h);
     let shown: Vec<Line> = body.into_iter().skip(scroll).take(list_h).collect();
     f.render_widget(Paragraph::new(shown), area);
 }
@@ -1979,11 +2162,7 @@ fn draw_help_list(f: &mut Frame, area: Rect, app: &App, focused: bool) {
             Style::default().fg(theme::DIM2),
         )));
     }
-    let scroll = if body.len() <= list_h {
-        0
-    } else {
-        sel_line.saturating_sub(list_h / 2).min(body.len() - list_h)
-    };
+    let scroll = scroll_window(sel_line, body.len(), list_h);
     out.extend(body.into_iter().skip(scroll).take(list_h));
     f.render_widget(Paragraph::new(out), area);
 }
@@ -2142,32 +2321,15 @@ fn inset(area: Rect) -> Rect {
     }
 }
 
-/// Right-align `s` into `width` columns (pad left; truncate if too wide).
+/// Right-align `s` into `width` columns (pad left; truncate with `…` if too
+/// wide).
 fn pad_left(s: &str, width: usize) -> String {
-    let w = s.width();
+    let w = text::width(s);
     if w >= width {
         truncate(s, width)
     } else {
         format!("{}{}", " ".repeat(width - w), s)
     }
-}
-
-/// Truncate `s` to at most `width` display columns.
-fn truncate(s: &str, width: usize) -> String {
-    if s.width() <= width {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in s.chars() {
-        let cw = ch.to_string().width();
-        if used + cw > width {
-            break;
-        }
-        out.push(ch);
-        used += cw;
-    }
-    out
 }
 
 #[cfg(test)]
@@ -3000,6 +3162,344 @@ mod tests {
         app2.timestamps = false;
         let (_, text) = draw_text(&app2, 100, 24);
         assert!(!text.contains("Oct 2026"), "off with the timestamps");
+    }
+
+    fn app_in_channel() -> App {
+        let mut app = one_net_app();
+        engine(&mut app, Event::MessageReceived(chat("#rust", "bob", "hi")));
+        engine(
+            &mut app,
+            Event::NamesLoaded {
+                target: "#rust".into(),
+                members: vec![irc_engine::Member {
+                    nick: "bob".into(),
+                    prefixes: vec![],
+                    away: false,
+                }],
+            },
+        );
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        app
+    }
+
+    #[test]
+    fn layout_uses_the_configured_widths_and_never_overlaps() {
+        let mut app = app_in_channel();
+        app.client.sidebar_width = 30;
+        app.client.nicklist_width = 20;
+        let area = Rect::new(0, 0, 120, 30);
+        let p = layout(&app, area);
+        assert!(!p.too_small);
+        assert_eq!(p.sidebar.width, 30);
+        let nick = p.nicklist.expect("a wide channel shows the nicklist");
+        assert_eq!(nick.width, 20);
+        assert_eq!(nick.right(), 120, "flush with the right edge");
+        // The chat column sits between them, inset by one cell, and does not
+        // touch either pane.
+        assert!(p.messages.x > p.sidebar.right());
+        assert!(p.messages.right() < nick.x);
+        assert_eq!(p.messages.width, 120 - 30 - 20 - 2);
+        // Rows stack header, rule, messages, activity, input.
+        assert_eq!(p.header.y + 1, p.rule.y);
+        assert_eq!(p.rule.y + 1, p.messages.y);
+        assert_eq!(p.messages.bottom(), p.activity.y);
+        assert_eq!(p.activity.y + 1, p.input.y);
+        assert_eq!(p.input.bottom(), 30);
+    }
+
+    #[test]
+    fn layout_gives_way_before_the_chat_is_squeezed() {
+        let mut app = app_in_channel();
+        // Under 80 columns the nicklist is hidden.
+        assert!(layout(&app, Rect::new(0, 0, 79, 24)).nicklist.is_none());
+        assert!(layout(&app, Rect::new(0, 0, 80, 24)).nicklist.is_some());
+        // ... and not at all outside a channel.
+        app.switch_to(0);
+        assert!(layout(&app, Rect::new(0, 0, 120, 24)).nicklist.is_none());
+        // A wide sidebar yields so the chat keeps MIN_CENTER columns (+ padding).
+        app.client.sidebar_width = 48;
+        let p = layout(&app, Rect::new(0, 0, 60, 24));
+        assert!(p.sidebar.width < 48);
+        assert!(p.messages.width + 2 >= 20, "{p:?}");
+        assert_eq!(p.messages.x, p.sidebar.right() + 1);
+    }
+
+    #[test]
+    fn a_terminal_below_the_minimum_says_so_and_nothing_panics_at_any_size() {
+        let app = app_in_channel();
+        assert!(layout(&app, Rect::new(0, 0, 59, 24)).too_small);
+        assert!(layout(&app, Rect::new(0, 0, 80, 9)).too_small);
+        assert!(!layout(&app, Rect::new(0, 0, 60, 10)).too_small);
+        let (_, text) = draw_text(&app, 50, 8);
+        assert!(text.contains("terminal too small (50x8)"), "{text}");
+        assert!(!text.contains("libera"), "no half-drawn layout");
+        // Every small size draws without panicking, with every overlay open.
+        for (w, h) in [
+            (1, 1),
+            (2, 3),
+            (10, 4),
+            (20, 6),
+            (40, 9),
+            (59, 30),
+            (60, 10),
+        ] {
+            for mode in [
+                Mode::Normal,
+                Mode::Switcher,
+                Mode::Help,
+                Mode::Settings,
+                Mode::Networks,
+                Mode::Plugins,
+                Mode::Search,
+            ] {
+                let mut app = app_in_channel();
+                app.mode = mode;
+                draw_text(&app, w, h);
+            }
+        }
+    }
+
+    fn app_with_many_buffers(n: usize) -> App {
+        let mut app = one_net_app();
+        for i in 0..n {
+            engine(
+                &mut app,
+                Event::MessageReceived(chat(&format!("#room{i:02}"), "bob", "hi")),
+            );
+        }
+        app
+    }
+
+    #[test]
+    fn the_sidebar_scrolls_to_keep_the_active_buffer_visible() {
+        let mut app = app_with_many_buffers(40);
+        let last = app
+            .buffers
+            .iter()
+            .position(|b| b.name == "#room39")
+            .unwrap();
+        app.switch_to(last);
+        let (_, text) = draw_text(&app, 80, 14);
+        let sidebar = |needle: &str| -> bool {
+            text.lines()
+                .any(|l| l.chars().take(24).collect::<String>().contains(needle))
+        };
+        assert!(sidebar("#room39"), "the active buffer is on screen: {text}");
+        assert!(!sidebar("#room00"), "the top has scrolled away");
+        assert!(text.contains('▲'), "an arrow says there is more above");
+        // Back to the first buffer scrolls up again.
+        app.switch_to(0);
+        let (_, text) = draw_text(&app, 80, 14);
+        assert!(text.lines().next().unwrap().contains("norn"));
+        assert!(text.contains('▼') && !text.contains('▲'));
+    }
+
+    #[test]
+    fn clicks_and_the_wheel_follow_the_scrolled_sidebar() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mouse = |kind, x, y| MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut app = app_with_many_buffers(40);
+        let last = app
+            .buffers
+            .iter()
+            .position(|b| b.name == "#room39")
+            .unwrap();
+        app.switch_to(last);
+        draw_text(&app, 80, 14); // the draw decides how far the sidebar scrolled
+                                 // Click the first visible row: it is not the console any more.
+        let top = app.sidebar_top.get();
+        assert!(top > 0);
+        crate::tui::input::handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 5, 0),
+            80,
+            14,
+        );
+        let clicked = app.active_buffer().name.clone();
+        let rows = sidebar_rows(&app);
+        let expected = match rows[top] {
+            SidebarRow::Buffer(i) => app.buffers[i].name.clone(),
+            other => panic!("expected a buffer row at the top, got {other:?}"),
+        };
+        assert_eq!(clicked, expected);
+
+        // The wheel over the sidebar scrolls it, not the messages.
+        draw_text(&app, 80, 14);
+        let before = app.sidebar_top.get();
+        crate::tui::input::handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 5, 3), 80, 14);
+        assert!(app.sidebar_top.get() < before, "scrolled up");
+        draw_text(&app, 80, 14);
+        assert!(
+            app.sidebar_top.get() < before,
+            "and the draw does not snap it back to the active buffer"
+        );
+        // Over the chat it scrolls the messages instead.
+        let sidebar_before = app.sidebar_top.get();
+        crate::tui::input::handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 50, 3), 80, 14);
+        assert_eq!(app.sidebar_top.get(), sidebar_before);
+    }
+
+    #[test]
+    fn mouse_hit_testing_uses_the_configured_widths() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let click = |x, y| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut app = app_in_channel();
+        app.client.sidebar_width = 32;
+        // Column 28 is inside a 32-wide sidebar (it was the chat with the old
+        // fixed 24); row 1 is the network header.
+        app.switch_to(0);
+        crate::tui::input::handle_mouse(&mut app, click(28, 2), 120, 30);
+        assert_eq!(app.active_buffer().name, "#rust", "row 2 is #rust");
+        // The nicklist's left edge follows nicklist_width.
+        app.client.nicklist_width = 25;
+        app.switch_to(0);
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        let edge = 120 - 25;
+        crate::tui::input::handle_mouse(&mut app, click(edge, 1), 120, 30);
+        assert!(
+            app.buffers.iter().any(|b| b.name == "bob"),
+            "a click on the first nick opens a query"
+        );
+    }
+
+    #[test]
+    fn a_long_input_scrolls_to_keep_the_cursor_in_view() {
+        let mut app = app_in_channel();
+        app.input = format!("{}END", "x".repeat(300));
+        app.cursor = app.input.len();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        // The input is the last row of a 24-row screen.
+        let row = text.lines().nth(23).unwrap_or_default();
+        assert!(
+            row.contains("xxxEND"),
+            "the end of the line is visible: {row:?}"
+        );
+        assert!(row.contains('…'), "and the left is marked as cut");
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(cursor.x < 80, "the cursor stays on screen");
+        assert_eq!(cursor.y, 23);
+        // Cursor at the start shows the beginning, no ellipsis.
+        app.cursor = 0;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(!text.lines().nth(23).unwrap().contains('…'));
+    }
+
+    #[test]
+    fn names_too_long_for_their_column_end_in_an_ellipsis() {
+        let mut app = one_net_app();
+        engine(
+            &mut app,
+            Event::MessageReceived(chat("#rust", "averyveryverylongnickname", "hello there")),
+        );
+        engine(
+            &mut app,
+            Event::NamesLoaded {
+                target: "#rust".into(),
+                members: vec![irc_engine::Member {
+                    nick: "averyveryverylongnickname".into(),
+                    prefixes: vec![],
+                    away: false,
+                }],
+            },
+        );
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        let (_, text) = draw_text(&app, 100, 24);
+        // The nick column is 9 wide: 8 letters and the ellipsis.
+        assert!(
+            row_with(&text, "hello there").contains("averyver… │"),
+            "{text}"
+        );
+        // And in the nicklist, which would otherwise run off the pane.
+        let nicklist = row_with(&text, "averyveryve");
+        assert!(nicklist.contains('…'), "{nicklist}");
+    }
+
+    #[test]
+    fn a_long_channel_name_is_cut_in_the_sidebar_and_the_prompt() {
+        let mut app = one_net_app();
+        let name = format!("#{}", "channelname".repeat(6));
+        engine(&mut app, Event::MessageReceived(chat(&name, "bob", "hi")));
+        let idx = app.buffers.iter().position(|b| b.name == name).unwrap();
+        app.switch_to(idx);
+        app.input = "typed".into();
+        app.cursor = 5;
+        let (_, text) = draw_text(&app, 80, 24);
+        // The sidebar's own cells (the header row also holds the channel name).
+        let sidebar_row = text
+            .lines()
+            .map(|l| l.chars().take(24).collect::<String>())
+            .find(|l| l.contains("#channelname"))
+            .expect("the channel is listed");
+        assert!(sidebar_row.contains('…'), "{sidebar_row}");
+        let header = text.lines().next().unwrap();
+        assert!(header.contains('…'), "the title is cut too: {header}");
+        assert!(
+            text.lines().nth(23).unwrap().contains("typed"),
+            "the prompt left room for the text: {text}"
+        );
+    }
+
+    #[test]
+    fn completion_with_many_candidates_scrolls_and_counts() {
+        let mut app = app_in_channel();
+        app.completion = Some(crate::tui::state::Completion {
+            matches: (0..20).map(|i| format!("cand{i:02}")).collect(),
+            idx: 15,
+            start: 0,
+            suffix: String::new(),
+            tail: String::new(),
+        });
+        let (_, text) = draw_text(&app, 80, 24);
+        assert!(text.contains("cand15"), "the selection is visible: {text}");
+        assert!(text.contains("16/20"), "{text}");
+        assert!(!text.contains("cand00"), "the top has scrolled away");
+        app.completion.as_mut().unwrap().idx = 0;
+        let (_, text) = draw_text(&app, 80, 24);
+        assert!(text.contains("cand00") && text.contains("1/20"));
+    }
+
+    #[test]
+    fn scroll_window_centres_the_selection_and_stays_in_range() {
+        assert_eq!(scroll_window(0, 5, 10), 0, "everything fits");
+        assert_eq!(scroll_window(3, 100, 10), 0);
+        assert_eq!(scroll_window(50, 100, 10), 45);
+        assert_eq!(scroll_window(99, 100, 10), 90, "never past the end");
+        assert_eq!(scroll_window(7, 20, 1), 7);
+    }
+
+    #[test]
+    fn wrapping_never_splits_an_emoji_cluster() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let word: String = family.repeat(6); // 12 cells, no spaces
+        for width in [3, 4, 5, 7] {
+            let lines = wrap_text(&word, width);
+            assert_eq!(lines.concat(), word, "nothing lost at width {width}");
+            for line in &lines {
+                assert!(text::width(line) <= width.max(2), "{line:?} at {width}");
+                assert!(!line.starts_with('\u{200d}'), "a joiner starts a line");
+                assert_eq!(
+                    line.matches(family).count() * family.len(),
+                    line.len(),
+                    "only whole families: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]
