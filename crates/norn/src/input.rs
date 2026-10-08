@@ -12,6 +12,9 @@ pub struct Translated {
     pub lines: Vec<String>,
     /// A local message to show the user (usage/error/help), not sent.
     pub feedback: Option<String>,
+    /// Whether `feedback` reports a mistake (usage, unknown command) rather than
+    /// plain information such as the help text.
+    pub feedback_is_error: bool,
     /// Whether the user asked to quit.
     pub quit: bool,
     /// The reason given to `/quit`, if any.
@@ -56,6 +59,7 @@ impl Translated {
     fn feedback(msg: impl Into<String>) -> Self {
         Translated {
             feedback: Some(msg.into()),
+            feedback_is_error: true,
             ..Default::default()
         }
     }
@@ -223,7 +227,10 @@ pub fn translate(input: &str, current: &mut Option<String>) -> Translated {
                 _ => Translated::feedback("usage: /invite <nick> [#channel]"),
             }
         }
-        "help" | "h" => Translated::feedback(HELP),
+        "help" | "h" => Translated {
+            feedback: Some(HELP.to_string()),
+            ..Default::default()
+        },
         "quit" => {
             let reason = if arg.is_empty() { "norn" } else { arg };
             Translated {

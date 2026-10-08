@@ -316,7 +316,7 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) -> usize {
             visual.push((i, vl));
         }
         if buffer.unread_marker == Some(i) {
-            visual.push((i, divider_line(width)));
+            visual.push((i, divider_line(width, app.accent)));
         }
         if visual.len() >= want {
             break;
@@ -333,14 +333,15 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) -> usize {
 }
 
 /// The `──── unread ────` divider line.
-fn divider_line(width: usize) -> Line<'static> {
+fn divider_line(width: usize, accent: ratatui::style::Color) -> Line<'static> {
     let label = " unread ";
     let dashes = width.saturating_sub(label.width());
     let left = dashes / 2;
     let right = dashes - left;
+    // The rule is decoration (FAINT); the label is text and must stay readable.
     Line::from(vec![
         Span::styled("─".repeat(left), Style::default().fg(theme::FAINT)),
-        Span::styled(label, Style::default().fg(theme::FAINT)),
+        Span::styled(label, Style::default().fg(accent)),
         Span::styled("─".repeat(right), Style::default().fg(theme::FAINT)),
     ])
 }
@@ -350,7 +351,21 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
     let pw = prefix_width(app);
     let text_w = width.saturating_sub(pw).max(1);
     let (time, gutter_nick, nick_color, base, mention_nick, text) = match line {
-        BufLine::Event { time, text } => (
+        // Failures get their own marker and colour; the `!!` keeps them
+        // distinguishable from joins and parts without relying on colour.
+        BufLine::Event {
+            time,
+            text,
+            error: true,
+        } => (
+            time.clone(),
+            "!!".to_string(),
+            theme::RED,
+            Style::default().fg(theme::RED),
+            None,
+            text.clone(),
+        ),
+        BufLine::Event { time, text, .. } => (
             time.clone(),
             "-!-".to_string(),
             theme::EVENT,
@@ -1051,7 +1066,7 @@ fn draw_networks_list(f: &mut Frame, area: Rect, app: &App, focused: bool) {
             Some(ConnState::Registered { .. }) => ("●", theme::GOLD),
             Some(ConnState::Connecting | ConnState::Reconnecting { .. }) => ("◐", theme::ACCENT),
             Some(_) => ("○", theme::DIM2),
-            None => ("·", theme::FAINT),
+            None => ("·", theme::DIM2),
         };
         let bg = if selected && focused {
             theme::ACTIVE_BG
@@ -1973,6 +1988,27 @@ mod tests {
         // The form shows fields including password_command, never a bare password.
         assert!(text.contains("host"));
         assert!(text.contains("password_command"));
+    }
+
+    #[test]
+    fn error_lines_get_a_red_double_bang_marker() {
+        let mut app = one_net_app();
+        app.push_error("usage: /nope".to_string());
+        app.push_active_event("carol joined #rust".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let text = buffer_text(buf);
+        assert!(text.contains("!! │ usage: /nope"), "error marker: {text}");
+        assert!(text.contains("-!- │ carol joined"), "info marker: {text}");
+        let red_marker = (0..buf.area.height).any(|y| {
+            (0..buf.area.width - 1).any(|x| {
+                buf[(x, y)].symbol() == "!"
+                    && buf[(x + 1, y)].symbol() == "!"
+                    && buf[(x, y)].fg == theme::RED
+            })
+        });
+        assert!(red_marker, "the !! marker is drawn in the error colour");
     }
 
     #[test]

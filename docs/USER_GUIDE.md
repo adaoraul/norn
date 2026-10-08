@@ -295,6 +295,11 @@ buffer). Your own nick changes and away state are announced too, and the
 network's status buffer says why a connection was abandoned (for example, every
 nickname in use).
 
+Mistakes and failures (a bad command, a missing target, a save error) appear in
+red with a `!!` marker; ordinary events keep the grey `-!-` marker. Text colours
+are kept at 4.5:1 contrast or better against the background, and the marker does
+not depend on colour alone.
+
 ### Completion
 
 `Tab` completes. In a channel it completes member nicks; at the start of a line a

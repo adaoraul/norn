@@ -63,6 +63,8 @@ pub enum Line {
         time: Option<String>,
         /// The event text.
         text: String,
+        /// Whether this reports a failure (rendered in the error style).
+        error: bool,
     },
 }
 
@@ -81,6 +83,16 @@ fn event_line(text: String) -> Line {
     Line::Event {
         time: Some(now_hm()),
         text,
+        error: false,
+    }
+}
+
+/// Build a timestamped error line.
+fn error_line(text: String) -> Line {
+    Line::Event {
+        time: Some(now_hm()),
+        text,
+        error: true,
     }
 }
 
@@ -1111,6 +1123,13 @@ impl App {
         self.dirty = true;
     }
 
+    /// Push a failure/usage message into the active buffer, in the error style.
+    pub fn push_error(&mut self, text: String) {
+        let idx = self.active;
+        self.buffers[idx].push(error_line(text));
+        self.dirty = true;
+    }
+
     /// The global console buffer index.
     fn console(&self) -> usize {
         self.buffers
@@ -1337,7 +1356,7 @@ impl App {
     /// A missing path or write error is reported into the active buffer.
     pub fn save_config(&mut self) {
         let Some(path) = self.config_path.clone() else {
-            self.push_active_event("no config file path; change not saved".to_string());
+            self.push_error("no config file path; change not saved".to_string());
             return;
         };
         let config = Config {
@@ -1349,7 +1368,7 @@ impl App {
             plugin_config: self.plugin_config.clone(),
         };
         if let Err(err) = config.save(&path) {
-            self.push_active_event(format!("save failed: {err}"));
+            self.push_error(format!("save failed: {err}"));
         }
     }
 
@@ -1444,7 +1463,7 @@ impl App {
         };
         let (file, name, empty) = (p.file.clone(), p.name.clone(), p.config.is_empty());
         if empty {
-            self.push_active_event(format!("{name} has no configurable settings"));
+            self.push_error(format!("{name} has no configurable settings"));
             return;
         }
         self.plugin_cfg = PluginConfigState {
@@ -1464,7 +1483,7 @@ impl App {
                 || p.file.eq_ignore_ascii_case(name)
                 || p.file.eq_ignore_ascii_case(&format!("{name}.rhai"))
         }) else {
-            self.push_active_event(format!("no plugin '{name}'"));
+            self.push_error(format!("no plugin '{name}'"));
             return;
         };
         self.plugins_ui.sel = idx;
@@ -1537,11 +1556,11 @@ impl App {
             .find(|n| n.name.eq_ignore_ascii_case(name))
             .cloned()
         else {
-            self.push_active_event(format!("no network '{name}' (define it with /network add)"));
+            self.push_error(format!("no network '{name}' (define it with /network add)"));
             return;
         };
         if let Err(err) = check_dialable(&config) {
-            self.push_active_event(err);
+            self.push_error(err);
             return;
         }
         let id = self.networks.len();
@@ -1562,11 +1581,11 @@ impl App {
     pub fn disconnect_active(&mut self, reason: Option<String>) {
         let net = self.active_buffer().net;
         let Some(meta) = self.networks.get(net) else {
-            self.push_active_event("no network here to disconnect".to_string());
+            self.push_error("no network here to disconnect".to_string());
             return;
         };
         if matches!(meta.state, ConnState::Disconnected | ConnState::Closed) {
-            self.push_active_event(format!("{} is not connected", meta.name));
+            self.push_error(format!("{} is not connected", meta.name));
             return;
         }
         self.actions.push(AppAction::Disconnect(net, reason));
@@ -1577,7 +1596,7 @@ impl App {
     pub fn reconnect_active(&mut self) {
         let net = self.active_buffer().net;
         let Some(meta) = self.networks.get(net) else {
-            self.push_active_event("no network here to reconnect".to_string());
+            self.push_error("no network here to reconnect".to_string());
             return;
         };
         if !matches!(meta.state, ConnState::Disconnected | ConnState::Closed) {

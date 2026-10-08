@@ -640,7 +640,7 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
         return Vec::new();
     }
     if depth > MAX_ALIAS_DEPTH {
-        app.push_active_event("alias expansion too deep (cyclic alias?)".to_string());
+        app.push_error("alias expansion too deep (cyclic alias?)".to_string());
         return Vec::new();
     }
 
@@ -655,7 +655,7 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
                         let net = app.active_buffer().net;
                         app.open_query(net, nick);
                     }
-                    None => app.push_active_event("usage: /query <nick>".to_string()),
+                    None => app.push_error("usage: /query <nick>".to_string()),
                 }
                 return Vec::new();
             }
@@ -684,7 +684,7 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
             "connect" | "server" => {
                 match arg.split_whitespace().next() {
                     Some(name) => app.connect_network(name),
-                    None => app.push_active_event("usage: /connect <name>".to_string()),
+                    None => app.push_error("usage: /connect <name>".to_string()),
                 }
                 return Vec::new();
             }
@@ -742,14 +742,18 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
     };
     // Plain text needs a target; the console and server buffers only take commands.
     if target.is_none() && !text.starts_with('/') {
-        app.push_active_event("no target here; join a channel or /query <nick>".to_string());
+        app.push_error("no target here; join a channel or /query <nick>".to_string());
         return Vec::new();
     }
 
     let mut current = target.clone();
     let result = crate::input::translate(text, &mut current);
     if let Some(feedback) = result.feedback {
-        app.push_active_event(feedback);
+        if result.feedback_is_error {
+            app.push_error(feedback);
+        } else {
+            app.push_active_event(feedback);
+        }
     }
     if result.quit {
         app.should_quit = true;
@@ -763,7 +767,7 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
     // Lines for a network that cannot take them would vanish without a trace.
     let net = app.active_buffer().net;
     if let Err(why) = app.send_ready(net) {
-        app.push_active_event(why);
+        app.push_error(why);
         return Vec::new();
     }
 
@@ -824,11 +828,11 @@ fn handle_alias(app: &mut App, arg: &str) {
         .to_ascii_lowercase();
     let expansion = it.next().unwrap_or("").trim();
     if name.is_empty() || expansion.is_empty() {
-        app.push_active_event("usage: /alias <name> <expansion>".to_string());
+        app.push_error("usage: /alias <name> <expansion>".to_string());
         return;
     }
     if STRUCTURAL.contains(&name.as_str()) {
-        app.push_active_event(format!("cannot alias the built-in command /{name}"));
+        app.push_error(format!("cannot alias the built-in command /{name}"));
         return;
     }
     app.aliases.insert(name.clone(), expansion.to_string());
@@ -848,7 +852,7 @@ fn handle_unalias(app: &mut App, arg: &str) {
         app.save_config();
         app.push_active_event(format!("removed alias /{name}"));
     } else {
-        app.push_active_event(format!("no alias /{name}"));
+        app.push_error(format!("no alias /{name}"));
     }
 }
 
@@ -875,16 +879,16 @@ fn handle_trigger(app: &mut App, arg: &str) {
         }
         "add" => {
             let Some((on, run)) = rest.split_once('=') else {
-                app.push_active_event("usage: /trigger add <on> = <run>".to_string());
+                app.push_error("usage: /trigger add <on> = <run>".to_string());
                 return;
             };
             let (on, run) = (on.trim(), run.trim());
             if on.is_empty() || run.is_empty() {
-                app.push_active_event("usage: /trigger add <on> = <run>".to_string());
+                app.push_error("usage: /trigger add <on> = <run>".to_string());
                 return;
             }
             if !crate::addons::matcher_is_valid(on) {
-                app.push_active_event(format!(
+                app.push_error(format!(
                     "unknown trigger event '{on}' (try: highlight, message, notice, join, part, quit, nick)"
                 ));
                 return;
@@ -904,11 +908,11 @@ fn handle_trigger(app: &mut App, arg: &str) {
                 .next()
                 .and_then(|s| s.parse::<usize>().ok())
             else {
-                app.push_active_event("usage: /trigger rm <number>".to_string());
+                app.push_error("usage: /trigger rm <number>".to_string());
                 return;
             };
             if n == 0 || n > app.triggers.len() {
-                app.push_active_event(format!("no trigger {n} (see /trigger ls)"));
+                app.push_error(format!("no trigger {n} (see /trigger ls)"));
                 return;
             }
             let removed = app.triggers.remove(n - 1);
@@ -919,7 +923,7 @@ fn handle_trigger(app: &mut App, arg: &str) {
                 removed.on, removed.run
             ));
         }
-        other => app.push_active_event(format!("usage: /trigger ls|add|rm (got '{other}')")),
+        other => app.push_error(format!("usage: /trigger ls|add|rm (got '{other}')")),
     }
 }
 
@@ -1050,7 +1054,7 @@ fn handle_plugins(app: &mut App, arg: &str) {
         "install" => {
             let name = rest.split_whitespace().next().unwrap_or("");
             if name.is_empty() {
-                app.push_active_event("usage: /plugins install <name>".to_string());
+                app.push_error("usage: /plugins install <name>".to_string());
                 return;
             }
             match app.install_plugin(name) {
@@ -1062,7 +1066,7 @@ fn handle_plugins(app: &mut App, arg: &str) {
             let enable = sub == "enable";
             let name = rest.split_whitespace().next().unwrap_or("");
             if name.is_empty() {
-                app.push_active_event(format!("usage: /plugins {sub} <name>"));
+                app.push_error(format!("usage: /plugins {sub} <name>"));
                 return;
             }
             match app.set_plugin_enabled(name, enable) {
@@ -1076,12 +1080,12 @@ fn handle_plugins(app: &mut App, arg: &str) {
         "config" | "configure" => {
             let name = rest.split_whitespace().next().unwrap_or("");
             if name.is_empty() {
-                app.push_active_event("usage: /plugins config <name>".to_string());
+                app.push_error("usage: /plugins config <name>".to_string());
                 return;
             }
             app.open_plugin_config(name);
         }
-        other => app.push_active_event(format!(
+        other => app.push_error(format!(
             "usage: /plugins ls|available|install|reload|enable|disable|config (got '{other}')"
         )),
     }
@@ -1164,7 +1168,7 @@ fn handle_set(app: &mut App, arg: &str) {
     };
     let value = it.collect::<Vec<_>>().join(" ");
     if value.is_empty() {
-        app.push_active_event(format!("usage: /set {key} <value>"));
+        app.push_error(format!("usage: /set {key} <value>"));
         return;
     }
     match app.set_setting(key, &value) {
@@ -1229,7 +1233,7 @@ fn handle_network(app: &mut App, arg: &str) {
             app.definitions
                 .retain(|n| !n.name.eq_ignore_ascii_case(name));
             if app.definitions.len() == before {
-                app.push_active_event(format!("no network named '{name}'"));
+                app.push_error(format!("no network named '{name}'"));
             } else {
                 app.save_config();
                 app.push_active_event(format!("removed network '{name}'"));
@@ -1243,7 +1247,7 @@ fn handle_network(app: &mut App, arg: &str) {
                 .find(|n| n.name.eq_ignore_ascii_case(name))
                 .cloned()
             else {
-                app.push_active_event(format!("no network named '{name}'"));
+                app.push_error(format!("no network named '{name}'"));
                 return;
             };
             // Live connection state, if a network of this name is connected.
@@ -1291,7 +1295,7 @@ fn handle_network(app: &mut App, arg: &str) {
             }
             app.switch_to_console();
         }
-        other => app.push_active_event(format!("usage: /network ls|add|rm|show (got '{other}')")),
+        other => app.push_error(format!("usage: /network ls|add|rm|show (got '{other}')")),
     }
 }
 
@@ -2514,6 +2518,29 @@ mod tests {
             net: 0,
             kind: crate::session::UiEventKind::Engine(event),
         });
+    }
+
+    fn last_line_is_error(app: &App) -> bool {
+        matches!(
+            app.active_buffer().lines.last(),
+            Some(crate::tui::state::Line::Event { error: true, .. })
+        )
+    }
+
+    #[test]
+    fn mistakes_are_errors_but_help_is_information() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/nope");
+        assert!(last_line_is_error(&app), "unknown command");
+        run_line(&mut app, "/kick");
+        assert!(last_line_is_error(&app), "usage");
+        run_line(&mut app, "/alias");
+        assert!(!last_line_is_error(&app), "listing aliases is information");
+
+        let mut console = app_with_channel();
+        console.switch_to(0);
+        run_line(&mut console, "/join #x");
+        assert!(last_line_is_error(&console), "cannot send from the console");
     }
 
     #[test]
