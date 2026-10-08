@@ -58,6 +58,13 @@ pub const SETTINGS: &[SettingDoc] = &[
         default: "on",
     },
     SettingDoc {
+        key: "timestamp_format",
+        category: "look & feel",
+        kind: SettingKind::Str,
+        desc: "how timestamps are written, as a strftime pattern (e.g. %H:%M:%S for seconds)",
+        default: "%H:%M",
+    },
+    SettingDoc {
         key: "nick_colors",
         category: "look & feel",
         kind: SettingKind::Bool,

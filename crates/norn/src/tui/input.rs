@@ -89,6 +89,37 @@ fn nicklist_nick_at(app: &App, y: u16) -> Option<String> {
         .map(|m| m.nick.clone())
 }
 
+/// Keys while searching the scrollback. Typing builds the query (each change
+/// jumps to the newest match); Enter or Up goes to the next-older match, Down to
+/// the next-newer; Esc leaves the search where the view is.
+fn handle_search(app: &mut App, key: &KeyEvent) -> Vec<NetCommand> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Esc => app.close_search(),
+        KeyCode::Enter | KeyCode::Up => app.search_step(true),
+        KeyCode::Down => app.search_step(false),
+        KeyCode::PageUp => return app.scroll(1).into_iter().collect(),
+        KeyCode::PageDown => return app.scroll(-1).into_iter().collect(),
+        KeyCode::Backspace => {
+            app.search.query.pop();
+            app.refresh_search();
+        }
+        // The one global key that still applies.
+        KeyCode::Char('c') if ctrl => {
+            if app.confirm(Confirm::Quit) {
+                app.should_quit = true;
+            }
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            app.search.query.push(c);
+            app.refresh_search();
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
 /// Handle text pasted into the terminal (bracketed paste). One line goes into
 /// the input at the cursor like typing would. Several lines are held back and
 /// confirmed first: sending each as its own message is rarely what a paste
@@ -180,7 +211,7 @@ fn handle_paste_confirm(app: &mut App, key: &KeyEvent) -> Vec<NetCommand> {
 fn is_arming_key(app: &App, key: &KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match app.mode {
-        Mode::Normal => ctrl && key.code == KeyCode::Char('c'),
+        Mode::Normal | Mode::Search => ctrl && key.code == KeyCode::Char('c'),
         Mode::Networks => {
             app.networks_ui.editing.is_none()
                 && app.networks_ui.focus == NetworksFocus::List
@@ -202,6 +233,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
     }
     if app.mode == Mode::PasteConfirm {
         return handle_paste_confirm(app, &key);
+    }
+    if app.mode == Mode::Search {
+        return handle_search(app, &key);
     }
     if app.mode == Mode::Switcher {
         handle_switcher(app, key);
@@ -242,6 +276,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
             app.mode = Mode::Switcher;
             app.switcher = Switcher::default();
         }
+        KeyCode::Char('f') if ctrl => app.open_search(""),
+        KeyCode::End if ctrl => app.jump_to_bottom(),
+        KeyCode::Char('u') if alt && !ctrl => app.jump_to_unread(),
         KeyCode::F(1) => app.open_help("keys"),
         KeyCode::F(2) => app.open_settings(),
         KeyCode::F(3) => app.open_networks(),
@@ -764,6 +801,7 @@ const STRUCTURAL: &[&str] = &[
     "trigger",
     "plugins",
     "keys",
+    "search",
 ];
 
 /// Max alias-expansion recursion depth (guards cyclic aliases).
@@ -873,6 +911,10 @@ fn run_command(app: &mut App, text: &str, depth: usize) -> Vec<NetCommand> {
             }
             "keys" => {
                 app.open_help("keys");
+                return Vec::new();
+            }
+            "search" => {
+                app.open_search(arg);
                 return Vec::new();
             }
             _ => {}
@@ -2076,6 +2118,80 @@ mod tests {
         );
     }
 
+    fn type_keys(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle_key(app, key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn ctrl_f_opens_a_search_that_is_driven_from_the_keyboard() {
+        let mut app = app_with_channel();
+        said(&mut app, "alice");
+        said(&mut app, "albert");
+        said(&mut app, "alice");
+        handle_key(&mut app, mods(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Search);
+        assert!(app.search.query.is_empty());
+        type_keys(&mut app, "alice");
+        assert_eq!(app.search.hits.len(), 2);
+        assert!(
+            app.input.is_empty(),
+            "typing went to the query, not the input"
+        );
+        assert_eq!(app.search.cur, 1);
+        handle_key(&mut app, key(KeyCode::Enter)); // next older
+        assert_eq!(app.search.cur, 0);
+        handle_key(&mut app, key(KeyCode::Down)); // next newer
+        assert_eq!(app.search.cur, 1);
+        handle_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.search.query, "alic");
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn search_command_starts_a_search_with_its_text() {
+        let mut app = app_with_channel();
+        said(&mut app, "alice");
+        let out = run_line(&mut app, "/search alice");
+        assert!(out.is_empty());
+        assert_eq!(app.mode, Mode::Search);
+        assert_eq!(app.search.query, "alice");
+        assert_eq!(app.search.hits.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_c_still_asks_to_quit_during_a_search() {
+        let mut app = app_with_channel();
+        handle_key(&mut app, mods(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        handle_key(&mut app, ctrl_c());
+        assert!(!app.should_quit);
+        handle_key(&mut app, ctrl_c());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_end_and_alt_u_move_through_the_scrollback() {
+        let mut app = app_with_channel();
+        for _ in 0..40 {
+            said(&mut app, "alice");
+        }
+        app.visible_lines.set(10);
+        handle_key(&mut app, key(KeyCode::PageUp));
+        assert_ne!(
+            app.active_buffer().scroll,
+            crate::tui::state::Scroll::Live,
+            "PageUp holds the view"
+        );
+        handle_key(&mut app, mods(KeyCode::End, KeyModifiers::CONTROL));
+        assert_eq!(app.active_buffer().scroll, crate::tui::state::Scroll::Live);
+        assert!(app.input.is_empty(), "Ctrl+End is not an editing key");
+        handle_key(&mut app, mods(KeyCode::Char('u'), KeyModifiers::ALT));
+        // No unread marker yet: it says so instead of doing nothing silently.
+        assert!(last_event_text(&app).contains("no unread messages"));
+    }
+
     #[test]
     fn nick_completion_offers_whoever_spoke_last_first() {
         let mut app = app_with_channel(); // alice, albert
@@ -2155,7 +2271,8 @@ mod tests {
     #[test]
     fn tab_completes_set_keys_and_values() {
         let mut app = app_with_channel();
-        assert_eq!(tab_after(&mut app, "/set time"), "/set timestamps ");
+        // "timestamp" is a prefix of two settings; the full name picks one.
+        assert_eq!(tab_after(&mut app, "/set timestamps"), "/set timestamps ");
         assert_eq!(
             tab_after(&mut app, "/set timestamps o"),
             "/set timestamps off "
@@ -2379,9 +2496,11 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(!app.client.timestamps);
         assert!(!app.timestamps, "live mirror follows the change");
-        // Row 2 is `theme` (enum); Right cycles it.
-        handle_key(&mut app, key(KeyCode::Down));
-        handle_key(&mut app, key(KeyCode::Down));
+        // Filter to `theme` (an enum); Right cycles it. (Filtering, not a row
+        // number, so adding settings elsewhere cannot break this.)
+        for c in "theme".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
         let before = app.client.theme.clone();
         handle_key(&mut app, key(KeyCode::Right));
         assert_ne!(app.client.theme, before, "theme cycled");
@@ -2401,9 +2520,8 @@ mod tests {
     fn settings_screen_edits_a_str_setting() {
         let mut app = app_with_channel();
         run_line(&mut app, "/settings");
-        // Rows: timestamps, nick_colors, theme, nicklist, completion_char, ...
-        for _ in 0..4 {
-            handle_key(&mut app, key(KeyCode::Down));
+        for c in "completion_char".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
         }
         // Enter begins editing the current value (":").
         handle_key(&mut app, key(KeyCode::Enter));

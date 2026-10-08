@@ -170,6 +170,7 @@ applies live and auto-saves.
 | Key                | Type            | Default | What it does                                                        |
 | ------------------ | --------------- | ------- | ------------------------------------------------------------------- |
 | `timestamps`       | bool            | `on`    | Show a timestamp in front of each message.                          |
+| `timestamp_format` | str             | `%H:%M` | How timestamps are written, as a strftime pattern (`%H:%M:%S` adds seconds, `%a %H:%M` the weekday). An invalid pattern is refused. |
 | `nick_colors`      | bool            | `on`    | Color nicks by a per-nick hue (off = one muted color).              |
 | `theme`            | enum            | `teal`  | Accent color: `teal`, `amber`, `green`, `blue`, `purple`, `pink`.   |
 | `nicklist`         | bool            | `on`    | Show the channel nicklist by default.                               |
@@ -276,6 +277,9 @@ locally so your side of the conversation is always visible.
 | `Ctrl+W` / `Alt+Backspace` | Delete the word before the cursor.                     |
 | `Up` / `Down`       | Recall previous / next input from history.                    |
 | `PageUp` / `PageDown` | Scroll the buffer (fetches `CHATHISTORY` when you reach the top). |
+| `Ctrl+End`          | Jump to the newest line and follow live again.                |
+| `Alt+U`             | Jump to the first unread line.                                |
+| `Ctrl+F`            | Search this buffer's scrollback (same as `/search <text>`).   |
 
 These editing keys work the same in the input line and in every inline edit (the
 settings, networks and plugin screens). `Alt+Left`/`Alt+Right` switch buffers, so
@@ -283,6 +287,26 @@ word movement is on `Ctrl+Left`/`Ctrl+Right`.
 
 `PageUp`/`PageDown` scroll by a screenful (the pane height less two lines); the
 mouse wheel scrolls three lines per notch.
+
+### Scrolling and searching
+
+Scrolling holds your place: if you scroll up to read, new messages arriving below
+do not move what is on screen (the `↑ N more` hint counts what is above), and
+`PageUp` can always reach the very first line, however much the lines wrap.
+Switching to another buffer and back returns to the live end. `Ctrl+End` gets
+there directly, and `Alt+U` takes you to the first line that arrived since you
+last looked at the buffer.
+
+`Ctrl+F` (or `/search <text>`) searches the lines held in the active buffer,
+ignoring case, matching the sender as well as the text. Every occurrence is
+highlighted, the current match has a `▶` in the gutter, and the input line shows
+`search: <text>   2/7`. Typing changes the query and jumps to the newest match;
+`Enter` or `Up` goes to the next-older match, `Down` to the next-newer, and `Esc`
+leaves the search where you are. Only lines still in memory are searched (see
+`scrollback_lines`).
+
+Timestamps follow `timestamp_format`, and a line of the form `── Thu 8 Oct 2026 ──`
+marks where the date changes (shown while timestamps are on).
 
 ### Pasting
 

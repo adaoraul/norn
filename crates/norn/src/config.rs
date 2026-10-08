@@ -99,6 +99,9 @@ fn default_port() -> u16 {
 fn default_theme() -> String {
     "teal".to_string()
 }
+fn default_timestamp_format() -> String {
+    crate::tui::state::DEFAULT_TIMESTAMP_FORMAT.to_string()
+}
 fn default_completion_char() -> String {
     ":".to_string()
 }
@@ -166,6 +169,9 @@ pub struct ClientConfig {
     /// Whether to show message timestamps.
     #[serde(default = "default_true")]
     pub timestamps: bool,
+    /// How timestamps are written, as a strftime pattern (default `%H:%M`).
+    #[serde(default = "default_timestamp_format")]
+    pub timestamp_format: String,
     /// Whether to color nicks by a per-nick hue (off = a single muted color).
     #[serde(default = "default_true")]
     pub nick_colors: bool,
@@ -200,6 +206,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         ClientConfig {
             timestamps: true,
+            timestamp_format: default_timestamp_format(),
             nick_colors: true,
             theme: default_theme(),
             nicklist: true,

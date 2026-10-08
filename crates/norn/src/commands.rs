@@ -633,6 +633,20 @@ send/notify/nick.",
         examples: &["/raw WHOIS bob", "/raw PRIVMSG #rust :hi"],
     },
     CommandDoc {
+        name: "search",
+        category: "Client",
+        usage: "/search <text>",
+        summary: "Search this buffer's scrollback",
+        description: "Highlight every line of the active buffer that contains the \
+text (ignoring case) and go to the newest match. Enter or Up goes to the next-older \
+match, Down to the next-newer, Esc leaves the search. Ctrl+F starts a search with \
+nothing typed yet. Only lines still held in memory are searched.",
+        aliases: &[],
+        params: &[req("text", ArgKind::Free, "what to look for")],
+        subcommands: &[],
+        examples: &["/search deploy", "/search alice"],
+    },
+    CommandDoc {
         name: "keys",
         category: "Client",
         usage: "/keys",

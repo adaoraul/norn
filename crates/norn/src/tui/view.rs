@@ -418,9 +418,52 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The fixed left gutter width: timestamp + nick column + `" │ "`.
+/// The width of the timestamp column for the configured format: the widest a
+/// timestamp in that format can be (the longest weekday and month names, the
+/// largest numbers), so the column never shifts as the clock changes.
+fn timestamp_width(app: &App) -> usize {
+    use chrono::TimeZone;
+    // Wednesday 30 September 2026, 23:59:59: English's longest weekday and month.
+    let widest = chrono::Local
+        .with_ymd_and_hms(2026, 9, 30, 23, 59, 59)
+        .single();
+    widest.map_or(5, |t| {
+        super::state::format_time(&t, &app.client.timestamp_format).width()
+    })
+}
+
+/// The fixed left gutter width: timestamp + a space + nick column + `" │ "`.
 fn prefix_width(app: &App) -> usize {
-    (if app.timestamps { 6 } else { 0 }) + NICK_COL + 3
+    (if app.timestamps {
+        timestamp_width(app) + 1
+    } else {
+        0
+    }) + NICK_COL
+        + 3
+}
+
+/// A rule with a label in the middle, like the unread divider: `── label ──`.
+fn labelled_rule(width: usize, label: &str, label_color: ratatui::style::Color) -> Line<'static> {
+    let label = format!(" {label} ");
+    let dashes = width.saturating_sub(label.width());
+    let left = dashes / 2;
+    Line::from(vec![
+        Span::styled("─".repeat(left), Style::default().fg(theme::FAINT)),
+        Span::styled(label, Style::default().fg(label_color)),
+        Span::styled("─".repeat(dashes - left), Style::default().fg(theme::FAINT)),
+    ])
+}
+
+/// The day separator shown where the date changes between two lines.
+fn day_separator(width: usize, date: chrono::NaiveDate) -> Line<'static> {
+    labelled_rule(width, &date.format("%a %-d %b %Y").to_string(), theme::DIM2)
+}
+
+/// Whether a separator belongs between `earlier` and `later`: both have times
+/// and fall on different local days. A line without a time never starts a day.
+fn new_day(earlier: Option<&BufLine>, later: &BufLine) -> Option<chrono::NaiveDate> {
+    let (a, b) = (earlier?.time()?, later.time()?);
+    (a.date_naive() != b.date_naive()).then(|| b.date_naive())
 }
 
 /// Draw the message list, bottom-anchored and word-wrapped, with the unread
@@ -430,28 +473,73 @@ fn draw_messages(f: &mut Frame, area: Rect, app: &App) -> usize {
     let buffer = app.active_buffer();
     let width = area.width as usize;
     let height = area.height as usize;
-    let want = height + buffer.scroll;
+    if buffer.lines.is_empty() || height == 0 {
+        app.visible_lines.set(height.max(1));
+        return 0;
+    }
+    let last = buffer.lines.len() - 1;
+    let bottom = buffer.bottom_index();
+    let marker = buffer.unread_marker.and_then(|m| buffer.index_of(m));
 
-    // Build wrapped visual lines from the bottom up, tagged with their source
-    // line index; insert the unread divider above the marked line.
-    let mut visual: Vec<(usize, Line)> = Vec::new();
-    for (i, line) in buffer.lines.iter().enumerate().rev() {
-        for vl in wrap_buf_line(app, line, width).into_iter().rev() {
-            visual.push((i, vl));
+    // Build wrapped rows from the bottom line upward, each tagged with its source
+    // line; the unread divider goes above the marked line. Stop once full.
+    let mut rows: Vec<(usize, Line)> = Vec::new();
+    for i in (0..=bottom).rev() {
+        let hit = app.current_hit() == Some(buffer.seq_of(i));
+        for row in wrap_buf_line(app, &buffer.lines[i], width, hit)
+            .into_iter()
+            .rev()
+        {
+            rows.push((i, row));
         }
-        if buffer.unread_marker == Some(i) {
-            visual.push((i, divider_line(width, app.accent)));
+        if marker == Some(i) {
+            rows.push((i, divider_line(width, app.accent)));
         }
-        if visual.len() >= want {
+        // Where the date changes, a separator above the first line of the day
+        // (above the unread divider too: the day comes first).
+        if app.timestamps && i > 0 {
+            if let Some(day) = new_day(buffer.lines.get(i - 1), &buffer.lines[i]) {
+                rows.push((i, day_separator(width, day)));
+            }
+        }
+        if rows.len() >= height {
             break;
         }
     }
-    let vis: Vec<(usize, Line)> = visual.into_iter().rev().collect();
-    let n = vis.len();
-    let end = n.saturating_sub(buffer.scroll);
-    let start = end.saturating_sub(height);
-    let lines_above = vis.get(start).map(|(i, _)| *i).unwrap_or(0);
-    let shown: Vec<Line> = vis[start..end].iter().map(|(_, l)| l.clone()).collect();
+    rows.reverse();
+
+    // Held partway up with the top of the buffer reached before the pane filled:
+    // fill the rest from the lines below instead of leaving a gap.
+    let mut extended = false;
+    let mut next = bottom + 1;
+    while rows.len() < height && next <= last {
+        extended = true;
+        if app.timestamps {
+            if let Some(day) = new_day(buffer.lines.get(next - 1), &buffer.lines[next]) {
+                rows.push((next, day_separator(width, day)));
+            }
+        }
+        if marker == Some(next) {
+            rows.push((next, divider_line(width, app.accent)));
+        }
+        let hit = app.current_hit() == Some(buffer.seq_of(next));
+        for row in wrap_buf_line(app, &buffer.lines[next], width, hit) {
+            rows.push((next, row));
+        }
+        next += 1;
+    }
+
+    let (start, end) = if extended {
+        (0, rows.len().min(height))
+    } else {
+        (rows.len().saturating_sub(height), rows.len())
+    };
+    let lines_above = rows.get(start).map(|(i, _)| *i).unwrap_or(0);
+    // Tell the key handling how many lines a page is: what is on screen now.
+    let mut shown_lines: Vec<usize> = rows[start..end].iter().map(|(i, _)| *i).collect();
+    shown_lines.dedup();
+    app.visible_lines.set(shown_lines.len().max(1));
+    let shown: Vec<Line> = rows[start..end].iter().map(|(_, l)| l.clone()).collect();
     f.render_widget(Paragraph::new(shown), area);
     lines_above
 }
@@ -471,7 +559,11 @@ fn divider_line(width: usize, accent: ratatui::style::Color) -> Line<'static> {
 }
 
 /// Wrap one buffer line into its visual (possibly multiple) lines.
-fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> {
+fn wrap_buf_line(app: &App, line: &BufLine, width: usize, hit: bool) -> Vec<Line<'static>> {
+    // While searching, every occurrence of the query is highlighted; `hit` marks
+    // the match the view is on.
+    let search = (app.mode == Mode::Search && !app.search.query.is_empty())
+        .then_some(app.search.query.as_str());
     let pw = prefix_width(app);
     let text_w = width.saturating_sub(pw).max(1);
     let (time, gutter_nick, nick_color, base, mention_nick, text) = match line {
@@ -482,7 +574,7 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
             text,
             error: true,
         } => (
-            time.clone(),
+            *time,
             "!!".to_string(),
             theme::RED,
             Style::default().fg(theme::RED),
@@ -490,7 +582,7 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
             text.clone(),
         ),
         BufLine::Event { time, text, .. } => (
-            time.clone(),
+            *time,
             "-!-".to_string(),
             theme::EVENT,
             Style::default().fg(theme::EVENT),
@@ -510,7 +602,7 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
             if *action {
                 // `* nick does something`, all in the sender's color.
                 (
-                    time.clone(),
+                    *time,
                     "*".to_string(),
                     color,
                     Style::default().fg(color),
@@ -519,7 +611,7 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
                 )
             } else {
                 (
-                    time.clone(),
+                    *time,
                     nick.clone(),
                     color,
                     if *notice {
@@ -540,8 +632,17 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
         let mut spans: Vec<Span> = Vec::new();
         if i == 0 {
             if app.timestamps {
+                // Padded (or cut) to the column width; a line with no time
+                // leaves it blank.
+                let w = pw - NICK_COL - 3 - 1;
+                let stamp = time
+                    .as_ref()
+                    .map(|t| super::state::format_time(t, &app.client.timestamp_format))
+                    .unwrap_or_default();
+                let stamp = truncate(&stamp, w);
+                let pad = " ".repeat(w.saturating_sub(stamp.width()));
                 spans.push(Span::styled(
-                    format!("{:5} ", time.clone().unwrap_or_default()),
+                    format!("{stamp}{pad} "),
                     Style::default().fg(theme::DIM2),
                 ));
             }
@@ -549,9 +650,12 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
                 pad_left(&gutter_nick, NICK_COL),
                 Style::default().fg(nick_color),
             ));
-            // A line that mentions us gets a gold bar in the gutter, so it can
-            // be found while scrolling without relying on the highlight colour.
-            if mention_nick.is_some() {
+            // The current search match gets an arrow; a line that mentions us a
+            // gold bar. Both can be found while scrolling without relying on
+            // the highlight colour.
+            if hit {
+                spans.push(Span::styled(" ▶ ", Style::default().fg(theme::GOLD)));
+            } else if mention_nick.is_some() {
                 spans.push(Span::styled(" ▌ ", Style::default().fg(theme::GOLD)));
             } else {
                 spans.push(Span::styled(" │ ", Style::default().fg(theme::FAINT)));
@@ -559,14 +663,50 @@ fn wrap_buf_line(app: &App, line: &BufLine, width: usize) -> Vec<Line<'static>> 
         } else {
             spans.push(Span::raw(" ".repeat(pw)));
         }
-        spans.extend(styled_chunk(chunk, base, mention_nick.as_deref()));
+        spans.extend(styled_chunk(chunk, base, mention_nick.as_deref(), search));
         out.push(Line::from(spans));
     }
     out
 }
 
-/// Style a text chunk, highlighting a whole-word mention of `nick` if present.
-fn styled_chunk(chunk: &str, base: Style, mention: Option<&str>) -> Vec<Span<'static>> {
+/// Style a text chunk. A search query highlights every occurrence; otherwise a
+/// whole-word mention of `nick` is highlighted if present.
+fn styled_chunk(
+    chunk: &str,
+    base: Style,
+    mention: Option<&str>,
+    search: Option<&str>,
+) -> Vec<Span<'static>> {
+    if let Some(query) = search {
+        let mut spans = Vec::new();
+        let (bytes, needle) = (chunk.as_bytes(), query.as_bytes());
+        let mut from = 0;
+        let mut i = 0;
+        while i + needle.len() <= bytes.len() {
+            if bytes[i..i + needle.len()].eq_ignore_ascii_case(needle)
+                && chunk.is_char_boundary(i)
+                && chunk.is_char_boundary(i + needle.len())
+            {
+                if from < i {
+                    spans.push(Span::styled(chunk[from..i].to_string(), base));
+                }
+                spans.push(Span::styled(
+                    chunk[i..i + needle.len()].to_string(),
+                    Style::default().fg(theme::BRIGHT).bg(theme::HL_BG),
+                ));
+                i += needle.len();
+                from = i;
+            } else {
+                i += 1;
+            }
+        }
+        if from < chunk.len() {
+            spans.push(Span::styled(chunk[from..].to_string(), base));
+        }
+        if !spans.is_empty() {
+            return spans;
+        }
+    }
     if let Some(nick) = mention {
         if let Some((start, end)) = find_word(chunk, nick) {
             return vec![
@@ -788,6 +928,29 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App, lines_above: usize) {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App) {
+    // While searching, the input line becomes the search box.
+    if app.mode == Mode::Search {
+        let s = &app.search;
+        let count = if s.query.is_empty() {
+            "type to search · Enter/↑ older · ↓ newer · Esc done".to_string()
+        } else if s.hits.is_empty() {
+            "no matches".to_string()
+        } else {
+            format!("{}/{}", s.cur + 1, s.hits.len())
+        };
+        let prompt = "search: ";
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prompt, Style::default().fg(theme::GOLD)),
+                Span::styled(s.query.clone(), Style::default().fg(theme::BRIGHT)),
+                Span::styled(format!("   {count}"), Style::default().fg(theme::DIM2)),
+            ])),
+            area,
+        );
+        let x = area.x + (prompt.width() + s.query.width()) as u16;
+        f.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
+        return;
+    }
     let buffer = app.active_buffer();
     let prompt = match buffer.kind {
         BufferKind::Server => "> ".to_string(),
@@ -2624,6 +2787,233 @@ mod tests {
             text.contains("#room23"),
             "selection scrolled into view: {text}"
         );
+    }
+
+    fn app_with_long_lines(n: usize) -> (App, usize) {
+        let mut app = one_net_app();
+        for i in 0..n {
+            // Each message wraps onto several rows at this width.
+            let text = format!("L{i:02} {}", "word ".repeat(30));
+            engine(
+                &mut app,
+                Event::MessageReceived(chat("#rust", "bob", &text)),
+            );
+        }
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        (app, rust)
+    }
+
+    #[test]
+    fn scrolling_up_reaches_the_first_line_even_when_lines_wrap() {
+        let (mut app, _) = app_with_long_lines(40);
+        let (_, text) = draw_text(&app, 80, 24);
+        assert!(text.contains("L39 "), "following live shows the newest");
+        assert!(!text.contains("L00 "));
+        // Page all the way up.
+        for _ in 0..40 {
+            app.scroll(1);
+            draw_text(&app, 80, 24); // lets the view report its page size
+        }
+        let (_, text) = draw_text(&app, 80, 24);
+        assert!(
+            text.contains("L00 "),
+            "the very first line is reachable: {text}"
+        );
+        assert!(!text.contains("L39 "));
+    }
+
+    #[test]
+    fn paging_never_skips_lines_that_wrap() {
+        let (mut app, _) = app_with_long_lines(40);
+        draw_text(&app, 80, 24);
+        let mut seen: std::collections::BTreeSet<usize> = (0..40)
+            .filter(|i| draw_text(&app, 80, 24).1.contains(&format!("L{i:02} ")))
+            .collect();
+        for _ in 0..60 {
+            app.scroll(1);
+            let (_, text) = draw_text(&app, 80, 24);
+            seen.extend((0..40).filter(|i| text.contains(&format!("L{i:02} "))));
+        }
+        let all: std::collections::BTreeSet<usize> = (0..40).collect();
+        assert_eq!(seen, all, "every message was on screen at some point");
+    }
+
+    #[test]
+    fn a_held_view_keeps_showing_the_same_message_as_new_ones_arrive() {
+        let (mut app, rust) = app_with_long_lines(40);
+        draw_text(&app, 80, 24);
+        app.scroll(2);
+        let (_, before) = draw_text(&app, 80, 24);
+        let newest_before = (0..40)
+            .rev()
+            .find(|i| before.contains(&format!("L{i:02} ")));
+        for i in 40..50 {
+            let text = format!("L{i:02} {}", "word ".repeat(30));
+            engine(
+                &mut app,
+                Event::MessageReceived(chat("#rust", "bob", &text)),
+            );
+        }
+        assert_ne!(app.buffers[rust].scroll, crate::tui::state::Scroll::Live);
+        let (_, after) = draw_text(&app, 80, 24);
+        let newest_after = (0..50).rev().find(|i| after.contains(&format!("L{i:02} ")));
+        assert_eq!(newest_before, newest_after, "the screen did not move");
+        // And the page size tracks what the screen holds.
+        assert!(app.visible_lines.get() >= 2 && app.visible_lines.get() < 24);
+    }
+
+    #[test]
+    fn search_highlights_matches_marks_the_current_one_and_shows_the_count() {
+        let mut app = one_net_app();
+        for t in ["first needle here", "nothing", "a NEEDLE again", "last"] {
+            engine(&mut app, Event::MessageReceived(chat("#rust", "bob", t)));
+        }
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        app.open_search("needle");
+        let (buf, text) = draw_text(&app, 100, 24);
+        // The prompt shows the query and where we are among the matches.
+        assert!(text.contains("search: needle"), "{text}");
+        assert!(text.contains("2/2"), "{text}");
+        // The current (newest) match carries the arrow; the older one does not.
+        assert!(row_with(&text, "a NEEDLE again").contains('▶'), "{text}");
+        assert!(!row_with(&text, "first needle here").contains('▶'));
+        // Both occurrences are highlighted, in their original case.
+        let highlighted = |row: &str| -> String {
+            let y = text.lines().position(|l| l == row).unwrap() as u16;
+            (0..buf.area.width)
+                .filter(|x| buf[(*x, y)].bg == theme::HL_BG)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        };
+        assert_eq!(highlighted(row_with(&text, "a NEEDLE again")), "NEEDLE");
+        assert_eq!(highlighted(row_with(&text, "first needle here")), "needle");
+        // Without a search, nothing is highlighted.
+        app.close_search();
+        let (buf, _) = draw_text(&app, 100, 24);
+        assert!(!(0..24u16).any(|y| (0..100u16).any(|x| buf[(x, y)].bg == theme::HL_BG)));
+    }
+
+    /// A local date and time: year, month, day, hour, minute, second.
+    type Stamp = (i32, u32, u32, u32, u32, u32);
+
+    /// Replay messages sent at the given local times into `#rust`.
+    fn app_with_timed_messages(times: &[Option<Stamp>]) -> App {
+        use chrono::TimeZone;
+        let mut app = one_net_app();
+        let messages: Vec<irc_engine::ChatMessage> = times
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let mut m = chat("#rust", "bob", &format!("msg{i}"));
+                m.time = t.map(|(y, mo, d, h, mi, s)| {
+                    chrono::Local
+                        .with_ymd_and_hms(y, mo, d, h, mi, s)
+                        .unwrap()
+                        .with_timezone(&chrono::Utc)
+                });
+                m
+            })
+            .collect();
+        engine(
+            &mut app,
+            Event::HistoryLoaded {
+                target: "#rust".into(),
+                messages,
+                complete: true,
+            },
+        );
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        app
+    }
+
+    #[test]
+    fn timestamps_follow_the_configured_format() {
+        let mut app = app_with_timed_messages(&[Some((2026, 10, 8, 9, 5, 7))]);
+        let (_, text) = draw_text(&app, 100, 24);
+        assert!(row_with(&text, "msg0").contains("09:05 "), "{text}");
+        app.client.timestamp_format = "%H:%M:%S".into();
+        let (_, text) = draw_text(&app, 100, 24);
+        assert!(row_with(&text, "msg0").contains("09:05:07 "), "{text}");
+        // An invalid pattern falls back instead of panicking the draw.
+        app.client.timestamp_format = "%Q".into();
+        let (_, text) = draw_text(&app, 100, 24);
+        assert!(row_with(&text, "msg0").contains("09:05 "), "{text}");
+    }
+
+    #[test]
+    fn the_timestamp_column_is_as_wide_as_the_widest_possible_stamp() {
+        // Monday and Wednesday differ in length with %A; the columns must not.
+        let mut app = app_with_timed_messages(&[
+            Some((2026, 10, 5, 9, 0, 0)), // Monday
+            Some((2026, 10, 7, 9, 0, 0)), // Wednesday
+        ]);
+        app.client.timestamp_format = "%A %H:%M".into();
+        let (_, text) = draw_text(&app, 100, 24);
+        let bar = |needle: &str| row_with(&text, needle).chars().position(|c| c == '│');
+        let first = bar("msg0");
+        assert!(first.is_some());
+        // Same column for the shorter weekday as for the longer.
+        let gutter = |needle: &str| {
+            row_with(&text, needle)
+                .chars()
+                .skip(25)
+                .position(|c| c == '│')
+        };
+        assert_eq!(gutter("msg0"), gutter("msg1"), "{text}");
+        assert!(row_with(&text, "msg0").contains("Monday 09:00"));
+        assert!(row_with(&text, "msg1").contains("Wednesday 09:00"));
+    }
+
+    #[test]
+    fn a_separator_marks_where_the_date_changes() {
+        let app = app_with_timed_messages(&[
+            Some((2026, 10, 7, 23, 58, 0)),
+            Some((2026, 10, 7, 23, 59, 0)),
+            Some((2026, 10, 8, 0, 1, 0)),
+            Some((2026, 10, 8, 0, 2, 0)),
+        ]);
+        let (_, text) = draw_text(&app, 100, 24);
+        assert!(text.contains("Thu 8 Oct 2026"), "{text}");
+        assert_eq!(text.matches("Oct 2026").count(), 1, "only where it changes");
+        // The separator sits between the two days' messages.
+        let y = |needle: &str| text.lines().position(|l| l.contains(needle)).unwrap();
+        assert!(y("msg1") < y("Thu 8 Oct 2026") && y("Thu 8 Oct 2026") < y("msg2"));
+    }
+
+    #[test]
+    fn no_separator_without_timestamps_or_without_a_time() {
+        let app = app_with_timed_messages(&[
+            Some((2026, 10, 7, 23, 59, 0)),
+            None,
+            Some((2026, 10, 8, 0, 1, 0)),
+        ]);
+        // A line with no time breaks the comparison: nothing to compare.
+        let (_, text) = draw_text(&app, 100, 24);
+        assert!(!text.contains("Oct 2026"), "{text}");
+        let mut app2 = app_with_timed_messages(&[
+            Some((2026, 10, 7, 23, 59, 0)),
+            Some((2026, 10, 8, 0, 1, 0)),
+        ]);
+        app2.timestamps = false;
+        let (_, text) = draw_text(&app2, 100, 24);
+        assert!(!text.contains("Oct 2026"), "off with the timestamps");
+    }
+
+    #[test]
+    fn search_with_no_match_says_so() {
+        let mut app = one_net_app();
+        engine(
+            &mut app,
+            Event::MessageReceived(chat("#rust", "bob", "hello")),
+        );
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        app.open_search("zzz");
+        let (_, text) = draw_text(&app, 100, 24);
+        assert!(text.contains("no matches"), "{text}");
     }
 
     #[test]

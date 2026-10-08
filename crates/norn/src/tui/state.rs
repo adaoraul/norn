@@ -23,8 +23,8 @@ const HISTORY_PAGE: usize = 50;
 /// `/msg NickServ IDENTIFY ...`, and passwords never go to disk.
 pub const HISTORY_MAX: usize = 500;
 
-/// The message-pane height assumed until the first draw reports the real one.
-const DEFAULT_MSG_ROWS: usize = 12;
+/// The number of visible lines assumed until the first draw reports the real one.
+const DEFAULT_VISIBLE_LINES: usize = 12;
 
 /// How many lines one mouse-wheel notch scrolls.
 pub const WHEEL_LINES: isize = 3;
@@ -53,8 +53,8 @@ pub enum BufferKind {
 pub enum Line {
     /// A chat message.
     Chat {
-        /// Formatted `HH:MM`, if the message carried a time.
-        time: Option<String>,
+        /// When it was sent (the server's time if it gave one), in local time.
+        time: Option<LineTime>,
         /// The sender nick.
         nick: String,
         /// The message text.
@@ -70,8 +70,8 @@ pub enum Line {
     },
     /// A status/event line (joins, topics, notices).
     Event {
-        /// Local `HH:MM` when the event was received.
-        time: Option<String>,
+        /// When the event was received, in local time.
+        time: Option<LineTime>,
         /// The event text.
         text: String,
         /// Whether this reports a failure (rendered in the error style).
@@ -79,20 +79,54 @@ pub enum Line {
     },
 }
 
-/// Current local time as `HH:MM`.
-fn now_hm() -> String {
-    Local::now().format("%H:%M").to_string()
+/// A line's timestamp. Kept as a real time, not text, so the display format is a
+/// setting and day changes can be told apart.
+pub type LineTime = chrono::DateTime<Local>;
+
+impl Line {
+    /// When the line happened, if known.
+    pub fn time(&self) -> Option<LineTime> {
+        match self {
+            Line::Chat { time, .. } | Line::Event { time, .. } => *time,
+        }
+    }
+
+    /// The text a search looks through: the sender and the message for chat,
+    /// the text for events.
+    pub fn searchable(&self) -> String {
+        match self {
+            Line::Chat { nick, text, .. } => format!("{nick} {text}"),
+            Line::Event { text, .. } => text.clone(),
+        }
+    }
 }
 
-/// Format a UTC message time as local `HH:MM`.
-fn local_hm(time: chrono::DateTime<chrono::Utc>) -> String {
-    time.with_timezone(&Local).format("%H:%M").to_string()
+/// Whether `haystack` contains `needle`, ignoring ASCII case. An empty needle
+/// matches nothing (a search needs something to look for).
+pub fn contains_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// The current local time.
+fn now() -> LineTime {
+    Local::now()
+}
+
+/// A UTC message time in local time.
+fn local(time: chrono::DateTime<chrono::Utc>) -> LineTime {
+    time.with_timezone(&Local)
 }
 
 /// Build a timestamped event line.
 fn event_line(text: String) -> Line {
     Line::Event {
-        time: Some(now_hm()),
+        time: Some(now()),
         text,
         error: false,
     }
@@ -101,10 +135,31 @@ fn event_line(text: String) -> Line {
 /// Build a timestamped error line.
 fn error_line(text: String) -> Line {
     Line::Event {
-        time: Some(now_hm()),
+        time: Some(now()),
         text,
         error: true,
     }
+}
+
+/// The default `timestamp_format`: hours and minutes.
+pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%H:%M";
+
+/// Whether `format` is a usable strftime pattern: non-empty and with no
+/// unknown specifiers (which would make formatting fail).
+pub fn valid_timestamp_format(format: &str) -> bool {
+    use chrono::format::{Item, StrftimeItems};
+    !format.is_empty() && !StrftimeItems::new(format).any(|item| matches!(item, Item::Error))
+}
+
+/// Format `time` with a strftime `format`, falling back to the default if the
+/// pattern is invalid (a hand-edited config file could hold one).
+pub fn format_time(time: &LineTime, format: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    if valid_timestamp_format(format) && write!(out, "{}", time.format(format)).is_ok() {
+        return out;
+    }
+    time.format(DEFAULT_TIMESTAMP_FORMAT).to_string()
 }
 
 /// The inner text of a CTCP ACTION (`\x01ACTION ...\x01`), if `text` is one.
@@ -149,6 +204,17 @@ pub struct NetworkMeta {
     pub account: Option<String>,
 }
 
+/// Where a buffer's view sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scroll {
+    /// Following the newest line.
+    #[default]
+    Live,
+    /// Held with the line of this sequence number at the bottom edge, so new
+    /// messages arriving below do not move what the user is reading.
+    Anchor(i64),
+}
+
 /// A single buffer (server status, channel, or query).
 #[derive(Debug, Clone)]
 pub struct Buffer {
@@ -168,15 +234,21 @@ pub struct Buffer {
     pub unread: usize,
     /// Whether an unread line mentions us.
     pub mentioned: bool,
-    /// Line index where reading last stopped (for the unread divider).
-    pub unread_marker: Option<usize>,
+    /// The sequence number of the first line that was unread when reading last
+    /// stopped (the unread divider is drawn above it). A sequence number, not an
+    /// index, so it stays put when history is loaded above it or old lines are
+    /// trimmed.
+    pub unread_marker: Option<i64>,
     /// Whether an older-history request is in flight (avoids duplicate loads).
     pub history_pending: bool,
     /// Whether the server has reported no older history remains (a short page),
     /// so scrolling up should stop requesting.
     pub history_exhausted: bool,
-    /// Lines scrolled up from the bottom (0 = following live).
-    pub scroll: usize,
+    /// Where the view sits: following the newest line, or held at one.
+    pub scroll: Scroll,
+    /// The sequence number of `lines[0]`. A line's number never changes: trimming
+    /// the front raises this, loading older history lowers it.
+    pub base_seq: i64,
     /// Maximum lines retained (the `scrollback_lines` client setting).
     pub max_lines: usize,
     /// A channel's flag modes, e.g. `+nt` (empty when unknown or none).
@@ -205,7 +277,8 @@ impl Buffer {
             unread_marker: None,
             history_pending: false,
             history_exhausted: false,
-            scroll: 0,
+            scroll: Scroll::Live,
+            base_seq: 0,
             max_lines,
             modes: String::new(),
             joined: true,
@@ -223,25 +296,63 @@ impl Buffer {
 
     fn push(&mut self, line: Line) {
         self.lines.push(line);
+        self.trim();
+    }
+
+    /// Drop the oldest lines beyond the cap. Their numbers go with them; the
+    /// rest keep theirs, so the view and the unread marker stay where they are.
+    fn trim(&mut self) {
         if self.lines.len() > self.max_lines {
             let overflow = self.lines.len() - self.max_lines;
             self.lines.drain(0..overflow);
-            if let Some(marker) = &mut self.unread_marker {
-                *marker = marker.saturating_sub(overflow);
-            }
+            self.base_seq += overflow as i64;
         }
     }
 
     /// Change the retained-line cap, trimming immediately if it shrank.
     fn set_max_lines(&mut self, max_lines: usize) {
         self.max_lines = max_lines.max(1);
-        if self.lines.len() > self.max_lines {
-            let overflow = self.lines.len() - self.max_lines;
-            self.lines.drain(0..overflow);
-            if let Some(marker) = &mut self.unread_marker {
-                *marker = marker.saturating_sub(overflow);
-            }
+        self.trim();
+    }
+
+    /// Put older lines (oldest first) above everything held. Numbers of the
+    /// existing lines are unchanged.
+    fn prepend(&mut self, mut older: Vec<Line>) {
+        self.base_seq -= older.len() as i64;
+        older.append(&mut self.lines);
+        self.lines = older;
+    }
+
+    /// The sequence number of the line at `index`.
+    pub fn seq_of(&self, index: usize) -> i64 {
+        self.base_seq + index as i64
+    }
+
+    /// The index of the line with sequence number `seq`, if it is still held.
+    pub fn index_of(&self, seq: i64) -> Option<usize> {
+        let offset = seq.checked_sub(self.base_seq)?;
+        usize::try_from(offset)
+            .ok()
+            .filter(|&i| i < self.lines.len())
+    }
+
+    /// The index of the line at the bottom edge of the view.
+    pub fn bottom_index(&self) -> usize {
+        let last = self.lines.len().saturating_sub(1);
+        match self.scroll {
+            Scroll::Live => last,
+            Scroll::Anchor(seq) => usize::try_from(seq - self.base_seq).unwrap_or(0).min(last),
         }
+    }
+
+    /// Hold the view with `index` at the bottom edge (following live again when
+    /// that is the newest line).
+    fn hold_at(&mut self, index: usize) {
+        self.scroll = if index + 1 >= self.lines.len() {
+            Scroll::Live
+        } else {
+            Scroll::Anchor(self.seq_of(index))
+        };
     }
 
     /// Members sorted for display: by prefix rank, then nick.
@@ -301,6 +412,19 @@ pub enum Mode {
     PluginConfig,
     /// A multi-line paste is waiting for Enter (send) or Esc (discard).
     PasteConfirm,
+    /// Searching the active buffer's scrollback (Ctrl+F, `/search`).
+    Search,
+}
+
+/// An in-progress search of the active buffer.
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    /// What is being looked for (matched ignoring ASCII case).
+    pub query: String,
+    /// The sequence numbers of the matching lines, oldest first.
+    pub hits: Vec<i64>,
+    /// Which of `hits` the view is on.
+    pub cur: usize,
 }
 
 /// Which pane of the `/help` panel has focus.
@@ -630,9 +754,12 @@ pub struct App {
     pub armed: Option<(Confirm, std::time::Instant)>,
     /// The lines of a multi-line paste awaiting confirmation (`Mode::PasteConfirm`).
     pub paste: Vec<String>,
-    /// How many rows the message pane had when last drawn; PageUp/PageDown move
-    /// by about this much.
-    pub msg_rows: usize,
+    /// The search in progress (`Mode::Search`).
+    pub search: SearchState,
+    /// How many whole lines the message pane showed when last drawn. Written by
+    /// the view (hence the `Cell`), read when paging so a page is what the user
+    /// just saw, however much the lines wrap.
+    pub visible_lines: std::cell::Cell<usize>,
 }
 
 impl App {
@@ -700,7 +827,8 @@ impl App {
             lag: std::collections::HashMap::new(),
             armed: None,
             paste: Vec::new(),
-            msg_rows: DEFAULT_MSG_ROWS,
+            search: SearchState::default(),
+            visible_lines: std::cell::Cell::new(DEFAULT_VISIBLE_LINES),
         }
     }
 
@@ -782,7 +910,7 @@ impl App {
             .map(|m| m.my_nick.clone())
             .unwrap_or_default();
         self.buffers[idx].push(Line::Chat {
-            time: Some(now_hm()),
+            time: Some(now()),
             nick,
             text: out.text.clone(),
             notice: out.notice,
@@ -906,7 +1034,7 @@ impl App {
                 let line = Line::Chat {
                     // Fall back to the local receipt time when the message has no
                     // server-time tag (e.g. NickServ notices during connect).
-                    time: Some(msg.time.map(local_hm).unwrap_or_else(now_hm)),
+                    time: Some(msg.time.map(local).unwrap_or_else(now)),
                     nick: sender,
                     text,
                     notice: msg.kind == MessageKind::Notice,
@@ -928,7 +1056,7 @@ impl App {
                 complete,
             } => {
                 let idx = self.ensure_buffer(net, &target, BufferKind::Channel);
-                let mut lines: Vec<Line> = messages
+                let lines: Vec<Line> = messages
                     .iter()
                     .map(|m| {
                         let (text, action) = match ctcp_action(&m.text) {
@@ -936,7 +1064,7 @@ impl App {
                             None => (m.text.clone(), false),
                         };
                         Line::Chat {
-                            time: m.time.map(local_hm),
+                            time: m.time.map(local),
                             nick: m
                                 .sender
                                 .as_ref()
@@ -951,16 +1079,10 @@ impl App {
                         }
                     })
                     .collect();
-                // Prepend older messages. The view is anchored from the bottom,
-                // so the visible window stays put; the user scrolls further up to
-                // reach the newly loaded lines.
-                let added = lines.len();
-                lines.append(&mut self.buffers[idx].lines);
-                self.buffers[idx].lines = lines;
-                // Lines were inserted above the divider, so it moves down with them.
-                if let Some(marker) = self.buffers[idx].unread_marker.as_mut() {
-                    *marker += added;
-                }
+                // Older lines are numbered below the existing ones, so neither
+                // the unread divider nor a held view moves; the user scrolls
+                // further up to reach them.
+                self.buffers[idx].prepend(lines);
                 self.buffers[idx].history_pending = false;
                 // A short page (complete) means there is nothing older; stop
                 // paging so scrolling up does not re-request the same top.
@@ -1369,39 +1491,145 @@ impl App {
         if index >= self.buffers.len() {
             return;
         }
+        // A search belongs to the buffer it was started in.
+        if self.mode == Mode::Search && index != self.active {
+            self.close_search();
+        }
         let old = self.active;
         if old != index {
-            let len = self.buffers[old].lines.len();
-            self.buffers[old].unread_marker = Some(len);
+            // Reading stopped after the newest line; whatever arrives next is
+            // the first unread.
+            let next = self.buffers[old].seq_of(self.buffers[old].lines.len());
+            self.buffers[old].unread_marker = Some(next);
         }
         self.active = index;
         self.buffers[index].unread = 0;
         self.buffers[index].mentioned = false;
-        self.buffers[index].scroll = 0;
+        self.buffers[index].scroll = Scroll::Live;
         self.dirty = true;
+    }
+
+    /// Start searching the active buffer for `query` (empty to type it in), and
+    /// go to the newest match.
+    pub fn open_search(&mut self, query: &str) {
+        self.mode = Mode::Search;
+        self.search = SearchState {
+            query: query.to_string(),
+            ..SearchState::default()
+        };
+        self.refresh_search();
+    }
+
+    /// Leave search, keeping the view where it is.
+    pub fn close_search(&mut self) {
+        self.mode = Mode::Normal;
+        self.search = SearchState::default();
+        self.dirty = true;
+    }
+
+    /// Recompute the matches for the current query and go to the newest.
+    pub fn refresh_search(&mut self) {
+        let buffer = &self.buffers[self.active];
+        let hits: Vec<i64> = buffer
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| contains_ci(&line.searchable(), &self.search.query))
+            .map(|(i, _)| buffer.seq_of(i))
+            .collect();
+        self.search.cur = hits.len().saturating_sub(1);
+        self.search.hits = hits;
+        self.show_search_hit();
+    }
+
+    /// Move to the next-older (`older`) or next-newer match.
+    pub fn search_step(&mut self, older: bool) {
+        let n = self.search.hits.len();
+        if n == 0 {
+            return;
+        }
+        self.search.cur = if older {
+            self.search.cur.saturating_sub(1)
+        } else {
+            (self.search.cur + 1).min(n - 1)
+        };
+        self.show_search_hit();
+    }
+
+    /// The sequence number of the match the view is on, if any.
+    pub fn current_hit(&self) -> Option<i64> {
+        if self.mode != Mode::Search {
+            return None;
+        }
+        self.search.hits.get(self.search.cur).copied()
+    }
+
+    /// Scroll so the current match is in the middle of the view.
+    fn show_search_hit(&mut self) {
+        self.dirty = true;
+        let Some(seq) = self.search.hits.get(self.search.cur).copied() else {
+            return;
+        };
+        let visible = self.visible_lines.get().max(1);
+        let buffer = &mut self.buffers[self.active];
+        if let Some(hit) = buffer.index_of(seq) {
+            buffer.hold_at((hit + visible / 2).min(buffer.lines.len() - 1));
+        }
+    }
+
+    /// Follow the newest line again in the active buffer.
+    pub fn jump_to_bottom(&mut self) {
+        let idx = self.active;
+        self.buffers[idx].scroll = Scroll::Live;
+        self.dirty = true;
+    }
+
+    /// Scroll the active buffer so its first unread line is at the top of the
+    /// view. Says so when there is nothing unread to go to.
+    pub fn jump_to_unread(&mut self) {
+        self.dirty = true;
+        let idx = self.active;
+        let visible = self.visible_lines.get().max(1);
+        let buffer = &mut self.buffers[idx];
+        let target = buffer
+            .unread_marker
+            .and_then(|marker| buffer.index_of(marker));
+        match target {
+            Some(first) => buffer.hold_at(first + visible - 1),
+            None => self.push_active_event("no unread messages here".to_string()),
+        }
     }
 
     /// Scroll the active buffer by `pages` (positive = up/older). Returns a
     /// history-request command to send when scrolling reaches the top of a
     /// channel (to load older messages).
     pub fn scroll(&mut self, pages: isize) -> Option<NetCommand> {
-        // A page is the pane height less two rows, so the last lines of one page
-        // are still visible at the top of the next.
-        let page = self.msg_rows.saturating_sub(2).max(1) as isize;
+        // A page is what was on screen less one line, so the line at the edge of
+        // one page is still visible on the next.
+        let page = self.visible_lines.get().saturating_sub(1).max(1) as isize;
         self.scroll_by(page * pages)
     }
 
     /// Scroll the active buffer by `lines` (positive = up/older), asking for
-    /// older history when that reaches the top of a channel.
+    /// older history when that reaches the top of a channel. Moves by whole
+    /// lines (not rows), holding the view on a line number, so messages arriving
+    /// meanwhile do not shift it.
     pub fn scroll_by(&mut self, lines: isize) -> Option<NetCommand> {
         self.dirty = true;
+        let visible = self.visible_lines.get().max(1);
         let idx = self.active;
         let buffer = &mut self.buffers[idx];
-        let max = buffer.lines.len() as isize;
-        let requested = buffer.scroll as isize + lines;
-        buffer.scroll = requested.clamp(0, max) as usize;
+        if buffer.lines.is_empty() {
+            return None;
+        }
+        let last = buffer.lines.len() - 1;
+        // The view never goes higher than "line 0 at the top".
+        let highest = (visible - 1).min(last);
+        let target = buffer.bottom_index() as isize - lines;
+        let new = target.clamp(highest as isize, last as isize) as usize;
+        buffer.hold_at(new);
         // Reached (or pushed past) the top while scrolling up: pull older history.
-        if lines > 0 && requested >= max {
+        if lines > 0 && target <= highest as isize {
             return self.request_older_history();
         }
         None
@@ -1590,6 +1818,7 @@ impl App {
         let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
         match key {
             "timestamps" => on_off(self.client.timestamps),
+            "timestamp_format" => self.client.timestamp_format.clone(),
             "nick_colors" => on_off(self.client.nick_colors),
             "theme" => self.client.theme.clone(),
             "nicklist" => on_off(self.client.nicklist),
@@ -1615,6 +1844,12 @@ impl App {
             "nick_colors" => self.client.nick_colors = want_bool()?,
             "nicklist" => self.client.nicklist = want_bool()?,
             "beep_on_highlight" => self.client.beep_on_highlight = want_bool()?,
+            "timestamp_format" => {
+                if !valid_timestamp_format(raw) {
+                    return Err("not a valid strftime pattern (try %H:%M or %H:%M:%S)".to_string());
+                }
+                self.client.timestamp_format = raw.to_string();
+            }
             "mouse" => {
                 let want = want_bool()?;
                 if want != self.client.mouse {
@@ -2113,8 +2348,10 @@ impl App {
     pub fn clear_active(&mut self) {
         let idx = self.active;
         let buffer = &mut self.buffers[idx];
+        // Keep numbering monotonic: the cleared lines' numbers are not reused.
+        buffer.base_seq += buffer.lines.len() as i64;
         buffer.lines.clear();
-        buffer.scroll = 0;
+        buffer.scroll = Scroll::Live;
         buffer.unread = 0;
         buffer.unread_marker = None;
         self.dirty = true;
@@ -3011,7 +3248,11 @@ mod tests {
             0,
             Event::MessageReceived(chat("#rust", "alice", "one")),
         ));
-        a.buffers[idx].unread_marker = Some(1);
+        a.apply(engine(
+            0,
+            Event::MessageReceived(chat("#rust", "alice", "two")),
+        ));
+        a.buffers[idx].unread_marker = Some(1); // "two" is the first unread
         a.apply(engine(
             0,
             Event::HistoryLoaded {
@@ -3023,7 +3264,41 @@ mod tests {
                 complete: false,
             },
         ));
-        assert_eq!(a.buffers[idx].unread_marker, Some(3));
+        // The marker is a line number, so it did not need to move: it still
+        // names the same line, which is now at index 3.
+        assert_eq!(a.buffers[idx].unread_marker, Some(1));
+        assert_eq!(a.buffers[idx].index_of(1), Some(3));
+        assert_eq!(
+            a.buffers[idx].index_of(-2),
+            Some(0),
+            "the oldest loaded line"
+        );
+        assert_eq!(a.buffers[idx].index_of(-3), None, "before anything held");
+    }
+
+    #[test]
+    fn the_marker_survives_trimming_and_is_lost_only_when_its_line_is() {
+        let mut a = app();
+        let idx = join_channel(&mut a, "#rust", &["me"]);
+        a.buffers[idx].set_max_lines(10);
+        for i in 0..10 {
+            a.buffers[idx].push(event_line(format!("line {i}")));
+        }
+        a.buffers[idx].unread_marker = Some(a.buffers[idx].seq_of(6));
+        for i in 10..14 {
+            a.buffers[idx].push(event_line(format!("line {i}")));
+        }
+        // Four lines were trimmed off the front; the marked line moved from
+        // index 6 to index 2 without the marker being touched.
+        assert_eq!(a.buffers[idx].index_of(6), Some(2));
+        for i in 14..20 {
+            a.buffers[idx].push(event_line(format!("line {i}")));
+        }
+        assert_eq!(
+            a.buffers[idx].index_of(6),
+            None,
+            "its line was trimmed away"
+        );
     }
 
     fn last_line(buffer: &Buffer) -> &Line {
@@ -3255,24 +3530,250 @@ mod tests {
         for i in 0..200 {
             a.buffers[idx].push(event_line(format!("line {i}")));
         }
-        a.msg_rows = 20;
+        a.visible_lines.set(20);
+        let bottom = |a: &App| a.buffers[idx].bottom_index();
+        assert_eq!(bottom(&a), 199, "following live");
         a.scroll(1);
         assert_eq!(
-            a.buffers[idx].scroll, 18,
-            "a page is the pane less two rows"
+            bottom(&a),
+            199 - 19,
+            "a page is what was shown less one line"
         );
         a.scroll(1);
-        assert_eq!(a.buffers[idx].scroll, 36);
+        assert_eq!(bottom(&a), 199 - 38);
         a.scroll(-1);
-        assert_eq!(a.buffers[idx].scroll, 18);
+        assert_eq!(bottom(&a), 199 - 19);
         a.scroll_by(WHEEL_LINES);
-        assert_eq!(a.buffers[idx].scroll, 21);
+        assert_eq!(bottom(&a), 199 - 19 - 3);
         a.scroll_by(-1000);
-        assert_eq!(a.buffers[idx].scroll, 0, "cannot scroll below the live end");
+        assert_eq!(a.buffers[idx].scroll, Scroll::Live, "back at the live end");
         // A tiny pane still moves.
-        a.msg_rows = 1;
+        a.visible_lines.set(1);
         a.scroll(1);
-        assert_eq!(a.buffers[idx].scroll, 1);
+        assert_eq!(bottom(&a), 198);
+    }
+
+    #[test]
+    fn scrolling_stops_with_line_zero_at_the_top_and_asks_for_older_history() {
+        let mut a = app();
+        let mut first = chat("#rust", "alice", "first");
+        first.msgid = Some("m0".into());
+        a.apply(engine(0, Event::MessageReceived(first)));
+        let idx = a.buffer_index(0, "#rust").unwrap();
+        for i in 1..100 {
+            a.buffers[idx].push(event_line(format!("line {i}")));
+        }
+        a.switch_to(idx);
+        a.visible_lines.set(20);
+        assert!(a.scroll(1).is_none(), "plenty above: no request yet");
+        let cmd = a.scroll_by(10_000);
+        assert!(matches!(cmd, Some(NetCommand::RequestHistory { .. })));
+        // The view stops with line 0 at the top edge (20 lines on screen).
+        assert_eq!(a.buffers[idx].bottom_index(), 19);
+    }
+
+    #[test]
+    fn a_held_view_does_not_move_when_messages_arrive_or_history_loads() {
+        let mut a = app();
+        let idx = join_channel(&mut a, "#rust", &["me"]);
+        a.buffers[idx].set_max_lines(50);
+        for i in 0..50 {
+            a.buffers[idx].push(event_line(format!("line {i}")));
+        }
+        a.switch_to(idx);
+        a.visible_lines.set(10);
+        a.scroll_by(19); // the bottom edge is now line 30
+        let reading = |a: &App| -> String {
+            let b = &a.buffers[idx];
+            match &b.lines[b.bottom_index()] {
+                Line::Event { text, .. } => text.clone(),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(reading(&a), "line 30");
+        // New messages arrive below (and the oldest are trimmed from the top).
+        for i in 50..55 {
+            a.buffers[idx].push(event_line(format!("line {i}")));
+        }
+        assert_eq!(
+            reading(&a),
+            "line 30",
+            "trimming the front did not shift it"
+        );
+        // Older history is loaded above.
+        a.apply(engine(
+            0,
+            Event::HistoryLoaded {
+                target: "#rust".into(),
+                messages: vec![
+                    chat("#rust", "x", "h1"),
+                    chat("#rust", "x", "h2"),
+                    chat("#rust", "x", "h3"),
+                ],
+                complete: false,
+            },
+        ));
+        assert_eq!(reading(&a), "line 30", "loading history did not shift it");
+        // Leaving and returning drops back to live.
+        a.switch_to(0);
+        a.switch_to(idx);
+        assert_eq!(a.buffers[idx].scroll, Scroll::Live);
+    }
+
+    fn buffer_with(a: &mut App, texts: &[&str]) -> usize {
+        let idx = join_channel(a, "#rust", &["me"]);
+        for t in texts {
+            a.buffers[idx].push(event_line((*t).to_string()));
+        }
+        a.switch_to(idx);
+        a.visible_lines.set(10);
+        idx
+    }
+
+    #[test]
+    fn search_finds_matches_ignoring_case_and_goes_to_the_newest() {
+        let mut a = app();
+        let idx = buffer_with(
+            &mut a,
+            &["alpha", "Needle one", "gamma", "a NEEDLE two", "end"],
+        );
+        a.open_search("needle");
+        assert_eq!(a.mode, Mode::Search);
+        assert_eq!(a.search.hits, vec![1, 3]);
+        assert_eq!(a.search.cur, 1, "starts on the newest match");
+        assert_eq!(a.current_hit(), Some(3));
+        // Older, then older again stays on the oldest; newer goes back.
+        a.search_step(true);
+        assert_eq!(a.current_hit(), Some(1));
+        a.search_step(true);
+        assert_eq!(a.current_hit(), Some(1));
+        a.search_step(false);
+        assert_eq!(a.current_hit(), Some(3));
+        a.search_step(false);
+        assert_eq!(a.current_hit(), Some(3));
+        // Leaving keeps the view and drops the highlight state.
+        a.close_search();
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.current_hit().is_none());
+        let _ = idx;
+    }
+
+    #[test]
+    fn search_looks_at_the_sender_as_well_as_the_text() {
+        let mut a = app();
+        let idx = join_channel(&mut a, "#rust", &["me"]);
+        a.apply(engine(
+            0,
+            Event::MessageReceived(chat("#rust", "zelda", "hello")),
+        ));
+        a.apply(engine(
+            0,
+            Event::MessageReceived(chat("#rust", "bob", "bye")),
+        ));
+        a.switch_to(idx);
+        a.open_search("zeld");
+        assert_eq!(a.search.hits.len(), 1);
+        a.open_search("");
+        assert!(a.search.hits.is_empty(), "an empty query matches nothing");
+    }
+
+    #[test]
+    fn a_search_hit_is_brought_into_view_and_a_new_query_re_searches() {
+        let mut a = app();
+        let texts: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let idx = buffer_with(&mut a, &refs);
+        a.open_search("line 5"); // matches 5 and 50-59: newest is 59
+        assert_eq!(a.search.hits.len(), 11);
+        let b = &a.buffers[idx];
+        let bottom = b.bottom_index();
+        let top = bottom + 1 - 10;
+        assert!((top..=bottom).contains(&59), "the hit is on screen");
+        a.search.query = "line 7".into();
+        a.refresh_search();
+        assert_eq!(a.current_hit(), Some(79));
+    }
+
+    #[test]
+    fn switching_buffers_ends_a_search() {
+        let mut a = app();
+        buffer_with(&mut a, &["needle"]);
+        a.open_search("needle");
+        a.switch_to(0);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.search.hits.is_empty());
+    }
+
+    #[test]
+    fn timestamp_formats_are_validated_and_fall_back_when_broken() {
+        use chrono::TimeZone;
+        for ok in ["%H:%M", "%H:%M:%S", "%a %-d %b %H:%M", "[%H:%M]"] {
+            assert!(valid_timestamp_format(ok), "{ok}");
+        }
+        for bad in ["", "%Q", "%", "%H:%"] {
+            assert!(!valid_timestamp_format(bad), "{bad:?}");
+        }
+        let t = Local.with_ymd_and_hms(2026, 10, 8, 9, 5, 7).unwrap();
+        assert_eq!(format_time(&t, "%H:%M:%S"), "09:05:07");
+        // A broken pattern (say, from a hand-edited config) never panics.
+        assert_eq!(format_time(&t, "%Q"), "09:05");
+        assert_eq!(format_time(&t, ""), "09:05");
+    }
+
+    #[test]
+    fn the_timestamp_format_setting_accepts_good_patterns_and_refuses_bad_ones() {
+        let mut a = app();
+        assert_eq!(a.setting_value("timestamp_format"), "%H:%M");
+        assert_eq!(
+            a.set_setting("timestamp_format", "%H:%M:%S").as_deref(),
+            Ok("%H:%M:%S")
+        );
+        assert_eq!(a.client.timestamp_format, "%H:%M:%S");
+        let err = a.set_setting("timestamp_format", "%Q").unwrap_err();
+        assert!(err.contains("strftime"), "{err}");
+        assert_eq!(a.client.timestamp_format, "%H:%M:%S", "unchanged");
+    }
+
+    #[test]
+    fn contains_ci_ignores_ascii_case_and_rejects_the_empty_needle() {
+        assert!(contains_ci("Hello World", "o w"));
+        assert!(contains_ci("Hello", "HELLO"));
+        assert!(!contains_ci("Hello", ""));
+        assert!(!contains_ci("hi", "hello"));
+        assert!(contains_ci("héllo wörld", "wörld"));
+    }
+
+    #[test]
+    fn jump_keys_go_to_the_bottom_and_to_the_first_unread_line() {
+        let mut a = app();
+        let idx = join_channel(&mut a, "#rust", &["me"]);
+        for i in 0..40 {
+            a.buffers[idx].push(event_line(format!("old {i}")));
+        }
+        a.switch_to(idx);
+        a.visible_lines.set(10);
+        a.switch_to(0); // leave: the marker is set after the newest line
+        for i in 0..30 {
+            a.buffers[idx].push(event_line(format!("new {i}")));
+        }
+        a.switch_to(idx);
+        a.jump_to_unread();
+        let b = &a.buffers[idx];
+        // The first unread line ("new 0", index 40) is at the top of the view.
+        let top = b.bottom_index() + 1 - 10;
+        assert_eq!(top, 40);
+        a.jump_to_bottom();
+        assert_eq!(a.buffers[idx].scroll, Scroll::Live);
+        // Nothing unread: say so rather than jumping.
+        a.switch_to(0);
+        a.switch_to(idx);
+        let before = a.buffers[idx].lines.len();
+        a.jump_to_unread();
+        assert_eq!(a.buffers[idx].lines.len(), before + 1);
+        assert_eq!(
+            event_texts(&a.buffers[idx]).last().map(String::as_str),
+            Some("no unread messages here")
+        );
     }
 
     #[test]

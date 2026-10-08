@@ -169,12 +169,6 @@ pub async fn run(
                             is_idle = false;
                             fire_synthetic(&mut app, host.as_mut(), &cmd_txs, || AddonEventKind::Active);
                         }
-                        // PageUp/PageDown move by the pane's height: the rows
-                        // left after the header, its rule, the activity bar and
-                        // the input line.
-                        if let Ok(size) = guard.terminal.size() {
-                            app.msg_rows = (size.height as usize).saturating_sub(4);
-                        }
                         let cmds = input::handle_key(&mut app, key);
                         send_to_active(&app, &cmd_txs, cmds);
                     }
