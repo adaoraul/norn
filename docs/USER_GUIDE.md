@@ -268,9 +268,30 @@ locally so your side of the conversation is always visible.
 | `Esc`               | Clear the completion menu.                                    |
 | `Enter`             | Send the message or run the command.                          |
 | `Left` / `Right`    | Move the cursor.                                              |
+| `Ctrl+Left` / `Ctrl+Right` | Move the cursor by a word.                             |
 | `Home` / `End`      | Jump to start / end of the input.                             |
+| `Ctrl+A` / `Ctrl+E` | Jump to start / end of the input.                             |
+| `Delete`            | Delete the character under the cursor.                        |
+| `Ctrl+U`            | Delete everything before the cursor.                          |
+| `Ctrl+W` / `Alt+Backspace` | Delete the word before the cursor.                     |
 | `Up` / `Down`       | Recall previous / next input from history.                    |
 | `PageUp` / `PageDown` | Scroll the buffer (fetches `CHATHISTORY` when you reach the top). |
+
+These editing keys work the same in the input line and in every inline edit (the
+settings, networks and plugin screens). `Alt+Left`/`Alt+Right` switch buffers, so
+word movement is on `Ctrl+Left`/`Ctrl+Right`.
+
+`PageUp`/`PageDown` scroll by a screenful (the pane height less two lines); the
+mouse wheel scrolls three lines per notch.
+
+### Pasting
+
+A paste of one line goes into the input at the cursor, as if you had typed it. A
+paste of several lines is held back and the activity bar asks first
+(`paste 3 lines to #rust? Enter sends · Esc cancels`): `Enter` sends each line as
+its own message, `Esc` throws the paste away. If some pasted lines start with `/`
+the question says so, because they would run as commands. Blank lines are
+dropped. (Your terminal must support bracketed paste, which nearly all do.)
 
 The command help opens with `/help`; `F1` (or `/keys`) opens it on the list of
 keys, which is generated from the same table as this section.
@@ -347,7 +368,9 @@ not depend on colour alone.
 
 ### Completion
 
-`Tab` completes. In a channel it completes member nicks; at the start of a line a
+`Tab` completes. In a channel it completes member nicks, the people who spoke most
+recently first (the rest alphabetically), and completing in the middle of a line
+keeps the text after the cursor; at the start of a line a
 completed nick gets your `completion_char` (default `:`) and a space appended
 (`nick: `). After a `/` it completes command names, then subcommands and
 arguments (nicks, channels, network names). Repeat `Tab` to cycle matches.
@@ -358,6 +381,10 @@ Each buffer keeps up to `scrollback_lines` lines (default 5000), trimmed as it
 grows. `PageUp`/`PageDown` scroll; reaching the top requests older messages over
 IRCv3 `CHATHISTORY` where the server supports it, paginating on demand. Replayed
 history is rendered with its original timestamps, not the reconnect time.
+
+The lines you type are kept for `Up`/`Down` recall, the last 500 across all
+buffers, in memory only: they are never written to disk, because a line like
+`/msg NickServ IDENTIFY ...` can hold a password.
 
 ### Aliases
 

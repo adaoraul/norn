@@ -760,8 +760,9 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App, lines_above: usize) {
         }
         spans.push(Span::styled("]", Style::default().fg(theme::TEXT)));
     }
-    // A pending "press again" (quit): spelled out so it cannot be missed.
-    if let Some(prompt) = app.armed_prompt() {
+    // A pending "press again" (quit) or a held-back paste: spelled out so it
+    // cannot be missed.
+    if let Some(prompt) = app.armed_prompt().or_else(|| app.paste_prompt()) {
         spans.push(Span::styled(
             format!(" {prompt}"),
             Style::default()
@@ -1059,7 +1060,13 @@ fn settings_row_line(app: &App, row: &SettingsRow, selected: bool, width: usize)
     // The "add alias" row: `＋ add alias`, or the edit buffer while creating one.
     if let SettingsRow::AddAlias = row {
         let (text, fg) = match (selected, &app.settings.editing) {
-            (true, Some(buf)) => (format!("＋ {buf}\u{2588}"), theme::BRIGHT),
+            (true, Some(buf)) => (
+                format!(
+                    "＋ {}",
+                    super::editor::with_cursor(buf, app.settings.edit_cursor)
+                ),
+                theme::BRIGHT,
+            ),
             _ => ("＋ add alias".to_string(), theme::DIM),
         };
         let text = truncate(&text, width.saturating_sub(2));
@@ -1083,7 +1090,10 @@ fn settings_row_line(app: &App, row: &SettingsRow, selected: bool, width: usize)
 
     // The selected row shows its inline edit buffer (with a cursor) as the value.
     let (value, value_fg) = match (selected, &app.settings.editing) {
-        (true, Some(buf)) => (format!("{buf}\u{2588}"), theme::BRIGHT),
+        (true, Some(buf)) => (
+            super::editor::with_cursor(buf, app.settings.edit_cursor),
+            theme::BRIGHT,
+        ),
         _ => (value, theme::GOLD),
     };
 
@@ -1327,9 +1337,9 @@ fn draw_networks_form(f: &mut Frame, area: Rect, app: &App, focused: bool) {
                 "[ ]".to_string()
             }
         } else if editing_here {
-            format!(
-                "{}\u{2588}",
-                app.networks_ui.editing.as_deref().unwrap_or("")
+            super::editor::with_cursor(
+                app.networks_ui.editing.as_deref().unwrap_or(""),
+                app.networks_ui.edit_cursor,
             )
         } else {
             let v = network_field_value(cfg, i);
@@ -1618,7 +1628,10 @@ fn plugin_cfg_row_line(
         .and_then(|m| m.get(key))
         .is_some();
     let value = if editing {
-        format!("{}_", app.plugin_cfg.editing.clone().unwrap_or_default())
+        super::editor::with_cursor(
+            app.plugin_cfg.editing.as_deref().unwrap_or(""),
+            app.plugin_cfg.edit_cursor,
+        )
     } else {
         app.plugin_cfg_value(key, default)
     };
@@ -2611,6 +2624,41 @@ mod tests {
             text.contains("#room23"),
             "selection scrolled into view: {text}"
         );
+    }
+
+    #[test]
+    fn a_held_back_paste_asks_in_the_activity_bar() {
+        let mut app = one_net_app();
+        let rust_event = Event::MessageReceived(chat("#rust", "bob", "hi"));
+        engine(&mut app, rust_event);
+        let rust = app.buffers.iter().position(|b| b.name == "#rust").unwrap();
+        app.switch_to(rust);
+        crate::tui::input::handle_paste(&mut app, "one\ntwo\n/part");
+        let (_, text) = draw_text(&app, 140, 20);
+        assert!(text.contains("paste 3 lines to #rust"), "{text}");
+        assert!(
+            text.contains("1 start with / and will run as commands"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_inline_edit_shows_the_cursor_where_it_is() {
+        let mut app = one_net_app();
+        app.open_settings();
+        for c in "completion_char".chars() {
+            crate::tui::input::handle_key(
+                &mut app,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(c),
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+            );
+        }
+        app.settings.begin_edit("abc".to_string());
+        app.settings.edit_cursor = 1;
+        let (_, text) = draw_text(&app, 100, 30);
+        assert!(text.contains("a\u{2588}c"), "block mid-text: {text}");
     }
 
     #[test]

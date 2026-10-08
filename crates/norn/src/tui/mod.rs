@@ -4,6 +4,7 @@
 //! panic) and the async loop: it selects between UI events from the network
 //! tasks and key events from the terminal, redrawing when state changes.
 
+pub mod editor;
 pub mod input;
 pub mod state;
 pub mod theme;
@@ -17,7 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CrosstermEvent, EventStream, KeyEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -44,7 +46,9 @@ impl TerminalGuard {
     fn new(mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        crossterm::execute!(stdout, EnterAlternateScreen)?;
+        // Bracketed paste lets us tell a paste from typing: a multi-line paste
+        // is confirmed instead of being sent a line at a time.
+        crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         if mouse {
             crossterm::execute!(stdout, EnableMouseCapture)?;
         }
@@ -58,6 +62,7 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = crossterm::execute!(
             self.terminal.backend_mut(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -81,7 +86,12 @@ fn install_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = io::stdout().flush();
         hook(info);
     }));
@@ -159,8 +169,18 @@ pub async fn run(
                             is_idle = false;
                             fire_synthetic(&mut app, host.as_mut(), &cmd_txs, || AddonEventKind::Active);
                         }
+                        // PageUp/PageDown move by the pane's height: the rows
+                        // left after the header, its rule, the activity bar and
+                        // the input line.
+                        if let Ok(size) = guard.terminal.size() {
+                            app.msg_rows = (size.height as usize).saturating_sub(4);
+                        }
                         let cmds = input::handle_key(&mut app, key);
                         send_to_active(&app, &cmd_txs, cmds);
+                    }
+                    Some(Ok(CrosstermEvent::Paste(text))) => {
+                        last_activity = Instant::now();
+                        input::handle_paste(&mut app, &text);
                     }
                     Some(Ok(CrosstermEvent::Mouse(mouse))) => {
                         let size = guard.terminal.size().unwrap_or_default();

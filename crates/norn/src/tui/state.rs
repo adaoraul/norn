@@ -18,6 +18,17 @@ use crate::tui::theme;
 /// How many older messages to pull per scroll-up page.
 const HISTORY_PAGE: usize = 50;
 
+/// How many submitted input lines are kept for recall (oldest dropped first).
+/// History stays in memory only: it can hold passwords typed into
+/// `/msg NickServ IDENTIFY ...`, and passwords never go to disk.
+pub const HISTORY_MAX: usize = 500;
+
+/// The message-pane height assumed until the first draw reports the real one.
+const DEFAULT_MSG_ROWS: usize = 12;
+
+/// How many lines one mouse-wheel notch scrolls.
+pub const WHEEL_LINES: isize = 3;
+
 /// Sentinel `NetworkId` for the global console buffer, which belongs to no
 /// network. Being out of range of `networks`/`cmd_txs`, it is naturally
 /// excluded from every per-network iteration and lookup.
@@ -173,6 +184,11 @@ pub struct Buffer {
     /// Whether we are in this channel. False after we part or are kicked; the
     /// buffer stays so the scrollback can still be read.
     pub joined: bool,
+    /// When each nick (lowercased) last spoke here, as a rising counter, so
+    /// completion can offer the people talking right now first.
+    pub last_spoke: std::collections::HashMap<String, u64>,
+    /// The counter behind `last_spoke`.
+    speak_clock: u64,
 }
 
 impl Buffer {
@@ -193,7 +209,16 @@ impl Buffer {
             max_lines,
             modes: String::new(),
             joined: true,
+            last_spoke: std::collections::HashMap::new(),
+            speak_clock: 0,
         }
+    }
+
+    /// Note that `nick` just spoke.
+    fn note_spoke(&mut self, nick: &str) {
+        self.speak_clock += 1;
+        self.last_spoke
+            .insert(nick.to_ascii_lowercase(), self.speak_clock);
     }
 
     fn push(&mut self, line: Line) {
@@ -274,6 +299,8 @@ pub enum Mode {
     Plugins,
     /// A single plugin's config editor is open.
     PluginConfig,
+    /// A multi-line paste is waiting for Enter (send) or Esc (discard).
+    PasteConfirm,
 }
 
 /// Which pane of the `/help` panel has focus.
@@ -318,8 +345,18 @@ pub struct PluginConfigState {
     pub sel: usize,
     /// When editing a value, the in-progress text.
     pub editing: Option<String>,
+    /// The cursor within `editing` (a byte offset).
+    pub edit_cursor: usize,
     /// A transient status line (e.g. "saved").
     pub msg: Option<String>,
+}
+
+impl PluginConfigState {
+    /// Start editing `text`, with the cursor at its end.
+    pub fn begin_edit(&mut self, text: String) {
+        self.edit_cursor = text.len();
+        self.editing = Some(text);
+    }
 }
 
 /// State of the `/settings` panel: a live filter, the selected row, an optional
@@ -332,8 +369,18 @@ pub struct SettingsState {
     pub sel: usize,
     /// When editing a text/int setting or an alias, the in-progress value.
     pub editing: Option<String>,
+    /// The cursor within `editing` (a byte offset).
+    pub edit_cursor: usize,
     /// A transient status line (validation error or confirmation).
     pub msg: Option<String>,
+}
+
+impl SettingsState {
+    /// Start editing `text`, with the cursor at its end.
+    pub fn begin_edit(&mut self, text: String) {
+        self.edit_cursor = text.len();
+        self.editing = Some(text);
+    }
 }
 
 /// One rendered row of the `/settings` panel: a category header, a client
@@ -379,8 +426,18 @@ pub struct NetworksState {
     pub field: usize,
     /// When editing a text field, the in-progress value.
     pub editing: Option<String>,
+    /// The cursor within `editing` (a byte offset).
+    pub edit_cursor: usize,
     /// A transient status line (validation error or confirmation).
     pub msg: Option<String>,
+}
+
+impl NetworksState {
+    /// Start editing `text`, with the cursor at its end.
+    pub fn begin_edit(&mut self, text: String) {
+        self.edit_cursor = text.len();
+        self.editing = Some(text);
+    }
 }
 
 /// How a network form field is edited and rendered.
@@ -481,6 +538,9 @@ pub struct Completion {
     /// Text appended after the inserted candidate (e.g. `": "` for a leading
     /// nick, `" "` for a command, `""` mid-line).
     pub suffix: String,
+    /// What followed the cursor when completion began; kept, so completing in
+    /// the middle of a line does not eat the rest of it.
+    pub tail: String,
 }
 
 /// The whole TUI application state.
@@ -568,6 +628,11 @@ pub struct App {
     pub lag: std::collections::HashMap<NetworkId, std::time::Duration>,
     /// A destructive action waiting for its second press, and when it was armed.
     pub armed: Option<(Confirm, std::time::Instant)>,
+    /// The lines of a multi-line paste awaiting confirmation (`Mode::PasteConfirm`).
+    pub paste: Vec<String>,
+    /// How many rows the message pane had when last drawn; PageUp/PageDown move
+    /// by about this much.
+    pub msg_rows: usize,
 }
 
 impl App {
@@ -634,6 +699,8 @@ impl App {
             echo_nets: HashSet::new(),
             lag: std::collections::HashMap::new(),
             armed: None,
+            paste: Vec::new(),
+            msg_rows: DEFAULT_MSG_ROWS,
         }
     }
 
@@ -652,6 +719,27 @@ impl App {
         };
         self.dirty = true;
         confirmed
+    }
+
+    /// The question shown while a multi-line paste waits for Enter or Esc.
+    pub fn paste_prompt(&self) -> Option<String> {
+        if self.mode != Mode::PasteConfirm {
+            return None;
+        }
+        let n = self.paste.len();
+        let commands = self.paste.iter().filter(|l| l.starts_with('/')).count();
+        let target = match self.active_buffer().kind {
+            BufferKind::Channel | BufferKind::Query => self.active_buffer().name.clone(),
+            _ => "this buffer".to_string(),
+        };
+        let warn = if commands > 0 {
+            format!(" ({commands} start with / and will run as commands)")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "paste {n} lines to {target}{warn}? Enter sends · Esc cancels"
+        ))
     }
 
     /// The prompt for a live armed action, if one is still within its window.
@@ -814,6 +902,7 @@ impl App {
                     None => (msg.text.clone(), false),
                 };
                 let mention = mentions(&text, &my_nick);
+                let spoke = sender.clone();
                 let line = Line::Chat {
                     // Fall back to the local receipt time when the message has no
                     // server-time tag (e.g. NickServ notices during connect).
@@ -826,6 +915,12 @@ impl App {
                     msgid: msg.msgid.clone(),
                 };
                 self.push_to(net, &target, kind, line, mention);
+                // Remember who is talking, so completion offers them first.
+                if kind == BufferKind::Channel {
+                    if let Some(i) = self.buffer_index(net, &target) {
+                        self.buffers[i].note_spoke(&spoke);
+                    }
+                }
             }
             Event::HistoryLoaded {
                 target,
@@ -1290,15 +1385,23 @@ impl App {
     /// history-request command to send when scrolling reaches the top of a
     /// channel (to load older messages).
     pub fn scroll(&mut self, pages: isize) -> Option<NetCommand> {
+        // A page is the pane height less two rows, so the last lines of one page
+        // are still visible at the top of the next.
+        let page = self.msg_rows.saturating_sub(2).max(1) as isize;
+        self.scroll_by(page * pages)
+    }
+
+    /// Scroll the active buffer by `lines` (positive = up/older), asking for
+    /// older history when that reaches the top of a channel.
+    pub fn scroll_by(&mut self, lines: isize) -> Option<NetCommand> {
         self.dirty = true;
         let idx = self.active;
         let buffer = &mut self.buffers[idx];
-        let step = 10 * pages;
         let max = buffer.lines.len() as isize;
-        let requested = buffer.scroll as isize + step;
+        let requested = buffer.scroll as isize + lines;
         buffer.scroll = requested.clamp(0, max) as usize;
         // Reached (or pushed past) the top while scrolling up: pull older history.
-        if pages > 0 && requested >= max {
+        if lines > 0 && requested >= max {
             return self.request_older_history();
         }
         None
@@ -1694,6 +1797,7 @@ impl App {
             name,
             sel: 0,
             editing: None,
+            edit_cursor: 0,
             msg: None,
         };
         self.mode = Mode::PluginConfig;
@@ -2047,6 +2151,9 @@ impl App {
         }
         if self.history.last().map(String::as_str) != Some(line) {
             self.history.push(line.to_string());
+            if self.history.len() > HISTORY_MAX {
+                self.history.remove(0);
+            }
         }
     }
 
@@ -3121,6 +3228,51 @@ mod tests {
                 doc.key
             );
         }
+    }
+
+    #[test]
+    fn input_history_is_capped_and_drops_the_oldest() {
+        let mut a = app();
+        for i in 0..(HISTORY_MAX + 25) {
+            a.remember_input(&format!("line {i}"));
+        }
+        assert_eq!(a.history.len(), HISTORY_MAX);
+        assert_eq!(a.history.first().map(String::as_str), Some("line 25"));
+        assert_eq!(
+            a.history.last().map(String::as_str),
+            Some(format!("line {}", HISTORY_MAX + 24).as_str())
+        );
+        // Recall still walks back from the newest.
+        a.history_prev();
+        assert_eq!(a.input, format!("line {}", HISTORY_MAX + 24));
+    }
+
+    #[test]
+    fn page_keys_scroll_by_the_pane_height_and_the_wheel_by_a_few_lines() {
+        let mut a = app();
+        let idx = join_channel(&mut a, "#rust", &["me"]);
+        a.switch_to(idx);
+        for i in 0..200 {
+            a.buffers[idx].push(event_line(format!("line {i}")));
+        }
+        a.msg_rows = 20;
+        a.scroll(1);
+        assert_eq!(
+            a.buffers[idx].scroll, 18,
+            "a page is the pane less two rows"
+        );
+        a.scroll(1);
+        assert_eq!(a.buffers[idx].scroll, 36);
+        a.scroll(-1);
+        assert_eq!(a.buffers[idx].scroll, 18);
+        a.scroll_by(WHEEL_LINES);
+        assert_eq!(a.buffers[idx].scroll, 21);
+        a.scroll_by(-1000);
+        assert_eq!(a.buffers[idx].scroll, 0, "cannot scroll below the live end");
+        // A tiny pane still moves.
+        a.msg_rows = 1;
+        a.scroll(1);
+        assert_eq!(a.buffers[idx].scroll, 1);
     }
 
     #[test]

@@ -2,9 +2,10 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
+use super::editor;
 use super::state::{
     check_dialable, network_field_value, App, AppAction, BufferKind, Completion, Confirm, Mode,
-    NetFieldKind, NetworksFocus, Switcher, NETWORK_FIELDS,
+    NetFieldKind, NetworksFocus, Switcher, NETWORK_FIELDS, WHEEL_LINES,
 };
 use super::view::{numbered_buffers, sidebar_rows, SidebarRow};
 use crate::session::NetCommand;
@@ -34,8 +35,10 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, width: u16, _height: u16) 
                 }
             }
         }
-        MouseEventKind::ScrollUp => return app.scroll(1).into_iter().collect(),
-        MouseEventKind::ScrollDown => return app.scroll(-1).into_iter().collect(),
+        // A wheel notch is a few lines, like a terminal's own scrollback; the
+        // keyboard pages are screenfuls.
+        MouseEventKind::ScrollUp => return app.scroll_by(WHEEL_LINES).into_iter().collect(),
+        MouseEventKind::ScrollDown => return app.scroll_by(-WHEEL_LINES).into_iter().collect(),
         _ => {}
     }
     Vec::new()
@@ -86,6 +89,91 @@ fn nicklist_nick_at(app: &App, y: u16) -> Option<String> {
         .map(|m| m.nick.clone())
 }
 
+/// Handle text pasted into the terminal (bracketed paste). One line goes into
+/// the input at the cursor like typing would. Several lines are held back and
+/// confirmed first: sending each as its own message is rarely what a paste
+/// means, and a pasted `/command` would otherwise run unseen.
+pub fn handle_paste(app: &mut App, text: &str) {
+    app.dirty = true;
+    // Terminals send CR or CRLF line ends; tabs would wreck the input layout.
+    let text = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', " ");
+    match app.mode {
+        Mode::Normal => {
+            let lines: Vec<String> = text
+                .split('\n')
+                .map(str::trim_end)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            match lines.as_slice() {
+                [] => {}
+                [one] => {
+                    editor::insert_str(&mut app.input, &mut app.cursor, one);
+                    app.completion = None;
+                }
+                _ => {
+                    app.paste = lines;
+                    app.mode = Mode::PasteConfirm;
+                }
+            }
+        }
+        // Inline edits take a paste as one line.
+        Mode::Settings if app.settings.editing.is_some() => {
+            let cursor = &mut app.settings.edit_cursor;
+            if let Some(buf) = app.settings.editing.as_mut() {
+                editor::insert_str(buf, cursor, &flatten(&text));
+            }
+        }
+        Mode::Networks if app.networks_ui.editing.is_some() => {
+            let cursor = &mut app.networks_ui.edit_cursor;
+            if let Some(buf) = app.networks_ui.editing.as_mut() {
+                editor::insert_str(buf, cursor, &flatten(&text));
+            }
+        }
+        Mode::PluginConfig if app.plugin_cfg.editing.is_some() => {
+            let cursor = &mut app.plugin_cfg.edit_cursor;
+            if let Some(buf) = app.plugin_cfg.editing.as_mut() {
+                editor::insert_str(buf, cursor, &flatten(&text));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Join a pasted block onto one line.
+fn flatten(text: &str) -> String {
+    text.split('\n')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Enter sends the held-back paste line by line (each runs as if typed); Esc
+/// throws it away; other keys do nothing while the question is open.
+fn handle_paste_confirm(app: &mut App, key: &KeyEvent) -> Vec<NetCommand> {
+    match key.code {
+        KeyCode::Enter => {
+            let lines = std::mem::take(&mut app.paste);
+            app.mode = Mode::Normal;
+            let mut out = Vec::new();
+            for line in lines {
+                out.extend(run_command(app, &line, 0));
+            }
+            out
+        }
+        KeyCode::Esc => {
+            app.paste.clear();
+            app.mode = Mode::Normal;
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Whether `key`, in the current mode, is one that arms a destructive action
 /// (quit, delete a network, delete an alias). Those keep a pending confirmation
 /// alive; every other key cancels it.
@@ -111,6 +199,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
     // repeats the arming one; anything else cancels it.
     if !is_arming_key(app, &key) {
         app.armed = None;
+    }
+    if app.mode == Mode::PasteConfirm {
+        return handle_paste_confirm(app, &key);
     }
     if app.mode == Mode::Switcher {
         handle_switcher(app, key);
@@ -175,24 +266,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
         KeyCode::Esc => app.completion = None,
         KeyCode::Tab => complete(app),
         KeyCode::Enter => return submit(app),
-        KeyCode::Backspace => {
-            backspace(app);
-            app.completion = None;
-        }
-        KeyCode::Left => move_left(app),
-        KeyCode::Right => move_right(app),
-        KeyCode::Home => app.cursor = 0,
-        KeyCode::End => app.cursor = app.input.len(),
         KeyCode::Up => app.history_prev(),
         KeyCode::Down => app.history_next(),
         KeyCode::PageUp => return app.scroll(1).into_iter().collect(),
         KeyCode::PageDown => return app.scroll(-1).into_iter().collect(),
-        KeyCode::Char(c) if !ctrl && !alt => {
-            app.input.insert(app.cursor, c);
-            app.cursor += c.len_utf8();
-            app.completion = None;
+        // Everything else that edits the line: typing, Backspace/Delete, cursor
+        // and word movement, Ctrl+A/E/U/W. Shared with the inline editors.
+        _ => {
+            if editor::handle(&mut app.input, &mut app.cursor, &key) {
+                app.completion = None;
+            }
         }
-        _ => {}
     }
     Vec::new()
 }
@@ -321,16 +405,17 @@ fn activate_setting(app: &mut App) {
         Some(SettingsRow::Setting(doc)) => match doc.kind {
             SettingKind::Bool | SettingKind::Enum(_) => adjust_setting(app, 1),
             SettingKind::Int { .. } | SettingKind::Str => {
-                app.settings.editing = Some(app.setting_value(doc.key));
+                let current = app.setting_value(doc.key);
+                app.settings.begin_edit(current);
                 app.settings.msg = None;
             }
         },
         Some(SettingsRow::Alias { expansion, .. }) => {
-            app.settings.editing = Some(expansion);
+            app.settings.begin_edit(expansion);
             app.settings.msg = None;
         }
         Some(SettingsRow::AddAlias) => {
-            app.settings.editing = Some(String::new());
+            app.settings.begin_edit(String::new());
             app.settings.msg = None;
         }
         _ => {}
@@ -390,17 +475,12 @@ fn handle_settings_edit(app: &mut App, key: KeyEvent) {
             app.settings.msg = None;
         }
         KeyCode::Enter => commit_settings_edit(app),
-        KeyCode::Backspace => {
+        _ => {
+            let cursor = &mut app.settings.edit_cursor;
             if let Some(buf) = app.settings.editing.as_mut() {
-                buf.pop();
+                editor::handle(buf, cursor, &key);
             }
         }
-        KeyCode::Char(c) => {
-            if let Some(buf) = app.settings.editing.as_mut() {
-                buf.push(c);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -536,7 +616,8 @@ fn activate_network_field(app: &mut App) {
     match NETWORK_FIELDS.get(field).map(|f| f.kind) {
         Some(NetFieldKind::Text) => {
             if let Some(cfg) = app.definitions.get(idx) {
-                app.networks_ui.editing = Some(network_field_value(cfg, field));
+                let current = network_field_value(cfg, field);
+                app.networks_ui.begin_edit(current);
                 app.networks_ui.msg = None;
             }
         }
@@ -599,17 +680,12 @@ fn handle_networks_edit(app: &mut App, key: KeyEvent) {
                 Err(err) => app.networks_ui.msg = Some(err),
             }
         }
-        KeyCode::Backspace => {
+        _ => {
+            let cursor = &mut app.networks_ui.edit_cursor;
             if let Some(buf) = app.networks_ui.editing.as_mut() {
-                buf.pop();
+                editor::handle(buf, cursor, &key);
             }
         }
-        KeyCode::Char(c) => {
-            if let Some(buf) = app.networks_ui.editing.as_mut() {
-                buf.push(c);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1038,17 +1114,11 @@ fn handle_plugin_config_screen(app: &mut App, key: KeyEvent) {
                 }
                 app.plugin_cfg.editing = None;
             }
-            KeyCode::Backspace => {
+            _ => {
                 let mut b = buf;
-                b.pop();
+                editor::handle(&mut b, &mut app.plugin_cfg.edit_cursor, &key);
                 app.plugin_cfg.editing = Some(b);
             }
-            KeyCode::Char(c) => {
-                let mut b = buf;
-                b.push(c);
-                app.plugin_cfg.editing = Some(b);
-            }
-            _ => {}
         }
         return;
     }
@@ -1061,7 +1131,8 @@ fn handle_plugin_config_screen(app: &mut App, key: KeyEvent) {
         KeyCode::Enter | KeyCode::Char(' ') => {
             if let Some((k, default)) = rows.get(app.plugin_cfg.sel) {
                 app.plugin_cfg.msg = None;
-                app.plugin_cfg.editing = Some(app.plugin_cfg_value(k, default));
+                let current = app.plugin_cfg_value(k, default);
+                app.plugin_cfg.begin_edit(current);
             }
         }
         _ => {}
@@ -1530,6 +1601,7 @@ fn complete(app: &mut App) {
         idx: 0,
         start,
         suffix,
+        tail: app.input[app.cursor..].to_string(),
     });
     apply_completion(app, 0);
 }
@@ -1567,6 +1639,7 @@ fn slash_completion(app: &App) -> Option<Completion> {
         idx: 0,
         start,
         suffix: suffix.to_string(),
+        tail: app.input[app.cursor..].to_string(),
     })
 }
 
@@ -1711,15 +1784,29 @@ fn network_names(app: &App) -> Vec<String> {
         .collect()
 }
 
-/// Nicks in the active channel (excluding our own).
+/// Nicks in the active channel (excluding our own), the people who spoke most
+/// recently first, then everyone else alphabetically.
 fn nick_names(app: &App) -> Vec<String> {
     let my = app.my_nick().to_lowercase();
-    app.active_buffer()
+    let buffer = app.active_buffer();
+    let mut nicks: Vec<(u64, String)> = buffer
         .members
         .iter()
-        .map(|m| m.nick.clone())
-        .filter(|n| n.to_lowercase() != my)
-        .collect()
+        .filter(|m| m.nick.to_lowercase() != my)
+        .map(|m| {
+            let spoke = buffer
+                .last_spoke
+                .get(&m.nick.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(0);
+            (spoke, m.nick.clone())
+        })
+        .collect();
+    nicks.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+    });
+    nicks.into_iter().map(|(_, nick)| nick).collect()
 }
 
 /// Names of open channel buffers.
@@ -1738,49 +1825,21 @@ fn apply_completion(app: &mut App, idx: usize) {
     completion.idx = idx;
     let candidate = completion.matches[idx].clone();
     let start = completion.start;
-    let suffix = completion.suffix.clone();
-    app.input = format!("{}{candidate}{suffix}", &app.input[..start]);
-    app.cursor = app.input.len();
+    let tail = completion.tail.clone();
+    // The suffix usually ends in a space; do not double it up against a tail
+    // that already starts with one.
+    let suffix = if tail.starts_with(' ') {
+        completion.suffix.trim_end().to_string()
+    } else {
+        completion.suffix.clone()
+    };
+    let head = format!("{}{candidate}{suffix}", &app.input[..start]);
+    app.cursor = head.len();
+    app.input = format!("{head}{tail}");
 }
 
 fn word_start(input: &str, cursor: usize) -> usize {
     input[..cursor].rfind(' ').map(|i| i + 1).unwrap_or(0)
-}
-
-fn backspace(app: &mut App) {
-    if app.cursor == 0 {
-        return;
-    }
-    let prev = app.input[..app.cursor]
-        .chars()
-        .next_back()
-        .map(char::len_utf8)
-        .unwrap_or(1);
-    let start = app.cursor - prev;
-    app.input.replace_range(start..app.cursor, "");
-    app.cursor = start;
-}
-
-fn move_left(app: &mut App) {
-    if app.cursor > 0 {
-        let prev = app.input[..app.cursor]
-            .chars()
-            .next_back()
-            .map(char::len_utf8)
-            .unwrap_or(1);
-        app.cursor -= prev;
-    }
-}
-
-fn move_right(app: &mut App) {
-    if app.cursor < app.input.len() {
-        let next = app.input[app.cursor..]
-            .chars()
-            .next()
-            .map(char::len_utf8)
-            .unwrap_or(1);
-        app.cursor += next;
-    }
 }
 
 #[cfg(test)]
@@ -1859,9 +1918,194 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('a')));
         handle_key(&mut app, key(KeyCode::Char('l')));
         handle_key(&mut app, key(KeyCode::Tab));
-        assert_eq!(app.input, "alice: "); // first match, at line start
+        // Nobody has spoken, so the matches are alphabetical.
+        assert_eq!(app.input, "albert: "); // first match, at line start
         handle_key(&mut app, key(KeyCode::Tab));
-        assert_eq!(app.input, "albert: "); // cycles to next
+        assert_eq!(app.input, "alice: "); // cycles to next
+    }
+
+    fn said(app: &mut App, who: &str) {
+        app.apply(crate::session::UiEvent {
+            net: 0,
+            kind: crate::session::UiEventKind::Engine(irc_engine::Event::MessageReceived(
+                irc_engine::ChatMessage {
+                    time: None,
+                    msgid: None,
+                    account: None,
+                    sender: Some(irc_proto::Source::User {
+                        nick: who.into(),
+                        user: None,
+                        host: None,
+                    }),
+                    target: "#rust".into(),
+                    text: "hi".into(),
+                    kind: irc_engine::MessageKind::Privmsg,
+                },
+            )),
+        });
+    }
+
+    fn mods(code: KeyCode, m: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, m)
+    }
+
+    #[test]
+    fn the_input_line_has_the_editing_keys() {
+        let mut app = app_with_channel();
+        for c in "hello big world".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, mods(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "hello big ");
+        handle_key(&mut app, mods(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(app.cursor, "hello ".len());
+        handle_key(&mut app, key(KeyCode::Delete));
+        assert_eq!(app.input, "hello ig ");
+        handle_key(&mut app, mods(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.cursor, 0);
+        handle_key(&mut app, mods(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.cursor, app.input.len());
+        handle_key(&mut app, mods(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn alt_arrows_still_switch_buffers_rather_than_moving_the_cursor() {
+        let mut app = app_with_channel();
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        let before = app.active;
+        handle_key(&mut app, mods(KeyCode::Left, KeyModifiers::ALT));
+        assert_ne!(app.active, before, "switched buffer");
+        assert_eq!(app.input, "x");
+        assert_eq!(app.cursor, 1, "cursor untouched");
+    }
+
+    #[test]
+    fn inline_edits_have_a_movable_cursor() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/settings");
+        for c in "completion_char".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter)); // begin editing ":"
+        assert_eq!(app.settings.editing.as_deref(), Some(":"));
+        assert_eq!(app.settings.edit_cursor, 1, "starts at the end");
+        handle_key(&mut app, key(KeyCode::Left));
+        handle_key(&mut app, key(KeyCode::Char('>')));
+        assert_eq!(app.settings.editing.as_deref(), Some(">:"));
+        handle_key(&mut app, key(KeyCode::Delete));
+        assert_eq!(app.settings.editing.as_deref(), Some(">"));
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.client.completion_char, ">");
+    }
+
+    #[test]
+    fn a_single_line_paste_goes_into_the_input_at_the_cursor() {
+        let mut app = app_with_channel();
+        app.input = "ab".into();
+        app.cursor = 1;
+        handle_paste(&mut app, "XY\n");
+        assert_eq!(app.input, "aXYb");
+        assert_eq!(app.cursor, 3);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_multi_line_paste_waits_for_confirmation() {
+        let mut app = app_with_channel();
+        handle_paste(&mut app, "one\r\ntwo\r\n\r\nthree\r\n");
+        assert_eq!(app.mode, Mode::PasteConfirm);
+        assert_eq!(app.paste, ["one", "two", "three"], "blank lines dropped");
+        assert_eq!(
+            app.paste_prompt().as_deref(),
+            Some("paste 3 lines to #rust? Enter sends · Esc cancels")
+        );
+        assert!(app.input.is_empty(), "nothing typed into the input");
+        // Other keys do nothing while the question is open.
+        assert!(handle_key(&mut app, key(KeyCode::Char('x'))).is_empty());
+        assert_eq!(app.mode, Mode::PasteConfirm);
+        // Enter sends every line.
+        let out = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            out,
+            vec![
+                NetCommand::Raw("PRIVMSG #rust :one".to_string()),
+                NetCommand::Raw("PRIVMSG #rust :two".to_string()),
+                NetCommand::Raw("PRIVMSG #rust :three".to_string()),
+            ]
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.paste.is_empty());
+    }
+
+    #[test]
+    fn escape_discards_a_multi_line_paste() {
+        let mut app = app_with_channel();
+        handle_paste(&mut app, "one\ntwo");
+        let out = handle_key(&mut app, key(KeyCode::Esc));
+        assert!(out.is_empty());
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.paste.is_empty());
+    }
+
+    #[test]
+    fn the_paste_prompt_warns_about_pasted_commands() {
+        let mut app = app_with_channel();
+        handle_paste(&mut app, "hello\n/quit\n/part");
+        let prompt = app.paste_prompt().unwrap();
+        assert!(
+            prompt.contains("2 start with / and will run as commands"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_paste_into_an_inline_edit_becomes_one_line() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/settings");
+        for c in "completion_char".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_paste(&mut app, "a\nb\n");
+        assert_eq!(app.settings.editing.as_deref(), Some(":a b"));
+        assert_eq!(
+            app.mode,
+            Mode::Settings,
+            "no confirmation in an inline edit"
+        );
+    }
+
+    #[test]
+    fn nick_completion_offers_whoever_spoke_last_first() {
+        let mut app = app_with_channel(); // alice, albert
+        said(&mut app, "alice");
+        assert_eq!(tab_after(&mut app, "al"), "alice: ");
+        said(&mut app, "albert");
+        assert_eq!(tab_after(&mut app, "al"), "albert: ");
+        // Cycling then walks from the most to the least recent.
+        handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.input, "alice: ");
+    }
+
+    #[test]
+    fn completing_mid_line_keeps_what_follows_the_cursor() {
+        let mut app = app_with_channel();
+        said(&mut app, "alice");
+        app.input = "hey al world".into();
+        app.cursor = "hey al".len();
+        handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.input, "hey alice world");
+        assert_eq!(app.cursor, "hey alice".len(), "cursor lands after the nick");
+        // At line start the ": " suffix does not double up against a space.
+        app.input = "al world".into();
+        app.cursor = 2;
+        app.completion = None;
+        handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.input, "alice: world");
+        // Cycling re-applies against the same tail rather than eating it.
+        handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.input, "albert: world");
     }
 
     #[test]
@@ -2284,7 +2528,7 @@ mod tests {
         run_line(&mut app, "/set nope 1");
         // completion_char changes the suffix for a nick completed at line start.
         run_line(&mut app, "/set completion_char ,");
-        assert_eq!(tab_after(&mut app, "al"), "alice, ");
+        assert_eq!(tab_after(&mut app, "al"), "albert, ");
     }
 
     #[test]
