@@ -1,3 +1,8 @@
+---
+title: "norn user guide"
+summary: "Everything you need to run norn day to day: starting it, the config file, connecting to networks, settings, the command set, keybindings, and the features that…"
+verified: "2026-10-08"
+---
 # norn user guide
 
 Everything you need to run norn day to day: starting it, the config file,

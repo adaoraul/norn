@@ -1,3 +1,8 @@
+---
+title: "norn plugin developer guide"
+summary: "norn plugins are Rhai scripts. A plugin defines hook functions that norn calls when something happens (a message arrives, someone joins, you go idle), and thos…"
+verified: "2026-10-08"
+---
 # norn plugin developer guide
 
 norn plugins are [Rhai](https://rhai.rs) scripts. A plugin defines *hook*

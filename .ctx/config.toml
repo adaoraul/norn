@@ -1,0 +1,21 @@
+# ctx configuration; see DESIGN.md
+schema = 1
+id = "b6562570934f"
+name = "norn"
+prefix = "norn"
+kind = "project"
+umbrella = false
+
+[docs]
+include = [
+    "DESIGN.md",
+    "docs/**/*.md",
+    "README.md",
+]
+exclude = []
+decisions = "docs/decisions"
+design = "docs/DESIGN.md"
+
+[inbox]
+commit = false
+cap = 20

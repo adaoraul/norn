@@ -1,3 +1,8 @@
+---
+title: "norn"
+summary: "A terminal IRCv3 client, built on a from-scratch protocol engine."
+verified: "2026-10-08"
+---
 # norn
 
 A terminal IRCv3 client, built on a from-scratch protocol engine.

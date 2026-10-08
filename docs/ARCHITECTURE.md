@@ -1,3 +1,8 @@
+---
+title: "IRCv3 Engine: Architecture"
+summary: "This document specifies the protocol engine only, not the UI. The engine owns everything from raw socket bytes up to semantic events. The UI layer (TUI) consum…"
+verified: "2026-10-08"
+---
 # IRCv3 Engine: Architecture
 
 ## Scope
