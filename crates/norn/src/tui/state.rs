@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::Local;
-use irc_engine::{Event, LeaveReason, Member, MessageKind, TopicChange, WhoisInfo};
+use irc_engine::{
+    DisconnectReason, Event, LeaveReason, Member, MessageKind, TopicChange, WhoisInfo,
+};
 use irc_proto::Source;
 use ratatui::style::Color;
 
@@ -711,8 +713,13 @@ impl App {
                 // Prepend older messages. The view is anchored from the bottom,
                 // so the visible window stays put; the user scrolls further up to
                 // reach the newly loaded lines.
+                let added = lines.len();
                 lines.append(&mut self.buffers[idx].lines);
                 self.buffers[idx].lines = lines;
+                // Lines were inserted above the divider, so it moves down with them.
+                if let Some(marker) = self.buffers[idx].unread_marker.as_mut() {
+                    *marker += added;
+                }
                 self.buffers[idx].history_pending = false;
                 // A short page (complete) means there is nothing older; stop
                 // paging so scrolling up does not re-request the same top.
@@ -769,7 +776,18 @@ impl App {
                     }
                 };
                 if matches!(reason, LeaveReason::Quit(_)) {
+                    // A quit has no channel: show it where the nick was visible
+                    // (shared channels and an open query), then drop them.
                     for b in self.buffers.iter_mut().filter(|b| b.net == net) {
+                        let was_member = b
+                            .members
+                            .iter()
+                            .any(|m| m.nick.eq_ignore_ascii_case(&who.nick));
+                        let is_query =
+                            b.kind == BufferKind::Query && b.name.eq_ignore_ascii_case(&who.nick);
+                        if was_member || is_query {
+                            b.push(event_line(text.clone()));
+                        }
                         b.members
                             .retain(|m| !m.nick.eq_ignore_ascii_case(&who.nick));
                     }
@@ -781,11 +799,35 @@ impl App {
                 }
             }
             Event::NickChanged { old, new } => {
+                let mine = self
+                    .networks
+                    .get(net)
+                    .is_some_and(|m| m.my_nick.eq_ignore_ascii_case(&old));
+                if mine {
+                    self.networks[net].my_nick = new.clone();
+                }
+                let has_new_query = self.buffers.iter().any(|b| {
+                    b.net == net && b.kind == BufferKind::Query && b.name.eq_ignore_ascii_case(&new)
+                });
+                let text = if mine {
+                    format!("you are now known as {new}")
+                } else {
+                    format!("{old} is now known as {new}")
+                };
                 for b in self.buffers.iter_mut().filter(|b| b.net == net) {
+                    let mut seen = false;
                     for m in &mut b.members {
                         if m.nick.eq_ignore_ascii_case(&old) {
                             m.nick = new.clone();
+                            seen = true;
                         }
+                    }
+                    let is_query = b.kind == BufferKind::Query && b.name.eq_ignore_ascii_case(&old);
+                    if is_query && !has_new_query {
+                        b.name = new.clone();
+                    }
+                    if seen || is_query || (mine && b.kind == BufferKind::Server) {
+                        b.push(event_line(text.clone()));
                     }
                 }
             }
@@ -806,6 +848,13 @@ impl App {
                 if let Some(meta) = self.networks.get_mut(net) {
                     meta.away = now_away;
                 }
+                let text = if now_away {
+                    "you are now marked away"
+                } else {
+                    "you are no longer away"
+                };
+                let i = self.server_buffer(net);
+                self.buffers[i].push(event_line(text.to_string()));
             }
             // Track our own services account (member accounts are not stored).
             Event::AccountChanged { nick, account } => {
@@ -822,9 +871,24 @@ impl App {
             Event::StandardReply(reply) => {
                 let i = self.server_buffer(net);
                 self.buffers[i].push(event_line(format!(
-                    "{:?} {} {}: {}",
-                    reply.kind, reply.command, reply.code, reply.description
+                    "{} {} {}: {}",
+                    reply.kind.label(),
+                    reply.command,
+                    reply.code,
+                    reply.description
                 )));
+            }
+            Event::Disconnected(reason) => {
+                let text = match reason {
+                    DisconnectReason::NickUnavailable => {
+                        "all nicknames are in use; registration abandoned"
+                    }
+                    DisconnectReason::SaslAbortedByPolicy => {
+                        "SASL authentication failed; connection aborted by policy"
+                    }
+                };
+                let i = self.server_buffer(net);
+                self.buffers[i].push(event_line(text.to_string()));
             }
             Event::AuthResult(result) => {
                 let text = match &result {
@@ -1608,7 +1672,10 @@ impl App {
     /// Close the active buffer (unless it is a server buffer). Returns the
     /// channel name if a channel was closed (so the caller can PART it).
     pub fn close_active(&mut self) -> Option<String> {
-        if self.active_buffer().kind == BufferKind::Server {
+        if matches!(
+            self.active_buffer().kind,
+            BufferKind::Server | BufferKind::Status
+        ) {
             return None;
         }
         let buffer = self.buffers.remove(self.active);
@@ -2282,6 +2349,161 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("no such nick: ghost"));
+    }
+
+    fn event_texts(buffer: &Buffer) -> Vec<String> {
+        buffer
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Event { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn join_channel(a: &mut App, chan: &str, nicks: &[&str]) -> usize {
+        a.apply(engine(
+            0,
+            Event::NamesLoaded {
+                target: chan.into(),
+                members: nicks.iter().map(|n| member(n)).collect(),
+            },
+        ));
+        a.buffer_index(0, chan).unwrap()
+    }
+
+    #[test]
+    fn quit_is_shown_in_shared_channels_and_query_only() {
+        let mut a = app();
+        let rust = join_channel(&mut a, "#rust", &["alice", "bob"]);
+        let other = join_channel(&mut a, "#other", &["carol"]);
+        a.apply(engine(0, Event::MessageReceived(chat("me", "alice", "hi"))));
+        let query = a.buffer_index(0, "alice").unwrap();
+        a.apply(engine(
+            0,
+            Event::MemberLeft {
+                target: String::new(),
+                who: irc_engine::User::nick("alice"),
+                reason: LeaveReason::Quit("bye".into()),
+            },
+        ));
+        assert_eq!(event_texts(&a.buffers[rust]), vec!["alice quit (bye)"]);
+        assert_eq!(event_texts(&a.buffers[query]), vec!["alice quit (bye)"]);
+        assert!(event_texts(&a.buffers[other]).is_empty());
+        assert_eq!(a.buffers[rust].members.len(), 1);
+    }
+
+    #[test]
+    fn own_nick_change_updates_my_nick_and_is_announced() {
+        let mut a = app();
+        let rust = join_channel(&mut a, "#rust", &["me", "bob"]);
+        a.apply(engine(
+            0,
+            Event::NickChanged {
+                old: "me".into(),
+                new: "me_".into(),
+            },
+        ));
+        assert_eq!(a.networks[0].my_nick, "me_");
+        assert_eq!(
+            event_texts(&a.buffers[rust]),
+            vec!["you are now known as me_"]
+        );
+        // A DM to the new nick now opens a query, not a channel buffer.
+        a.apply(engine(0, Event::MessageReceived(chat("me_", "bob", "yo"))));
+        let q = a.buffer_index(0, "bob").unwrap();
+        assert_eq!(a.buffers[q].kind, BufferKind::Query);
+    }
+
+    #[test]
+    fn other_nick_change_renames_member_and_query() {
+        let mut a = app();
+        let rust = join_channel(&mut a, "#rust", &["alice"]);
+        a.apply(engine(0, Event::MessageReceived(chat("me", "alice", "hi"))));
+        a.apply(engine(
+            0,
+            Event::NickChanged {
+                old: "alice".into(),
+                new: "alicia".into(),
+            },
+        ));
+        assert_eq!(a.buffers[rust].members[0].nick, "alicia");
+        assert_eq!(
+            event_texts(&a.buffers[rust]),
+            vec!["alice is now known as alicia"]
+        );
+        assert!(a.buffer_index(0, "alicia").is_some());
+        assert!(a.buffer_index(0, "alice").is_none());
+    }
+
+    #[test]
+    fn away_status_and_disconnect_reasons_reach_the_server_buffer() {
+        let mut a = app();
+        a.apply(engine(0, Event::AwayStatus(true)));
+        a.apply(engine(0, Event::AwayStatus(false)));
+        a.apply(engine(
+            0,
+            Event::Disconnected(DisconnectReason::NickUnavailable),
+        ));
+        let server = a.buffer_index(0, "*").unwrap();
+        let texts = event_texts(&a.buffers[server]);
+        assert!(texts.contains(&"you are now marked away".to_string()));
+        assert!(texts.contains(&"you are no longer away".to_string()));
+        assert!(texts.iter().any(|t| t.contains("nicknames are in use")));
+    }
+
+    #[test]
+    fn standard_reply_uses_the_wire_keyword() {
+        let mut a = app();
+        a.apply(engine(
+            0,
+            Event::StandardReply(irc_engine::StandardReply {
+                kind: irc_engine::ReplyKind::Fail,
+                command: "CHATHISTORY".into(),
+                code: "INVALID_PARAMS".into(),
+                context: Vec::new(),
+                description: "bad".into(),
+            }),
+        ));
+        let server = a.buffer_index(0, "*").unwrap();
+        assert_eq!(
+            event_texts(&a.buffers[server]),
+            vec!["FAIL CHATHISTORY INVALID_PARAMS: bad"]
+        );
+    }
+
+    #[test]
+    fn history_prepend_keeps_the_unread_marker_on_the_same_line() {
+        let mut a = app();
+        let idx = join_channel(&mut a, "#rust", &["alice"]);
+        a.apply(engine(
+            0,
+            Event::MessageReceived(chat("#rust", "alice", "one")),
+        ));
+        a.buffers[idx].unread_marker = Some(1);
+        a.apply(engine(
+            0,
+            Event::HistoryLoaded {
+                target: "#rust".into(),
+                messages: vec![
+                    chat("#rust", "alice", "old1"),
+                    chat("#rust", "alice", "old2"),
+                ],
+                complete: false,
+            },
+        ));
+        assert_eq!(a.buffers[idx].unread_marker, Some(3));
+    }
+
+    #[test]
+    fn the_console_cannot_be_closed() {
+        let mut a = app();
+        a.switch_to(0);
+        assert_eq!(a.active_buffer().kind, BufferKind::Status);
+        let before = a.buffers.len();
+        assert!(a.close_active().is_none());
+        assert_eq!(a.buffers.len(), before);
     }
 
     #[test]

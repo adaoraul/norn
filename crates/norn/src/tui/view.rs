@@ -1062,7 +1062,7 @@ fn draw_networks_form(f: &mut Frame, area: Rect, app: &App, focused: bool) {
         // Value: a checkbox for a bool, the edit buffer while editing, else text.
         let editing_here = selected && app.networks_ui.editing.is_some();
         let value = if field.kind == NetFieldKind::Toggle {
-            if cfg.tls {
+            if network_field_value(cfg, i) == "on" {
                 "[x]".to_string()
             } else {
                 "[ ]".to_string()
@@ -1924,6 +1924,38 @@ mod tests {
         // The form shows fields including password_command, never a bare password.
         assert!(text.contains("host"));
         assert!(text.contains("password_command"));
+    }
+
+    #[test]
+    fn network_form_checkboxes_reflect_their_own_field() {
+        let mut app = one_net_app();
+        app.definitions.push(crate::config::NetworkConfig {
+            name: "libera".into(),
+            host: "irc.libera.chat".into(),
+            port: 6697,
+            tls: true,
+            nick: "svan".into(),
+            user: None,
+            realname: None,
+            sasl_account: None,
+            sasl_mech: crate::config::SaslMech::Plain,
+            password_command: None,
+            auto_join: vec![],
+            auto_connect: false,
+            identify: false,
+        });
+        app.open_networks();
+        let mut terminal = Terminal::new(TestBackend::new(90, 28)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        let row = |name: &str| -> String {
+            text.lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name}"))
+                .to_string()
+        };
+        assert!(row("tls").contains("[x]"), "tls is on");
+        assert!(row("auto_connect").contains("[ ]"), "auto_connect is off");
     }
 
     fn chat(target: &str, from: &str, text: &str) -> irc_engine::ChatMessage {

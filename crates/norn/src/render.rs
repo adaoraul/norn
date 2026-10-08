@@ -126,8 +126,11 @@ pub fn render(event: &Event) -> Vec<String> {
             lines
         }
         Event::StandardReply(reply) => vec![format!(
-            "-- {:?} {} {}: {}",
-            reply.kind, reply.command, reply.code, reply.description
+            "-- {} {} {}: {}",
+            reply.kind.label(),
+            reply.command,
+            reply.code,
+            reply.description
         )],
         Event::Disconnected(reason) => vec![format!("-- disconnected: {reason:?}")],
     }

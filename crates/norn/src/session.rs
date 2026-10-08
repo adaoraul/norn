@@ -229,7 +229,7 @@ async fn run_once(
                 match incoming? {
                     Some(msg) => {
                         on_message(
-                            id, msg, &mut engine, &mut conn, &my_nick, settings,
+                            id, msg, &mut engine, &mut conn, &mut my_nick, settings,
                             authenticated, &mut identified, ui_tx,
                         )
                         .await?
@@ -272,7 +272,7 @@ async fn on_message<S>(
     msg: Message,
     engine: &mut Engine,
     conn: &mut Connection<S>,
-    my_nick: &str,
+    my_nick: &mut String,
     settings: &NetworkSettings,
     authenticated: bool,
     identified: &mut bool,
@@ -288,13 +288,20 @@ where
 
     for event in engine.handle(msg) {
         if let Event::MemberJoined { target, who, .. } = &event {
-            if who.nick == my_nick {
+            if who.nick.eq_ignore_ascii_case(my_nick) {
                 let line = engine
                     .request_history(ChatHistoryRequest::latest(target.clone(), HISTORY_LIMIT));
                 conn.send(&line).await?;
                 // Seed away state for members already gone (away-notify only
                 // reports live changes, not the state at join time).
                 conn.send(&format!("WHO {target}")).await?;
+            }
+        }
+        // Follow our own nick across /nick and forced changes, so later joins
+        // are still recognised as ours.
+        if let Event::NickChanged { old, new } = &event {
+            if old.eq_ignore_ascii_case(my_nick) {
+                *my_nick = new.clone();
             }
         }
         // NickServ auto-identify fallback: fire once on the identify prompt when

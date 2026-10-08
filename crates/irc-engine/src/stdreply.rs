@@ -17,6 +17,17 @@ pub enum ReplyKind {
     Note,
 }
 
+impl ReplyKind {
+    /// The wire keyword, for display.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ReplyKind::Fail => "FAIL",
+            ReplyKind::Warn => "WARN",
+            ReplyKind::Note => "NOTE",
+        }
+    }
+}
+
 /// A parsed standard reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandardReply {

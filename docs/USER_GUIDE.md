@@ -274,7 +274,14 @@ The help panel opens with `/help` (there is no dedicated key for it).
 The sidebar lists the global console, then each network's status buffer, then its
 channels and query (PM) buffers. Commands act on the active buffer's network.
 Move around with `Alt+Left`/`Alt+Right`, `Alt+1..9`, or the `Ctrl+K` fuzzy
-switcher. `/join`, `/query`, `/part`, and `/close` open and close buffers.
+switcher. `/join`, `/query`, `/part`, and `/close` open and close buffers. The
+console and network status buffers cannot be closed.
+
+Channel buffers show joins, parts, kicks, quits and nick changes (a quit or nick
+change appears in every channel you share with that person, and in their query
+buffer). Your own nick changes and away state are announced too, and the
+network's status buffer says why a connection was abandoned (for example, every
+nickname in use).
 
 ### Completion
 
