@@ -119,6 +119,8 @@ pub enum AppAction {
     Disconnect(NetworkId, Option<String>),
     /// Rebuild the addon host from `app.triggers` after an in-app edit.
     ReloadAddons,
+    /// Turn terminal mouse capture on or off (the `mouse` setting).
+    SetMouse(bool),
 }
 
 /// A network's metadata.
@@ -227,6 +229,31 @@ impl Buffer {
                 .then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
         });
         members
+    }
+}
+
+/// How long a "press again to confirm" stays armed.
+pub const CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A destructive action waiting for a second press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirm {
+    /// Leave norn (Ctrl+C).
+    Quit,
+    /// Delete the network definition with this name.
+    DeleteNetwork(String),
+    /// Delete the alias with this name.
+    DeleteAlias(String),
+}
+
+impl Confirm {
+    /// What to tell the user while this is armed.
+    pub fn prompt(&self) -> String {
+        match self {
+            Confirm::Quit => "press Ctrl+C again to quit".to_string(),
+            Confirm::DeleteNetwork(name) => format!("press x again to delete '{name}'"),
+            Confirm::DeleteAlias(name) => format!("press Delete again to remove alias /{name}"),
+        }
     }
 }
 
@@ -539,6 +566,8 @@ pub struct App {
     pub echo_nets: HashSet<NetworkId>,
     /// The latest PING round-trip time per network.
     pub lag: std::collections::HashMap<NetworkId, std::time::Duration>,
+    /// A destructive action waiting for its second press, and when it was armed.
+    pub armed: Option<(Confirm, std::time::Instant)>,
 }
 
 impl App {
@@ -604,6 +633,32 @@ impl App {
             pending_names: HashSet::new(),
             echo_nets: HashSet::new(),
             lag: std::collections::HashMap::new(),
+            armed: None,
+        }
+    }
+
+    /// Ask for a second press. Returns `true` (and disarms) when `action` was
+    /// already armed within [`CONFIRM_WINDOW`]; otherwise arms it and returns
+    /// `false`, so the caller shows [`App::armed_prompt`] instead of acting.
+    pub fn confirm(&mut self, action: Confirm) -> bool {
+        let confirmed = matches!(
+            &self.armed,
+            Some((armed, at)) if *armed == action && at.elapsed() < CONFIRM_WINDOW
+        );
+        self.armed = if confirmed {
+            None
+        } else {
+            Some((action, std::time::Instant::now()))
+        };
+        self.dirty = true;
+        confirmed
+    }
+
+    /// The prompt for a live armed action, if one is still within its window.
+    pub fn armed_prompt(&self) -> Option<String> {
+        match &self.armed {
+            Some((action, at)) if at.elapsed() < CONFIRM_WINDOW => Some(action.prompt()),
+            _ => None,
         }
     }
 
@@ -1437,6 +1492,7 @@ impl App {
             "nicklist" => on_off(self.client.nicklist),
             "completion_char" => self.client.completion_char.clone(),
             "beep_on_highlight" => on_off(self.client.beep_on_highlight),
+            "mouse" => on_off(self.client.mouse),
             "scrollback_lines" => self.client.scrollback_lines.to_string(),
             "idle_secs" => self.client.idle_secs.to_string(),
             _ => String::new(),
@@ -1456,6 +1512,15 @@ impl App {
             "nick_colors" => self.client.nick_colors = want_bool()?,
             "nicklist" => self.client.nicklist = want_bool()?,
             "beep_on_highlight" => self.client.beep_on_highlight = want_bool()?,
+            "mouse" => {
+                let want = want_bool()?;
+                if want != self.client.mouse {
+                    self.client.mouse = want;
+                    // Capturing the mouse is a terminal mode, not UI state: the
+                    // run loop flips it.
+                    self.actions.push(AppAction::SetMouse(want));
+                }
+            }
             "theme" => {
                 let v = raw.to_ascii_lowercase();
                 if !theme::THEME_NAMES.contains(&v.as_str()) {
@@ -3038,6 +3103,23 @@ mod tests {
             event_texts(&a.buffers[rust]),
             vec!["netjoin irc.a: 2 back (a, b)"]
         );
+    }
+
+    #[test]
+    fn every_registered_setting_can_be_read_and_written_back() {
+        // Catches a setting added to the registry but not wired into
+        // `setting_value` / `set_setting` (it would read as empty or be refused).
+        let mut a = app();
+        for doc in crate::settings::SETTINGS {
+            let value = a.setting_value(doc.key);
+            assert!(!value.is_empty(), "{} reads as empty", doc.key);
+            assert_eq!(
+                a.set_setting(doc.key, &value).as_deref(),
+                Ok(value.as_str()),
+                "{} does not accept its own value",
+                doc.key
+            );
+        }
     }
 
     #[test]

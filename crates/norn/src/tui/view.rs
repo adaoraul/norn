@@ -721,6 +721,15 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App, lines_above: usize) {
         }
         spans.push(Span::styled("]", Style::default().fg(theme::TEXT)));
     }
+    // A pending "press again" (quit): spelled out so it cannot be missed.
+    if let Some(prompt) = app.armed_prompt() {
+        spans.push(Span::styled(
+            format!(" {prompt}"),
+            Style::default()
+                .fg(theme::GOLD)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     let mut left_line = Line::from(spans);
     if lines_above > 0 {
@@ -2382,6 +2391,16 @@ mod tests {
         });
         let (_, text) = draw_text(&app, 100, 20);
         assert!(row_with(&text, "[Act:").contains("libera/#quiet"));
+    }
+
+    #[test]
+    fn a_pending_quit_is_spelled_out_in_the_activity_bar() {
+        let mut app = one_net_app();
+        let (_, text) = draw_text(&app, 100, 20);
+        assert!(!text.contains("press Ctrl+C again"));
+        assert!(!app.confirm(crate::tui::state::Confirm::Quit));
+        let (_, text) = draw_text(&app, 100, 20);
+        assert!(text.contains("press Ctrl+C again to quit"), "{text}");
     }
 
     #[test]

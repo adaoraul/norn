@@ -41,10 +41,13 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    fn new() -> io::Result<Self> {
+    fn new(mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        crossterm::execute!(stdout, EnterAlternateScreen)?;
+        if mouse {
+            crossterm::execute!(stdout, EnableMouseCapture)?;
+        }
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(TerminalGuard { terminal })
     }
@@ -104,7 +107,7 @@ pub async fn run(
     // `ui_tx` is held (and cloned when spawning) so `ui_rx` stays open even with
     // zero networks; `cmd_txs` grows as networks are added at runtime.
     let mut cmd_txs = cmd_txs;
-    let mut guard = TerminalGuard::new()?;
+    let mut guard = TerminalGuard::new(client.mouse)?;
     let mut app = App::new(networks, client, definitions, aliases, config_path);
     // Plugin scripts live next to the config file (`<config-dir>/plugins`).
     let plugins_dir: Option<PathBuf> = app
@@ -391,23 +394,30 @@ fn drain_actions(
                 *host = report.host;
                 report_addon_load(app, report.plugins, report.needs_presence);
             }
-            AppAction::AddNetwork { id, config } => match config.resolve() {
-                Ok(settings) => {
-                    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-                    // The id was allocated as `networks.len()`, kept in lockstep
-                    // with `cmd_txs`, so a plain push lands it at index `id`.
-                    debug_assert_eq!(id, cmd_txs.len());
-                    cmd_txs.push(cmd_tx);
-                    tokio::spawn(crate::session::run_network(
-                        id,
-                        settings,
-                        ui_tx.clone(),
-                        cmd_rx,
-                        quit.clone(),
-                    ));
-                }
-                Err(err) => app.push_active_event(format!("connect failed: {err}")),
-            },
+            AppAction::AddNetwork { id, config } => {
+                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                // The id was allocated as `networks.len()`, kept in lockstep
+                // with `cmd_txs`, so a plain push lands it at index `id`. The
+                // sender is always pushed, so a failure to resolve the password
+                // later can never leave the two lists out of step.
+                debug_assert_eq!(id, cmd_txs.len());
+                cmd_txs.push(cmd_tx);
+                tokio::spawn(crate::session::run_network(
+                    id,
+                    crate::session::NetworkInit::Deferred(config),
+                    ui_tx.clone(),
+                    cmd_rx,
+                    quit.clone(),
+                ));
+            }
+            AppAction::SetMouse(on) => {
+                let mut stdout = io::stdout();
+                let _ = if on {
+                    crossterm::execute!(stdout, EnableMouseCapture)
+                } else {
+                    crossterm::execute!(stdout, DisableMouseCapture)
+                };
+            }
             AppAction::Connect(id) => {
                 if let Some(tx) = cmd_txs.get(id) {
                     let _ = tx.send(NetCommand::Connect);

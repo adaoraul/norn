@@ -93,6 +93,13 @@ pub const SETTINGS: &[SettingDoc] = &[
         default: "off",
     },
     SettingDoc {
+        key: "mouse",
+        category: "behavior",
+        kind: SettingKind::Bool,
+        desc: "capture the mouse (click buffers, wheel scroll); off lets the terminal select text",
+        default: "on",
+    },
+    SettingDoc {
         key: "scrollback_lines",
         category: "history",
         kind: SettingKind::Int {

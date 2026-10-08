@@ -189,6 +189,11 @@ pub struct ClientConfig {
     /// (0 disables idle tracking).
     #[serde(default = "default_idle_secs")]
     pub idle_secs: usize,
+    /// Whether norn captures the mouse (click to switch buffers, wheel to
+    /// scroll). Off hands the mouse back to the terminal for plain text
+    /// selection.
+    #[serde(default = "default_true")]
+    pub mouse: bool,
 }
 
 impl Default for ClientConfig {
@@ -202,6 +207,7 @@ impl Default for ClientConfig {
             beep_on_highlight: false,
             scrollback_lines: default_scrollback(),
             idle_secs: default_idle_secs(),
+            mouse: true,
         }
     }
 }
@@ -344,16 +350,29 @@ impl NetworkSettings {
 }
 
 impl NetworkConfig {
-    /// Resolve into connect-ready settings, running the password command (or
-    /// reading NORN_PASSWORD) once now.
+    /// Resolve into connect-ready settings at startup, before the TUI owns the
+    /// terminal, so a `password_command` that prompts (a GPG pinentry, say) can
+    /// still use it. Warnings go to stderr.
     pub fn resolve(&self) -> io::Result<NetworkSettings> {
+        let (settings, warnings) = self.resolve_with_warnings()?;
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+        Ok(settings)
+    }
+
+    /// Resolve into connect-ready settings, running the password command (or
+    /// reading NORN_PASSWORD) once now. Problems come back as warnings instead
+    /// of being printed, so a caller inside the TUI can show them properly. This
+    /// blocks while the command runs: call it from `spawn_blocking`.
+    pub fn resolve_with_warnings(&self) -> io::Result<(NetworkSettings, Vec<String>)> {
         // Resolve the password for SASL and/or NickServ auto-identify.
-        let password = if self.sasl_account.is_some() || self.identify {
+        let (password, warnings) = if self.sasl_account.is_some() || self.identify {
             resolve_password(self.password_command.as_deref())
         } else {
-            None
+            (None, Vec::new())
         };
-        Ok(NetworkSettings {
+        let settings = NetworkSettings {
             name: self.name.clone(),
             conn: ConnConfig {
                 host: self.host.clone(),
@@ -368,26 +387,34 @@ impl NetworkConfig {
             sasl_mech: self.sasl_mech,
             password,
             identify: self.identify,
-        })
+        };
+        Ok((settings, warnings))
     }
 }
 
 /// Resolve a password from a command's stdout, else the `NORN_PASSWORD` env var.
-fn resolve_password(command: Option<&str>) -> Option<String> {
+/// Returns the password and any warnings. A warning never contains the command
+/// line or anything it printed: either could be, or hold, the secret.
+fn resolve_password(command: Option<&str>) -> (Option<String>, Vec<String>) {
+    let mut warnings = Vec::new();
     if let Some(cmd) = command {
         match ProcCommand::new("sh").arg("-c").arg(cmd).output() {
             Ok(out) if out.status.success() => {
                 let pw = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !pw.is_empty() {
-                    return Some(pw);
+                    return (Some(pw), warnings);
                 }
-                eprintln!("warning: password_command produced no output");
+                warnings.push("password_command produced no output".to_string());
             }
-            Ok(_) => eprintln!("warning: password_command failed: {cmd}"),
-            Err(e) => eprintln!("warning: could not run password_command: {e}"),
+            Ok(out) => warnings.push(match out.status.code() {
+                Some(code) => format!("password_command failed (exit status {code})"),
+                None => "password_command was stopped by a signal".to_string(),
+            }),
+            Err(e) => warnings.push(format!("could not run password_command: {e}")),
         }
     }
-    std::env::var(PASSWORD_ENV).ok().filter(|p| !p.is_empty())
+    let from_env = std::env::var(PASSWORD_ENV).ok().filter(|p| !p.is_empty());
+    (from_env, warnings)
 }
 
 /// The default config path, `~/.config/norn/config.toml`.
@@ -703,6 +730,56 @@ mod tests {
         let settings = net.resolve().unwrap();
         assert_eq!(settings.password.as_deref(), Some("sekret"));
         assert_eq!(settings.bringup().sasl.len(), 1);
+    }
+
+    fn net_with_command(cmd: &str) -> NetworkConfig {
+        NetworkConfig {
+            name: "n".into(),
+            host: "h".into(),
+            port: 6697,
+            tls: true,
+            nick: "nick".into(),
+            user: None,
+            realname: None,
+            sasl_account: Some("acct".into()),
+            sasl_mech: SaslMech::Plain,
+            password_command: Some(cmd.into()),
+            auto_join: vec![],
+            auto_connect: true,
+            identify: false,
+        }
+    }
+
+    #[test]
+    fn a_failing_password_command_warns_without_leaking_anything() {
+        // The command line itself carries a "secret", and the command prints one
+        // to both streams before failing: none of it may reach a warning.
+        let net = net_with_command(
+            "echo cmd-secret >/dev/null; echo out-secret; echo err-secret >&2; exit 3",
+        );
+        let (_, warnings) = net.resolve_with_warnings().unwrap();
+        assert_eq!(warnings, vec!["password_command failed (exit status 3)"]);
+        for leaked in ["cmd-secret", "out-secret", "err-secret"] {
+            assert!(
+                warnings.iter().all(|w| !w.contains(leaked)),
+                "warning leaked {leaked}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_password_command_result_warns() {
+        let (_, warnings) = net_with_command("true").resolve_with_warnings().unwrap();
+        assert_eq!(warnings, vec!["password_command produced no output"]);
+    }
+
+    #[test]
+    fn a_working_password_command_has_no_warnings() {
+        let (settings, warnings) = net_with_command("printf sekret")
+            .resolve_with_warnings()
+            .unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(settings.password.as_deref(), Some("sekret"));
     }
 
     #[test]

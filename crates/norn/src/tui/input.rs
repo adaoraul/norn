@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use super::state::{
-    check_dialable, network_field_value, App, AppAction, BufferKind, Completion, Mode,
+    check_dialable, network_field_value, App, AppAction, BufferKind, Completion, Confirm, Mode,
     NetFieldKind, NetworksFocus, Switcher, NETWORK_FIELDS,
 };
 use super::view::{sidebar_rows, SidebarRow};
@@ -86,10 +86,32 @@ fn nicklist_nick_at(app: &App, y: u16) -> Option<String> {
         .map(|m| m.nick.clone())
 }
 
+/// Whether `key`, in the current mode, is one that arms a destructive action
+/// (quit, delete a network, delete an alias). Those keep a pending confirmation
+/// alive; every other key cancels it.
+fn is_arming_key(app: &App, key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match app.mode {
+        Mode::Normal => ctrl && key.code == KeyCode::Char('c'),
+        Mode::Networks => {
+            app.networks_ui.editing.is_none()
+                && app.networks_ui.focus == NetworksFocus::List
+                && matches!(key.code, KeyCode::Char('x') | KeyCode::Delete)
+        }
+        Mode::Settings => app.settings.editing.is_none() && key.code == KeyCode::Delete,
+        _ => false,
+    }
+}
+
 /// Handle one key. Mutates `app` and returns commands to send to the active
 /// buffer's network (empty for local-only keys). Sets `app.should_quit` on quit.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
     app.dirty = true;
+    // A "press again to confirm" only survives the very next key if that key
+    // repeats the arming one; anything else cancels it.
+    if !is_arming_key(app, &key) {
+        app.armed = None;
+    }
     if app.mode == Mode::Switcher {
         handle_switcher(app, key);
         return Vec::new();
@@ -119,7 +141,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Vec<NetCommand> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
-        KeyCode::Char('c') if ctrl => app.should_quit = true,
+        // A stray Ctrl+C should not end a session: ask for a second one.
+        KeyCode::Char('c') if ctrl => {
+            if app.confirm(Confirm::Quit) {
+                app.should_quit = true;
+            }
+        }
         KeyCode::Char('k') if ctrl => {
             app.mode = Mode::Switcher;
             app.switcher = Switcher::default();
@@ -332,6 +359,10 @@ fn delete_selected_alias(app: &mut App) {
     let Some(SettingsRow::Alias { name, .. }) = app.selected_setting_row() else {
         return;
     };
+    if !app.confirm(Confirm::DeleteAlias(name.clone())) {
+        app.settings.msg = app.armed_prompt();
+        return;
+    }
     app.aliases.remove(&name);
     app.save_config();
     app.settings.msg = Some(format!("removed alias /{name}"));
@@ -458,8 +489,14 @@ fn handle_networks_list(app: &mut App, key: KeyEvent) {
         KeyCode::Char('d') => disconnect_selected_network(app),
         KeyCode::Char('x') | KeyCode::Delete => {
             let sel = app.networks_ui.sel;
-            if sel < add_row {
-                app.delete_network_definition(sel);
+            if let Some(name) = app.definitions.get(sel).map(|d| d.name.clone()) {
+                // Deleting also drops the connection, so ask twice.
+                if app.confirm(Confirm::DeleteNetwork(name)) {
+                    app.delete_network_definition(sel);
+                    app.networks_ui.msg = None;
+                } else {
+                    app.networks_ui.msg = app.armed_prompt();
+                }
             }
         }
         _ => {}
@@ -1898,7 +1935,14 @@ mod tests {
             .actions
             .iter()
             .any(|a| matches!(a, AppAction::AddNetwork { .. })));
-        // `x` removes the definition.
+        // `x` asks first, then a second `x` removes the definition.
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        assert_eq!(app.definitions.len(), 1, "first press does not delete");
+        assert!(app
+            .networks_ui
+            .msg
+            .as_deref()
+            .is_some_and(|m| m.contains("press x again to delete 'libera'")));
         handle_key(&mut app, key(KeyCode::Char('x')));
         assert!(app.definitions.is_empty());
     }
@@ -2067,9 +2111,11 @@ mod tests {
     fn settings_screen_edit_rejects_bad_value_and_keeps_editing() {
         let mut app = app_with_channel();
         run_line(&mut app, "/settings");
-        // Navigate to scrollback_lines (index 6) and edit it to something invalid.
-        for _ in 0..6 {
-            handle_key(&mut app, key(KeyCode::Down));
+        // Filter down to scrollback_lines (an int setting) and edit it to
+        // something invalid. Filtering, not a row index, so adding settings
+        // elsewhere in the list cannot break this.
+        for c in "scrollback".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
         }
         handle_key(&mut app, key(KeyCode::Enter));
         // Blank the buffer and type a non-number.
@@ -2095,6 +2141,17 @@ mod tests {
         assert!(
             matches!(app.selected_setting_row(), Some(crate::tui::state::SettingsRow::Alias { name, .. }) if name == "hi")
         );
+        // The first Delete only asks; the second one removes it.
+        handle_key(&mut app, key(KeyCode::Delete));
+        assert!(
+            app.aliases.contains_key("hi"),
+            "first press does not delete"
+        );
+        assert!(app
+            .settings
+            .msg
+            .as_deref()
+            .is_some_and(|m| m.contains("press Delete again")));
         handle_key(&mut app, key(KeyCode::Delete));
         assert!(!app.aliases.contains_key("hi"));
     }
@@ -2518,6 +2575,94 @@ mod tests {
             net: 0,
             kind: crate::session::UiEventKind::Engine(event),
         });
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_c_needs_a_second_press_to_quit() {
+        let mut app = app_with_channel();
+        handle_key(&mut app, ctrl_c());
+        assert!(!app.should_quit, "one press only asks");
+        assert_eq!(
+            app.armed_prompt().as_deref(),
+            Some("press Ctrl+C again to quit")
+        );
+        handle_key(&mut app, ctrl_c());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn any_other_key_cancels_a_pending_quit() {
+        let mut app = app_with_channel();
+        handle_key(&mut app, ctrl_c());
+        handle_key(&mut app, key(KeyCode::Char('a')));
+        assert!(app.armed_prompt().is_none(), "typing disarms it");
+        handle_key(&mut app, ctrl_c());
+        assert!(!app.should_quit, "so this press only asks again");
+    }
+
+    #[test]
+    fn a_pending_quit_expires() {
+        use crate::tui::state::{Confirm, CONFIRM_WINDOW};
+        let mut app = app_with_channel();
+        let stale = std::time::Instant::now()
+            .checked_sub(CONFIRM_WINDOW + std::time::Duration::from_secs(1))
+            .expect("a clock that has run for a few seconds");
+        app.armed = Some((Confirm::Quit, stale));
+        assert!(app.armed_prompt().is_none(), "an expired prompt is hidden");
+        handle_key(&mut app, ctrl_c());
+        assert!(!app.should_quit, "and an expired press does not confirm");
+    }
+
+    #[test]
+    fn deleting_a_network_asks_for_the_same_network_twice() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/network add one host=a.example nick=me");
+        run_line(&mut app, "/network add two host=b.example nick=me");
+        run_line(&mut app, "/networks");
+        handle_key(&mut app, key(KeyCode::Char('x'))); // arms 'one'
+        handle_key(&mut app, key(KeyCode::Down));
+        handle_key(&mut app, key(KeyCode::Char('x'))); // arms 'two', not a confirm
+        assert_eq!(app.definitions.len(), 2, "moving off cancels the first");
+        handle_key(&mut app, key(KeyCode::Char('x'))); // confirms 'two'
+        let names: Vec<&str> = app.definitions.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["one"]);
+    }
+
+    #[test]
+    fn deleting_an_alias_is_cancelled_by_another_key() {
+        let mut app = app_with_channel();
+        run_line(&mut app, "/alias hi msg $1 hi");
+        run_line(&mut app, "/settings");
+        for _ in 0..30 {
+            handle_key(&mut app, key(KeyCode::Down));
+        }
+        handle_key(&mut app, key(KeyCode::Up));
+        handle_key(&mut app, key(KeyCode::Delete)); // arms
+        handle_key(&mut app, key(KeyCode::Up)); // moves away, cancelling
+        handle_key(&mut app, key(KeyCode::Down));
+        handle_key(&mut app, key(KeyCode::Delete)); // arms again, no delete
+        assert!(app.aliases.contains_key("hi"));
+    }
+
+    #[test]
+    fn mouse_setting_queues_a_capture_toggle_only_on_change() {
+        use crate::tui::state::AppAction;
+        let mut app = app_with_channel();
+        assert!(app.client.mouse, "capture is on by default");
+        run_line(&mut app, "/set mouse on");
+        assert!(app.actions.is_empty(), "no change, nothing to do");
+        run_line(&mut app, "/set mouse off");
+        assert!(!app.client.mouse);
+        assert_eq!(app.actions, vec![AppAction::SetMouse(false)]);
+        run_line(&mut app, "/set mouse on");
+        assert_eq!(
+            app.actions,
+            vec![AppAction::SetMouse(false), AppAction::SetMouse(true)]
+        );
     }
 
     fn last_line_is_error(app: &App) -> bool {

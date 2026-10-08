@@ -63,7 +63,13 @@ async fn main() -> std::io::Result<()> {
         });
         let ui_tx = ui_tx.clone();
         let quit = quit.clone();
-        tokio::spawn(session::run_network(id, settings, ui_tx, cmd_rx, quit));
+        tokio::spawn(session::run_network(
+            id,
+            session::NetworkInit::Ready(settings),
+            ui_tx,
+            cmd_rx,
+            quit,
+        ));
     }
 
     if cli.plain {

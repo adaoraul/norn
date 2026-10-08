@@ -18,7 +18,7 @@ use irc_proto::{Command, Message, Source};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
-use crate::config::NetworkSettings;
+use crate::config::{NetworkConfig, NetworkSettings};
 use crate::transport;
 
 /// Index identifying a network among the connected set.
@@ -107,6 +107,14 @@ enum RunOutcome {
     Dropped,
 }
 
+/// What a network task starts from.
+pub enum NetworkInit {
+    /// Settings already resolved (startup, before the TUI owns the terminal).
+    Ready(NetworkSettings),
+    /// A definition still to resolve; the task does it off the UI loop.
+    Deferred(NetworkConfig),
+}
+
 /// Run one network task for the life of the program. The task owns a
 /// desired-connection state: when connected it dials and, on an unexpected
 /// drop, reconnects with backoff; when disconnected (via `/disconnect`) it idles
@@ -114,11 +122,44 @@ enum RunOutcome {
 /// closing) ends the task.
 pub async fn run_network(
     id: NetworkId,
-    settings: NetworkSettings,
+    init: NetworkInit,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<NetCommand>,
     quit: Arc<AtomicBool>,
 ) {
+    let settings = match init {
+        NetworkInit::Ready(settings) => settings,
+        // Running `password_command` may take a while (or prompt), so it happens
+        // here on a blocking thread, never on the UI loop.
+        NetworkInit::Deferred(config) => {
+            let resolved = tokio::task::spawn_blocking(move || config.resolve_with_warnings())
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()));
+            match resolved {
+                Ok((settings, warnings)) => {
+                    for warning in warnings {
+                        let _ = ui_tx.send(UiEvent {
+                            net: id,
+                            kind: UiEventKind::Info(format!("warning: {warning}")),
+                        });
+                    }
+                    settings
+                }
+                Err(err) => {
+                    let _ = ui_tx.send(UiEvent {
+                        net: id,
+                        kind: UiEventKind::Info(format!("connect failed: {err}")),
+                    });
+                    let _ = ui_tx.send(UiEvent {
+                        net: id,
+                        kind: UiEventKind::ConnState(ConnState::Closed),
+                    });
+                    return;
+                }
+            }
+        }
+    };
     let mut backoff = BACKOFF_START;
     // Spawned tasks always want to connect (they were just `/connect`ed, or are
     // a startup network).

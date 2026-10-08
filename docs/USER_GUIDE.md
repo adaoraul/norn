@@ -124,6 +124,14 @@ connect time from, in order:
    (e.g. `pass irc/libera`).
 2. The `NORN_PASSWORD` environment variable.
 
+Networks that connect at launch resolve this before the interface starts, so a
+command that prompts (a GPG pinentry) can still use the terminal. A network you
+connect later from inside norn runs the command in the background instead, so the
+interface never freezes; use a command that does not need to prompt there (an
+agent-cached `pass`, for instance). If it fails, the status buffer says so
+(`password_command failed (exit status 3)`); the message never includes the
+command line or anything it printed.
+
 ### SASL
 
 - `plain` - the password is base64-encoded and sent. **TLS only.**
@@ -169,6 +177,7 @@ applies live and auto-saves.
 | `beep_on_highlight`| bool            | `off`   | Ring the terminal bell when a message highlights your nick.         |
 | `scrollback_lines` | int (100-1e6)   | `5000`  | Maximum lines kept per buffer.                                      |
 | `idle_secs`        | int (0-86400)   | `300`   | Seconds of inactivity before plugins get `on_idle`; `0` disables.   |
+| `mouse`            | bool            | `on`    | Capture the mouse (click buffers, wheel scroll). Turn off to select text with the terminal's own selection; applies at once. |
 
 `/set` with no arguments lists the current values.
 
@@ -244,7 +253,7 @@ locally so your side of the conversation is always visible.
 
 | Key                 | Action                                                        |
 | ------------------- | ------------------------------------------------------------- |
-| `Ctrl+C`            | Quit (disconnect all and exit).                               |
+| `Ctrl+C`            | Quit (disconnect all and exit). Press twice within 2 seconds; any other key cancels. |
 | `Ctrl+K`            | Open the buffer switcher (type to filter, arrows, Enter).     |
 | `F2`                | Open the settings screen.                                     |
 | `F3`                | Open the networks manager.                                    |
@@ -267,10 +276,15 @@ The help panel opens with `/help` (there is no dedicated key for it).
 - **Buffer switcher** (`Ctrl+K`): type to filter, `Up`/`Down` to select, `Enter`
   to switch, `Esc` to cancel.
 - **Settings** (`F2`): type to filter, `Up`/`Down` to move, `Enter` to edit
-  (toggle a bool, cycle an enum, or type a value), `Delete` to remove an alias,
-  `Esc` to close.
+  (toggle a bool, cycle an enum, or type a value), `Delete` to remove an alias
+  (press it twice), `Esc` to close.
 - **Networks** (`F3`): `Up`/`Down` to move, `Enter`/`Right` to edit or create,
-  `c` to connect, `d` to disconnect, `x` to remove, `Esc` to close.
+  `c` to connect, `d` to disconnect, `x` to remove (press it twice), `Esc` to
+  close.
+
+Removing a network or an alias asks for a second press of the same key on the
+same item (the prompt is shown in the panel); moving to another row or pressing
+any other key cancels it, and it lapses after 2 seconds.
 - **Plugins** (`F4`): `Up`/`Down` to move, `Space`/`Enter` to enable/disable, `c`
   to open the config editor, `Esc` to close.
 - **Help** (`/help`): type to filter, `Up`/`Down` to move, `Enter` to insert the
