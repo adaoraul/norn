@@ -94,8 +94,15 @@ pub enum Event {
     HistoryLoaded { target: String, messages: Vec<ChatMessage>, complete: bool },
     MemberJoined { target: String, who: User, account: Option<String> },
     MemberLeft { target: String, who: User, reason: LeaveReason },
-    BatchCollapsed(CollapsedBatch),    // netsplit/netjoin folded to one event
+    Netsplit { servers: Vec<String>, users: Vec<User> },        // folded batch
+    Netjoin { servers: Vec<String>, joins: Vec<(String, User)> },
     StandardReply(StandardReply),      // FAIL / WARN / NOTE, machine-readable
+    CommandError { error: ServerError, target: Option<String>, message: String },
+    Motd(Vec<String>),                 // 375/372/376 folded; empty for 422
+    ServerInfo(String),                // other informational numerics, text only
+    ModeChanged { target: String, by: Option<String>, modes: String,
+                  args: Vec<String>, prefix_changes: Vec<PrefixChange> },
+    ChannelModes { target: String, modes: String },
     Disconnected(DisconnectReason),
 }
 ```
@@ -195,7 +202,8 @@ with a listed mechanism). End on `903` (proceed to `CAP END`) or a failure
 `BATCH +<ref> <type> [params]` opens, lines carry `@batch=<ref>`, `BATCH -<ref>`
 closes. Batches nest, so track a **stack keyed by ref**. Buffer an open batch
 and emit it as one event. Types: `chathistory`, `netsplit`/`netjoin` (collapse
-the quit/join flood into one `BatchCollapsed` event), `labeled-response`.
+the quit/join flood into one `Netsplit` / `Netjoin` event, with the roster
+updated for every user in it), `labeled-response`.
 
 ### Label router
 

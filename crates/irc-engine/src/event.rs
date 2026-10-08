@@ -7,9 +7,8 @@
 use chrono::{DateTime, Utc};
 use irc_proto::{CapSet, SaslError, Source};
 
-use crate::batch::CompletedBatch;
 use crate::chat::ChatMessage;
-use crate::roster::Member;
+use crate::roster::{Member, MemberPrefix};
 use crate::stdreply::StandardReply;
 
 /// An authenticated account name.
@@ -143,8 +142,21 @@ pub enum Event {
         /// Whether this is all there is (fewer than the limit returned).
         complete: bool,
     },
-    /// A netsplit/netjoin (or other collapsible) batch folded into one event.
-    BatchCollapsed(CompletedBatch),
+    /// A netsplit: these users left together because servers lost contact. The
+    /// UI shows one summary instead of a quit per user.
+    Netsplit {
+        /// The servers involved (the batch parameters).
+        servers: Vec<String>,
+        /// Everyone who dropped off.
+        users: Vec<User>,
+    },
+    /// A netjoin: these users came back after a netsplit healed.
+    Netjoin {
+        /// The servers involved (the batch parameters).
+        servers: Vec<String>,
+        /// Who rejoined which channel.
+        joins: Vec<(String, User)>,
+    },
     /// The full member list for a channel (emitted at end-of-NAMES, 366).
     NamesLoaded {
         /// The channel.
@@ -232,8 +244,108 @@ pub enum Event {
     WhoisReceived(WhoisInfo),
     /// A `FAIL`/`WARN`/`NOTE` standard reply (rule 15).
     StandardReply(StandardReply),
+    /// The server rejected something we did (cannot send, nick in use, not an
+    /// operator, ...). The numeric stays inside the engine.
+    CommandError {
+        /// What went wrong.
+        error: ServerError,
+        /// The channel, nick or command it concerns, when the server names one.
+        target: Option<String>,
+        /// The server's human-readable explanation.
+        message: String,
+    },
+    /// The message of the day, complete (empty when the server has none).
+    Motd(Vec<String>),
+    /// Informational server text with no dedicated event (LUSERS counts and the
+    /// like), so nothing the server says is silently dropped.
+    ServerInfo(String),
+    /// A mode change on a channel (or on a nick, for user modes).
+    ModeChanged {
+        /// The channel or nick the modes apply to.
+        target: String,
+        /// Who changed them, if a user did (servers set modes too).
+        by: Option<String>,
+        /// The mode string as sent, e.g. `+o-v`.
+        modes: String,
+        /// The mode arguments as sent, in order.
+        args: Vec<String>,
+        /// The membership-prefix changes this implies (op, voice, ...).
+        prefix_changes: Vec<PrefixChange>,
+    },
+    /// A channel's current modes, from the reply to a bare `MODE #chan`.
+    ChannelModes {
+        /// The channel.
+        target: String,
+        /// The modes, with their arguments (e.g. `+nt` or `+k secret`).
+        modes: String,
+    },
     /// The connection was terminated.
     Disconnected(DisconnectReason),
+}
+
+/// One membership-prefix change implied by a channel mode (`+o bob`, `-v alice`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixChange {
+    /// Whose prefix changed.
+    pub nick: String,
+    /// Which prefix.
+    pub prefix: MemberPrefix,
+    /// Whether it was granted (`true`) or removed (`false`).
+    pub granted: bool,
+}
+
+/// Why the server rejected a command. `Other` carries only the server's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerError {
+    /// The channel does not exist.
+    NoSuchChannel,
+    /// We cannot send to that channel or nick.
+    CannotSend,
+    /// We are in too many channels.
+    TooManyChannels,
+    /// The server does not know the command.
+    UnknownCommand,
+    /// The nickname is not valid.
+    ErroneousNick,
+    /// The nickname is already taken.
+    NickInUse,
+    /// The target is not on the channel.
+    UserNotInChannel,
+    /// We are not on the channel.
+    NotOnChannel,
+    /// The command lacked parameters.
+    NeedMoreParams,
+    /// The channel is full.
+    ChannelFull,
+    /// The channel is invite-only.
+    InviteOnly,
+    /// We are banned from the channel.
+    Banned,
+    /// The channel key was missing or wrong.
+    BadKey,
+    /// We need channel operator status.
+    NotOperator,
+    /// We lack the privileges for this.
+    NoPrivileges,
+    /// Anything else the server rejected.
+    Other,
+}
+
+impl ServerError {
+    /// A one-line explanation for the user: the server's own words, prefixed by
+    /// what they concern, with a next step where there is an obvious one.
+    pub fn describe(&self, target: Option<&str>, message: &str) -> String {
+        match (self, target) {
+            (ServerError::NickInUse, Some(nick)) => {
+                format!("nick {nick} is already in use; pick another with /nick <name>")
+            }
+            (ServerError::BadKey, Some(channel)) => {
+                format!("{channel}: {message} (try /join {channel} <key>)")
+            }
+            (_, Some(target)) => format!("{target}: {message}"),
+            (_, None) => message.to_string(),
+        }
+    }
 }
 
 /// Why the engine tore down the connection.

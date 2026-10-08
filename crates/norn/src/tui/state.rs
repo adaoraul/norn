@@ -997,6 +997,126 @@ impl App {
                     reply.description
                 )));
             }
+            // The server refused something: say so where the user is looking.
+            Event::CommandError {
+                error,
+                target,
+                message,
+            } => {
+                let text = error.describe(target.as_deref(), &message);
+                let idx = target
+                    .as_deref()
+                    .and_then(|t| self.buffer_index(net, t))
+                    .or_else(|| (self.buffers[self.active].net == net).then_some(self.active))
+                    .unwrap_or_else(|| self.server_buffer(net));
+                self.buffers[idx].push(error_line(text));
+            }
+            Event::Motd(lines) => {
+                let i = self.server_buffer(net);
+                if lines.is_empty() {
+                    self.buffers[i].push(event_line("no message of the day".to_string()));
+                } else {
+                    self.buffers[i].push(event_line("message of the day:".to_string()));
+                    for line in lines {
+                        self.buffers[i].push(event_line(format!("  {line}")));
+                    }
+                }
+            }
+            Event::ServerInfo(text) => {
+                let i = self.server_buffer(net);
+                self.buffers[i].push(event_line(text));
+            }
+            Event::ModeChanged {
+                target,
+                by,
+                modes,
+                args,
+                prefix_changes,
+            } => {
+                let text = crate::render::mode_line(&target, by.as_deref(), &modes, &args);
+                let idx = match self.buffer_index(net, &target) {
+                    Some(i) if self.buffers[i].kind == BufferKind::Channel => i,
+                    _ => self.server_buffer(net),
+                };
+                // Op/voice/... changes move the nick in the nicklist.
+                for change in &prefix_changes {
+                    for member in &mut self.buffers[idx].members {
+                        if member.nick.eq_ignore_ascii_case(&change.nick) {
+                            member.prefixes.retain(|p| *p != change.prefix);
+                            if change.granted {
+                                member.prefixes.push(change.prefix);
+                                member.prefixes.sort_by_key(|p| p.rank());
+                            }
+                        }
+                    }
+                }
+                self.buffers[idx].push(event_line(text));
+            }
+            Event::ChannelModes { target, modes } => {
+                let idx = match self.buffer_index(net, &target) {
+                    Some(i) => i,
+                    None => self.server_buffer(net),
+                };
+                self.buffers[idx].push(event_line(format!("modes for {target}: {modes}")));
+            }
+            // A split is one line per affected channel, not one quit per user.
+            Event::Netsplit { servers, users } => {
+                let servers = servers.join(" ");
+                for b in self.buffers.iter_mut().filter(|b| b.net == net) {
+                    let gone: Vec<String> = users
+                        .iter()
+                        .filter(|u| {
+                            b.members
+                                .iter()
+                                .any(|m| m.nick.eq_ignore_ascii_case(&u.nick))
+                        })
+                        .map(|u| u.nick.clone())
+                        .collect();
+                    if gone.is_empty() {
+                        continue;
+                    }
+                    b.members
+                        .retain(|m| !gone.iter().any(|n| n.eq_ignore_ascii_case(&m.nick)));
+                    b.push(event_line(format!(
+                        "netsplit {servers}: {} left ({})",
+                        gone.len(),
+                        nick_summary(&gone)
+                    )));
+                }
+            }
+            Event::Netjoin { servers, joins } => {
+                let servers = servers.join(" ");
+                let mut by_channel: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for (channel, user) in joins {
+                    by_channel
+                        .entry(channel.to_ascii_lowercase())
+                        .or_default()
+                        .push(user.nick);
+                }
+                for (channel, nicks) in by_channel {
+                    let Some(idx) = self.buffer_index(net, &channel) else {
+                        continue;
+                    };
+                    for nick in &nicks {
+                        let present = self.buffers[idx]
+                            .members
+                            .iter()
+                            .any(|m| m.nick.eq_ignore_ascii_case(nick));
+                        if !present {
+                            self.buffers[idx].members.push(Member {
+                                nick: nick.clone(),
+                                prefixes: Vec::new(),
+                                away: false,
+                            });
+                        }
+                    }
+                    self.buffers[idx].push(event_line(format!(
+                        "netjoin {servers}: {} back ({})",
+                        nicks.len(),
+                        nick_summary(&nicks)
+                    )));
+                }
+            }
             Event::Disconnected(reason) => {
                 let text = match reason {
                     DisconnectReason::NickUnavailable => {
@@ -1905,6 +2025,21 @@ pub(crate) fn mentions(text: &str, nick: &str) -> bool {
         .any(|word| word == nick)
 }
 
+/// "alice, bob, carol, +11 more": a short list for a bulk event.
+fn nick_summary(nicks: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let mut out = nicks
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if nicks.len() > SHOWN {
+        out.push_str(&format!(", +{} more", nicks.len() - SHOWN));
+    }
+    out
+}
+
 /// Why a network definition cannot be dialled yet, if it cannot.
 pub fn check_dialable(config: &NetworkConfig) -> Result<(), String> {
     if config.host.trim().is_empty() {
@@ -2651,6 +2786,193 @@ mod tests {
             },
         ));
         assert_eq!(a.buffers[idx].unread_marker, Some(3));
+    }
+
+    fn last_line(buffer: &Buffer) -> &Line {
+        buffer.lines.last().expect("a line")
+    }
+
+    #[test]
+    fn command_error_goes_to_the_named_buffer_as_an_error() {
+        let mut a = app();
+        let rust = join_channel(&mut a, "#rust", &["me"]);
+        a.apply(engine(
+            0,
+            Event::CommandError {
+                error: irc_engine::ServerError::CannotSend,
+                target: Some("#rust".into()),
+                message: "Cannot send to channel".into(),
+            },
+        ));
+        match last_line(&a.buffers[rust]) {
+            Line::Event { text, error, .. } => {
+                assert!(*error);
+                assert_eq!(text, "#rust: Cannot send to channel");
+            }
+            other => panic!("expected an error line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_error_without_a_buffer_lands_where_the_user_is() {
+        let mut a = app(); // active: net 0's server buffer
+        a.apply(engine(
+            0,
+            Event::CommandError {
+                error: irc_engine::ServerError::NickInUse,
+                target: Some("bob".into()),
+                message: "Nickname is already in use".into(),
+            },
+        ));
+        let text = event_texts(a.active_buffer());
+        assert_eq!(
+            text,
+            vec!["nick bob is already in use; pick another with /nick <name>"]
+        );
+        // An error on another network does not leak into the active buffer.
+        let before = a.active_buffer().lines.len();
+        a.apply(engine(
+            1,
+            Event::CommandError {
+                error: irc_engine::ServerError::NoPrivileges,
+                target: None,
+                message: "Permission Denied".into(),
+            },
+        ));
+        assert_eq!(a.active_buffer().lines.len(), before);
+        let other = a.buffer_index(1, "*").unwrap();
+        assert_eq!(event_texts(&a.buffers[other]), vec!["Permission Denied"]);
+    }
+
+    #[test]
+    fn motd_and_server_info_go_to_the_server_buffer() {
+        let mut a = app();
+        a.apply(engine(
+            0,
+            Event::Motd(vec!["Welcome".into(), "Be nice".into()]),
+        ));
+        a.apply(engine(0, Event::ServerInfo("There are 5 users".into())));
+        let server = a.buffer_index(0, "*").unwrap();
+        assert_eq!(
+            event_texts(&a.buffers[server]),
+            vec![
+                "message of the day:",
+                "  Welcome",
+                "  Be nice",
+                "There are 5 users"
+            ]
+        );
+    }
+
+    #[test]
+    fn mode_change_moves_prefixes_in_the_nicklist() {
+        let mut a = app();
+        let rust = join_channel(&mut a, "#rust", &["alice", "bob"]);
+        a.apply(engine(
+            0,
+            Event::ModeChanged {
+                target: "#rust".into(),
+                by: Some("alice".into()),
+                modes: "+o".into(),
+                args: vec!["bob".into()],
+                prefix_changes: vec![irc_engine::PrefixChange {
+                    nick: "bob".into(),
+                    prefix: irc_engine::MemberPrefix::Op,
+                    granted: true,
+                }],
+            },
+        ));
+        let bob = |a: &App| {
+            a.buffers[rust]
+                .members
+                .iter()
+                .find(|m| m.nick == "bob")
+                .unwrap()
+                .prefixes
+                .clone()
+        };
+        assert_eq!(bob(&a), vec![irc_engine::MemberPrefix::Op]);
+        assert_eq!(
+            event_texts(&a.buffers[rust]),
+            vec!["alice sets mode +o bob on #rust"]
+        );
+        a.apply(engine(
+            0,
+            Event::ModeChanged {
+                target: "#rust".into(),
+                by: None,
+                modes: "-o".into(),
+                args: vec!["bob".into()],
+                prefix_changes: vec![irc_engine::PrefixChange {
+                    nick: "bob".into(),
+                    prefix: irc_engine::MemberPrefix::Op,
+                    granted: false,
+                }],
+            },
+        ));
+        assert!(bob(&a).is_empty());
+    }
+
+    #[test]
+    fn user_modes_are_shown_in_the_server_buffer() {
+        let mut a = app();
+        a.apply(engine(
+            0,
+            Event::ModeChanged {
+                target: "me".into(),
+                by: None,
+                modes: "+i".into(),
+                args: Vec::new(),
+                prefix_changes: Vec::new(),
+            },
+        ));
+        let server = a.buffer_index(0, "*").unwrap();
+        assert_eq!(event_texts(&a.buffers[server]), vec!["mode +i on me"]);
+    }
+
+    #[test]
+    fn netsplit_is_one_summary_line_per_channel_and_removes_members() {
+        let mut a = app();
+        let rust = join_channel(&mut a, "#rust", &["a", "b", "c", "d", "e"]);
+        let other = join_channel(&mut a, "#other", &["zed"]);
+        let users = ["a", "b", "c", "d"].map(irc_engine::User::nick).to_vec();
+        a.apply(engine(
+            0,
+            Event::Netsplit {
+                servers: vec!["irc.a".into(), "irc.b".into()],
+                users,
+            },
+        ));
+        assert_eq!(
+            event_texts(&a.buffers[rust]),
+            vec!["netsplit irc.a irc.b: 4 left (a, b, c, +1 more)"]
+        );
+        assert_eq!(a.buffers[rust].members.len(), 1);
+        assert!(
+            event_texts(&a.buffers[other]).is_empty(),
+            "unaffected channel"
+        );
+    }
+
+    #[test]
+    fn netjoin_restores_members_with_one_line_per_channel() {
+        let mut a = app();
+        let rust = join_channel(&mut a, "#rust", &["me"]);
+        a.apply(engine(
+            0,
+            Event::Netjoin {
+                servers: vec!["irc.a".into()],
+                joins: vec![
+                    ("#rust".into(), irc_engine::User::nick("a")),
+                    ("#rust".into(), irc_engine::User::nick("b")),
+                ],
+            },
+        ));
+        assert_eq!(a.buffers[rust].members.len(), 3);
+        assert_eq!(
+            event_texts(&a.buffers[rust]),
+            vec!["netjoin irc.a: 2 back (a, b)"]
+        );
     }
 
     #[test]

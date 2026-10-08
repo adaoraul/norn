@@ -9,7 +9,8 @@
 
 use irc_proto::{Command, Message, Source};
 
-use crate::event::{Event, LeaveReason, User};
+use crate::event::{Event, LeaveReason, PrefixChange, User};
+use crate::roster::MemberPrefix;
 
 /// Map an identity/membership command to an event, or `None` if it is not one.
 pub fn identity_event(msg: &Message) -> Option<Event> {
@@ -93,8 +94,76 @@ pub fn identity_event(msg: &Message) -> Option<Event> {
             let realname = msg.params.first()?.clone();
             Some(Event::RealnameChanged { nick, realname })
         }
+        "MODE" => {
+            let target = msg.params.first()?.clone();
+            let modes = msg.params.get(1)?.clone();
+            let args = msg.params.get(2..).unwrap_or_default().to_vec();
+            let prefix_changes = if is_channel(&target) {
+                prefix_changes(&modes, &args)
+            } else {
+                Vec::new()
+            };
+            Some(Event::ModeChanged {
+                target,
+                by: source.and_then(source_nick),
+                modes,
+                args,
+                prefix_changes,
+            })
+        }
         _ => None,
     }
+}
+
+/// Whether a MODE target is a channel (vs a nick, for user modes).
+fn is_channel(target: &str) -> bool {
+    target.starts_with(['#', '&', '+', '!'])
+}
+
+/// The membership-prefix changes in a channel mode string, using the common
+/// `PREFIX=(qaohv)~&@%+` set. Walks the mode letters in order, consuming one
+/// argument for each letter that takes one, so `+ov alice bob` and
+/// `+b mask -o carol` line up correctly.
+fn prefix_changes(modes: &str, args: &[String]) -> Vec<PrefixChange> {
+    let mut out = Vec::new();
+    let mut granted = true;
+    let mut next = 0usize;
+    for c in modes.chars() {
+        let prefix = match c {
+            '+' => {
+                granted = true;
+                continue;
+            }
+            '-' => {
+                granted = false;
+                continue;
+            }
+            'q' => Some(MemberPrefix::Owner),
+            'a' => Some(MemberPrefix::Admin),
+            'o' => Some(MemberPrefix::Op),
+            'h' => Some(MemberPrefix::Halfop),
+            'v' => Some(MemberPrefix::Voice),
+            _ => None,
+        };
+        match (prefix, c) {
+            (Some(prefix), _) => {
+                if let Some(nick) = args.get(next) {
+                    out.push(PrefixChange {
+                        nick: nick.clone(),
+                        prefix,
+                        granted,
+                    });
+                }
+                next += 1;
+            }
+            // Always take an argument (list modes and the channel key).
+            (None, 'b' | 'e' | 'I' | 'k') => next += 1,
+            // The limit takes an argument only when set.
+            (None, 'l') if granted => next += 1,
+            _ => {}
+        }
+    }
+    out
 }
 
 fn source_nick(source: &Source) -> Option<String> {

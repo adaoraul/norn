@@ -26,7 +26,10 @@ pub use bringup::{recommended_caps, Action, BringupConfig, BringupMachine, SaslF
 pub use chat::{ChatMessage, MessageKind};
 pub use connection::Connection;
 pub use engine::Engine;
-pub use event::{AccountName, DisconnectReason, Event, LeaveReason, TopicChange, User, WhoisInfo};
+pub use event::{
+    AccountName, DisconnectReason, Event, LeaveReason, PrefixChange, ServerError, TopicChange,
+    User, WhoisInfo,
+};
 pub use framing::LineFramer;
 pub use history::{ChatHistoryRequest, Selector};
 pub use identity::identity_event;

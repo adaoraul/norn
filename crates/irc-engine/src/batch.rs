@@ -8,7 +8,7 @@
 //!
 //! This is sans-I/O and synchronous. It produces structural [`CompletedBatch`]
 //! values; mapping a batch to a semantic event (`HistoryLoaded` for
-//! `chathistory`, `BatchCollapsed` for `netsplit`/`netjoin`) is the emitter's
+//! `chathistory`, `Netsplit`/`Netjoin` for `netsplit`/`netjoin`) is the emitter's
 //! job in a later step.
 
 use irc_proto::{Command, Message, Tags};

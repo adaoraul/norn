@@ -296,7 +296,16 @@ network's status buffer says why a connection was abandoned (for example, every
 nickname in use).
 
 Mistakes and failures (a bad command, a missing target, a save error) appear in
-red with a `!!` marker; ordinary events keep the grey `-!-` marker. Text colours
+red with a `!!` marker; ordinary events keep the grey `-!-` marker. Refusals
+from the server (cannot send to a channel, nick in use, not a channel operator,
+banned, invite-only, ...) show the same way, in the channel they concern. The
+message of the day and other server text go to the network's status buffer.
+
+A netsplit shows one line per affected channel (`netsplit a.net b.net: 14 left
+(alice, bob, carol, +11 more)`) and removes those people from the nicklist; the
+matching `netjoin` line adds them back. Mode changes appear as `bob sets mode
++o alice on #rust`, and op/voice changes update the nicklist prefixes straight
+away. Text colours
 are kept at 4.5:1 contrast or better against the background, and the marker does
 not depend on colour alone.
 

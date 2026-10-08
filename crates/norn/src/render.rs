@@ -30,13 +30,38 @@ pub fn render(event: &Event) -> Vec<String> {
             lines.extend(messages.iter().map(chat_line));
             lines
         }
-        Event::BatchCollapsed(batch) => {
-            vec![format!(
-                "-- {} batch ({} items)",
-                batch.batch_type,
-                batch.len()
-            )]
-        }
+        Event::Netsplit { servers, users } => vec![format!(
+            "-- netsplit {}: {} user(s) quit",
+            servers.join(" "),
+            users.len()
+        )],
+        Event::Netjoin { servers, joins } => vec![format!(
+            "-- netjoin {}: {} user(s) back",
+            servers.join(" "),
+            joins.len()
+        )],
+        Event::CommandError {
+            error,
+            target,
+            message,
+        } => vec![format!(
+            "-- error: {}",
+            error.describe(target.as_deref(), message)
+        )],
+        Event::Motd(lines) if lines.is_empty() => vec!["-- no message of the day".to_string()],
+        Event::Motd(lines) => lines.iter().map(|l| format!("-- motd: {l}")).collect(),
+        Event::ServerInfo(text) => vec![format!("-- {text}")],
+        Event::ModeChanged {
+            target,
+            by,
+            modes,
+            args,
+            ..
+        } => vec![format!(
+            "-- {}",
+            mode_line(target, by.as_deref(), modes, args)
+        )],
+        Event::ChannelModes { target, modes } => vec![format!("-- modes for {target}: {modes}")],
         Event::NamesLoaded { target, members } => {
             vec![format!("-- {} has {} member(s)", target, members.len())]
         }
@@ -133,6 +158,20 @@ pub fn render(event: &Event) -> Vec<String> {
             reply.description
         )],
         Event::Disconnected(reason) => vec![format!("-- disconnected: {reason:?}")],
+    }
+}
+
+/// "bob sets mode +o alice on #rust" (no marker), shared by the plain and TUI
+/// renderers.
+pub fn mode_line(target: &str, by: Option<&str>, modes: &str, args: &[String]) -> String {
+    let mut change = modes.to_string();
+    if !args.is_empty() {
+        change.push(' ');
+        change.push_str(&args.join(" "));
+    }
+    match by {
+        Some(by) => format!("{by} sets mode {change} on {target}"),
+        None => format!("mode {change} on {target}"),
     }
 }
 

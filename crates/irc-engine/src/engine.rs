@@ -14,7 +14,7 @@ use irc_proto::{Command, Message};
 
 use crate::batch::{BatchCollector, CollectorOutput, CompletedBatch};
 use crate::chat::ChatMessage;
-use crate::event::{Event, LeaveReason, TopicChange, WhoisInfo};
+use crate::event::{Event, LeaveReason, ServerError, TopicChange, User, WhoisInfo};
 use crate::history::ChatHistoryRequest;
 use crate::identity::identity_event;
 use crate::labels::LabelRouter;
@@ -24,6 +24,28 @@ use crate::stdreply::StandardReply;
 /// Normalize a channel name for roster keying (ASCII case-insensitive).
 fn norm(channel: &str) -> String {
     channel.to_ascii_lowercase()
+}
+
+/// Classify an error numeric (4xx/5xx) without exposing the number upward.
+fn server_error(numeric: u16) -> ServerError {
+    match numeric {
+        403 => ServerError::NoSuchChannel,
+        404 => ServerError::CannotSend,
+        405 => ServerError::TooManyChannels,
+        421 => ServerError::UnknownCommand,
+        432 => ServerError::ErroneousNick,
+        433 => ServerError::NickInUse,
+        441 => ServerError::UserNotInChannel,
+        442 => ServerError::NotOnChannel,
+        461 => ServerError::NeedMoreParams,
+        471 => ServerError::ChannelFull,
+        473 => ServerError::InviteOnly,
+        474 => ServerError::Banned,
+        475 => ServerError::BadKey,
+        481 => ServerError::NoPrivileges,
+        482 => ServerError::NotOperator,
+        _ => ServerError::Other,
+    }
 }
 
 /// Wires batch collection and request correlation into semantic events.
@@ -42,6 +64,8 @@ pub struct Engine {
     /// In-progress WHOIS replies, keyed by normalized nick. Populated by the
     /// whois numerics and drained into one `WhoisReceived` at end-of-whois (318).
     whois: HashMap<String, WhoisInfo>,
+    /// The MOTD lines gathered between 375 and 376.
+    motd: Vec<String>,
 }
 
 impl Engine {
@@ -80,6 +104,10 @@ impl Engine {
         }
         // WHOIS reply numerics accumulate into one WhoisReceived at 318.
         if self.handle_whois(msg, events) {
+            return;
+        }
+        // MOTD, command errors and other server text: nothing is dropped.
+        if self.handle_server_numeric(msg, events) {
             return;
         }
         // Standard replies (rule 15) take precedence over chat interpretation.
@@ -212,6 +240,19 @@ impl Engine {
             }
             // 315 RPL_ENDOFWHO: consume it (the roster is already seeded).
             Command::Numeric(315) => true,
+            // 324 RPL_CHANNELMODEIS: <me> <channel> <modes> [<args>...]
+            Command::Numeric(324) => {
+                if let (Some(channel), Some(modes)) = (msg.params.get(1), msg.params.get(2)) {
+                    let rest = msg.params.get(3..).unwrap_or_default();
+                    let mut all = vec![modes.clone()];
+                    all.extend(rest.iter().cloned());
+                    events.push(Event::ChannelModes {
+                        target: channel.clone(),
+                        modes: all.join(" "),
+                    });
+                }
+                true
+            }
             // 305 RPL_UNAWAY / 306 RPL_NOWAWAY: our own away state toggled.
             Command::Numeric(305) => {
                 events.push(Event::AwayStatus(false));
@@ -219,6 +260,69 @@ impl Engine {
             }
             Command::Numeric(306) => {
                 events.push(Event::AwayStatus(true));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Turn the remaining server numerics into events: the MOTD (375/372/376,
+    /// 422), command errors (4xx/5xx), and informational text (2xx/3xx). The
+    /// numeric itself never leaves the engine. Returns whether it applied.
+    fn handle_server_numeric(&mut self, msg: &Message, events: &mut Vec<Event>) -> bool {
+        let Command::Numeric(n) = &msg.command else {
+            return false;
+        };
+        let n = *n;
+        // The trailing param is the human-readable text for all of these.
+        let text = msg.params.last().cloned().unwrap_or_default();
+        // The channel/nick/command the server names, right after our own nick.
+        let named = msg.params.get(1).cloned().filter(|_| msg.params.len() > 2);
+        match n {
+            // 375 RPL_MOTDSTART: a fresh MOTD begins (its text is just a banner).
+            375 => {
+                self.motd.clear();
+                true
+            }
+            // 372 RPL_MOTD: "- text"; drop the conventional leading dash.
+            372 => {
+                let line = text.strip_prefix("- ").unwrap_or(&text);
+                self.motd.push(line.to_string());
+                true
+            }
+            // 376 RPL_ENDOFMOTD: emit the whole message at once.
+            376 => {
+                events.push(Event::Motd(std::mem::take(&mut self.motd)));
+                true
+            }
+            // 301 RPL_AWAY outside a whois: the user we just messaged is away.
+            // (Inside a whois the whois handler has already consumed it.)
+            301 => {
+                let nick = msg.params.get(1).map(String::as_str).unwrap_or("?");
+                events.push(Event::ServerInfo(format!("{nick} is away: {text}")));
+                true
+            }
+            // 422 ERR_NOMOTD: the server has none.
+            422 => {
+                self.motd.clear();
+                events.push(Event::Motd(Vec::new()));
+                true
+            }
+            // 4xx/5xx: something we did was rejected.
+            400..=599 => {
+                events.push(Event::CommandError {
+                    error: server_error(n),
+                    target: named,
+                    message: text,
+                });
+                true
+            }
+            // Counts and numbers with no text of their own, or already shown
+            // through a dedicated event (channel creation time, LIST rows).
+            321 | 322 | 323 | 329 => true,
+            // Everything else informational (LUSERS, user modes, ...).
+            200..=399 if !text.is_empty() => {
+                events.push(Event::ServerInfo(text));
                 true
             }
             _ => false,
@@ -360,6 +464,18 @@ impl Engine {
                     roster.set_away(nick, away);
                 }
             }
+            // Op/voice/... grants and removals ride on MODE.
+            Event::ModeChanged {
+                target,
+                prefix_changes,
+                ..
+            } => {
+                if let Some(roster) = self.rosters.get_mut(&norm(target)) {
+                    for change in prefix_changes {
+                        roster.set_prefix(&change.nick, change.prefix, change.granted);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -367,7 +483,8 @@ impl Engine {
     fn on_batch(&mut self, batch: CompletedBatch, events: &mut Vec<Event>) {
         match batch.batch_type.as_str() {
             "chathistory" | "draft/chathistory" => self.on_history_batch(batch, events),
-            "netsplit" | "netjoin" => events.push(Event::BatchCollapsed(batch)),
+            "netsplit" => self.on_netsplit(&batch, events),
+            "netjoin" => self.on_netjoin(&batch, events),
             _ => {
                 // Other batches (e.g. labeled-response with no dedicated
                 // handler yet): surface any chat members individually.
@@ -378,6 +495,41 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Fold a netsplit batch into one event, keeping the rosters in step (each
+    /// QUIT removes the user everywhere, exactly as a live quit would).
+    fn on_netsplit(&mut self, batch: &CompletedBatch, events: &mut Vec<Event>) {
+        let mut users = Vec::new();
+        for msg in batch.messages() {
+            if let Some(event) = identity_event(msg) {
+                if let Event::MemberLeft { who, .. } = &event {
+                    users.push(who.clone());
+                }
+                self.update_roster(&event);
+            }
+        }
+        events.push(Event::Netsplit {
+            servers: batch.params.clone(),
+            users,
+        });
+    }
+
+    /// Fold a netjoin batch into one event, adding each user back to its channel.
+    fn on_netjoin(&mut self, batch: &CompletedBatch, events: &mut Vec<Event>) {
+        let mut joins: Vec<(String, User)> = Vec::new();
+        for msg in batch.messages() {
+            if let Some(event) = identity_event(msg) {
+                if let Event::MemberJoined { target, who, .. } = &event {
+                    joins.push((target.clone(), who.clone()));
+                }
+                self.update_roster(&event);
+            }
+        }
+        events.push(Event::Netjoin {
+            servers: batch.params.clone(),
+            joins,
+        });
     }
 
     fn on_history_batch(&mut self, batch: CompletedBatch, events: &mut Vec<Event>) {
@@ -591,9 +743,12 @@ mod tests {
     #[test]
     fn standalone_away_numeric_is_not_a_whois() {
         // RPL_AWAY outside a whois (messaging an away user) must not fabricate a
-        // whois block; it is simply consumed with no event.
+        // whois block; it is shown as plain information naming the user.
         let mut e = Engine::new();
-        assert!(feed(&mut e, ":s 301 me bob :gone fishing").is_empty());
+        assert_eq!(
+            feed(&mut e, ":s 301 me bob :gone fishing"),
+            vec![Event::ServerInfo("bob is away: gone fishing".into())]
+        );
     }
 
     // The integration proof: label routing + batch collection + server-time all
@@ -716,18 +871,210 @@ mod tests {
     }
 
     #[test]
-    fn netsplit_batch_collapses_to_one_event() {
+    fn netsplit_batch_collapses_to_one_event_and_empties_the_roster() {
         let mut e = Engine::new();
+        feed(&mut e, ":s 353 me = #rust :@a b c");
+        feed(&mut e, ":s 366 me #rust :End of /NAMES list");
         e.handle(Message::parse("BATCH +ns netsplit irc.a irc.b").unwrap());
         e.handle(Message::parse("@batch=ns :a!u@h QUIT :*.net *.split").unwrap());
         e.handle(Message::parse("@batch=ns :b!u@h QUIT :*.net *.split").unwrap());
         let events = e.handle(Message::parse("BATCH -ns").unwrap());
 
         assert_eq!(events.len(), 1);
-        let Event::BatchCollapsed(b) = &events[0] else {
-            panic!("expected BatchCollapsed");
+        let Event::Netsplit { servers, users } = &events[0] else {
+            panic!("expected Netsplit, got {:?}", events[0]);
         };
-        assert_eq!(b.batch_type, "netsplit");
-        assert_eq!(b.messages().len(), 2);
+        assert_eq!(servers, &["irc.a", "irc.b"]);
+        let nicks: Vec<&str> = users.iter().map(|u| u.nick.as_str()).collect();
+        assert_eq!(nicks, ["a", "b"]);
+        // The engine's own roster no longer lists them: a later NAMES snapshot
+        // reflects the split.
+        let events = feed(&mut e, ":s 366 me #rust :End of /NAMES list");
+        let Event::NamesLoaded { members, .. } = &events[0] else {
+            panic!("expected NamesLoaded");
+        };
+        let left: Vec<&str> = members.iter().map(|m| m.nick.as_str()).collect();
+        assert_eq!(left, ["c"]);
+    }
+
+    #[test]
+    fn netjoin_batch_restores_members() {
+        let mut e = Engine::new();
+        e.handle(Message::parse("BATCH +nj netjoin irc.a irc.b").unwrap());
+        e.handle(Message::parse("@batch=nj :a!u@h JOIN #rust").unwrap());
+        let events = e.handle(Message::parse("BATCH -nj").unwrap());
+        let Event::Netjoin { servers, joins } = &events[0] else {
+            panic!("expected Netjoin, got {:?}", events[0]);
+        };
+        assert_eq!(servers, &["irc.a", "irc.b"]);
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].0, "#rust");
+        let events = feed(&mut e, ":s 366 me #rust :End of /NAMES list");
+        let Event::NamesLoaded { members, .. } = &events[0] else {
+            panic!("expected NamesLoaded");
+        };
+        assert_eq!(members.len(), 1);
+    }
+
+    fn error_of(e: &mut Engine, line: &str) -> (ServerError, Option<String>, String) {
+        let events = feed(e, line);
+        let Event::CommandError {
+            error,
+            target,
+            message,
+        } = events.into_iter().next().expect("one event")
+        else {
+            panic!("expected CommandError for {line}");
+        };
+        (error, target, message)
+    }
+
+    #[test]
+    fn command_errors_become_semantic_events() {
+        let mut e = Engine::new();
+        let (err, target, msg) = error_of(&mut e, ":s 404 me #rust :Cannot send to channel");
+        assert_eq!(err, ServerError::CannotSend);
+        assert_eq!(target.as_deref(), Some("#rust"));
+        assert_eq!(msg, "Cannot send to channel");
+
+        let (err, target, _) = error_of(&mut e, ":s 433 me bob :Nickname is already in use");
+        assert_eq!(
+            (err, target.as_deref()),
+            (ServerError::NickInUse, Some("bob"))
+        );
+        assert_eq!(
+            error_of(&mut e, ":s 473 me #rust :Cannot join channel (+i)").0,
+            ServerError::InviteOnly
+        );
+        assert_eq!(
+            error_of(&mut e, ":s 474 me #rust :Cannot join channel (+b)").0,
+            ServerError::Banned
+        );
+        assert_eq!(
+            error_of(&mut e, ":s 482 me #rust :You're not channel operator").0,
+            ServerError::NotOperator
+        );
+        // No named target: just our nick and the text.
+        let (err, target, _) = error_of(&mut e, ":s 481 me :Permission Denied");
+        assert_eq!((err, target), (ServerError::NoPrivileges, None));
+        // An error we have no name for still reaches the UI, as text only.
+        let (err, _, msg) = error_of(&mut e, ":s 499 me #rust :Something odd");
+        assert_eq!(err, ServerError::Other);
+        assert_eq!(msg, "Something odd");
+    }
+
+    #[test]
+    fn motd_is_assembled_and_emitted_once() {
+        let mut e = Engine::new();
+        assert!(feed(&mut e, ":s 375 me :- irc.example Message of the day -").is_empty());
+        assert!(feed(&mut e, ":s 372 me :- Welcome").is_empty());
+        assert!(feed(&mut e, ":s 372 me :- Be nice").is_empty());
+        let events = feed(&mut e, ":s 376 me :End of /MOTD command.");
+        assert_eq!(
+            events,
+            vec![Event::Motd(vec!["Welcome".into(), "Be nice".into()])]
+        );
+        // A second MOTD does not inherit the first one's lines.
+        feed(&mut e, ":s 375 me :- again -");
+        let events = feed(&mut e, ":s 376 me :End of /MOTD command.");
+        assert_eq!(events, vec![Event::Motd(Vec::new())]);
+        // 422: the server has none.
+        assert_eq!(
+            feed(&mut e, ":s 422 me :MOTD File is missing"),
+            vec![Event::Motd(Vec::new())]
+        );
+    }
+
+    #[test]
+    fn informational_numerics_are_not_dropped() {
+        let mut e = Engine::new();
+        assert_eq!(
+            feed(
+                &mut e,
+                ":s 251 me :There are 5 users and 2 invisible on 3 servers"
+            ),
+            vec![Event::ServerInfo(
+                "There are 5 users and 2 invisible on 3 servers".into()
+            )]
+        );
+        // Channel creation time carries no text worth showing.
+        assert!(feed(&mut e, ":s 329 me #rust 1600000000").is_empty());
+    }
+
+    #[test]
+    fn mode_changes_update_prefixes_and_report_them() {
+        let mut e = Engine::new();
+        feed(&mut e, ":s 353 me = #rust :alice bob");
+        feed(&mut e, ":s 366 me #rust :End of /NAMES list");
+        let events = feed(&mut e, ":alice!u@h MODE #rust +ov-b bob bob *!*@bad");
+        let Event::ModeChanged {
+            target,
+            by,
+            modes,
+            prefix_changes,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected ModeChanged, got {:?}", events[0]);
+        };
+        assert_eq!(target, "#rust");
+        assert_eq!(by.as_deref(), Some("alice"));
+        assert_eq!(modes, "+ov-b");
+        assert_eq!(
+            prefix_changes.len(),
+            2,
+            "the ban mask is not a prefix change"
+        );
+        let events = feed(&mut e, ":s 366 me #rust :End of /NAMES list");
+        let Event::NamesLoaded { members, .. } = &events[0] else {
+            panic!("expected NamesLoaded");
+        };
+        let bob = members.iter().find(|m| m.nick == "bob").unwrap();
+        assert_eq!(
+            bob.prefixes,
+            vec![
+                crate::roster::MemberPrefix::Op,
+                crate::roster::MemberPrefix::Voice
+            ]
+        );
+        // Removing a prefix works too.
+        feed(&mut e, ":alice!u@h MODE #rust -o bob");
+        let events = feed(&mut e, ":s 366 me #rust :End of /NAMES list");
+        let Event::NamesLoaded { members, .. } = &events[0] else {
+            panic!("expected NamesLoaded");
+        };
+        let bob = members.iter().find(|m| m.nick == "bob").unwrap();
+        assert_eq!(bob.prefixes, vec![crate::roster::MemberPrefix::Voice]);
+    }
+
+    #[test]
+    fn mode_arguments_line_up_across_list_and_limit_modes() {
+        let mut e = Engine::new();
+        // +k and +l each take an argument before the +o's nick.
+        let events = feed(&mut e, ":alice!u@h MODE #rust +klo secret 20 bob");
+        let Event::ModeChanged { prefix_changes, .. } = &events[0] else {
+            panic!("expected ModeChanged");
+        };
+        assert_eq!(prefix_changes.len(), 1);
+        assert_eq!(prefix_changes[0].nick, "bob");
+        // -l takes no argument, so the nick is the first one.
+        let events = feed(&mut e, ":alice!u@h MODE #rust -lo carol");
+        let Event::ModeChanged { prefix_changes, .. } = &events[0] else {
+            panic!("expected ModeChanged");
+        };
+        assert_eq!(prefix_changes[0].nick, "carol");
+        assert!(!prefix_changes[0].granted);
+    }
+
+    #[test]
+    fn channel_modes_reply_becomes_an_event() {
+        let mut e = Engine::new();
+        assert_eq!(
+            feed(&mut e, ":s 324 me #rust +ntk secret"),
+            vec![Event::ChannelModes {
+                target: "#rust".into(),
+                modes: "+ntk secret".into()
+            }]
+        );
     }
 }

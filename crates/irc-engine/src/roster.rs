@@ -151,6 +151,22 @@ impl Roster {
         }
     }
 
+    /// Grant or remove a membership prefix, keeping prefixes ranked. Returns
+    /// whether the nick was present.
+    pub fn set_prefix(&mut self, nick: &str, prefix: MemberPrefix, granted: bool) -> bool {
+        match self.members.get_mut(&nick.to_ascii_lowercase()) {
+            Some(member) => {
+                member.prefixes.retain(|p| *p != prefix);
+                if granted {
+                    member.prefixes.push(prefix);
+                    member.prefixes.sort_by_key(|p| p.rank());
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Rename a member, preserving their prefixes.
     pub fn rename(&mut self, old: &str, new: &str) {
         if let Some(mut member) = self.members.remove(&old.to_ascii_lowercase()) {
